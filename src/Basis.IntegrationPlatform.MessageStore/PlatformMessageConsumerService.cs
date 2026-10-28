@@ -271,7 +271,9 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
     }
 
     // Same rule as the Camel adapter's DLQ parking (0.3.6), so both runtimes
-    // mask the same header names on the shared DLQ topic.
+    // mask the same header names on the shared DLQ topic. A -key or _key
+    // suffix covers vendor keys such as x-functions-key; Idempotency-Key is
+    // a delivery identifier, not a credential.
     internal static bool IsCredentialHeader(string name)
     {
         var lower = name.ToLowerInvariant();
@@ -280,7 +282,10 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
             return false;
         }
 
-        return CredentialHeaders.Contains(lower) || CredentialNameParts.Any(part => lower.Contains(part, StringComparison.Ordinal));
+        return CredentialHeaders.Contains(lower)
+            || CredentialNameParts.Any(part => lower.Contains(part, StringComparison.Ordinal))
+            || lower.EndsWith("-key", StringComparison.Ordinal)
+            || lower.EndsWith("_key", StringComparison.Ordinal);
     }
 
     private static string? Header(IReadOnlyDictionary<string, string> headers, string name)

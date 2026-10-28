@@ -34,8 +34,9 @@ The adapter owns platform mechanics for .NET integrations:
   record also carries the other consumed headers; the values of
   credential-like ones are masked as `xxxxxx`: `Authorization`, `Cookie`,
   `Set-Cookie`, `WWW-Authenticate`, and names containing secret, token,
-  password, credential, session, signature, auth or API/subscription key.
-  Their names, `x-bip-*` and `Idempotency-Key` stay readable
+  password, credential, session, signature, auth or API/subscription key, and
+  names ending in `-key` or `_key` (`x-functions-key`). Their names, `x-bip-*`
+  and `Idempotency-Key` stay readable
 - exposes `POST /admin/messages/{messageId}/resend`
 - republishes replay payloads back to the integration input topic
   (`bip.<integration>.in`), committing the `REQUESTED` audit row before the

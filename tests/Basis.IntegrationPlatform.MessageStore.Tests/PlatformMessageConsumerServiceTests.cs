@@ -83,17 +83,26 @@ public sealed class PlatformMessageConsumerServiceTests
             ["X-API-Key"] = "synthetic-key",
             ["Cookie"] = "SESSION=synthetic-session",
             ["X-Request-Token-Echo"] = "synthetic-echoed-token",
+            ["x-functions-key"] = "synthetic-functions-key",
+            ["X-Access-Key"] = "synthetic-access-key",
+            ["x-client-key"] = "synthetic-client-key",
+            ["partner_key"] = "synthetic-partner-key",
             // Envelope and diagnostics that must stay readable.
             ["x-bip-attempt"] = "2",
             ["x-bip-redo-steps"] = "[\"deliver\"]",
             ["Idempotency-Key"] = "message-1:deliver",
+            ["x-bip-idempotency-key"] = "message-1:deliver",
             ["content-type"] = "application/json",
             ["x-demo-outcome"] = "ERROR",
         });
 
         var headers = PlatformMessageConsumerService.CreateDlqHeaders(message, "simulated failure");
 
-        foreach (var name in new[] { "Authorization", "client_secret", "Ocp-Apim-Subscription-Key", "X-API-Key", "Cookie", "X-Request-Token-Echo" })
+        foreach (var name in new[]
+        {
+            "Authorization", "client_secret", "Ocp-Apim-Subscription-Key", "X-API-Key", "Cookie", "X-Request-Token-Echo",
+            "x-functions-key", "X-Access-Key", "x-client-key", "partner_key",
+        })
         {
             Assert.AreEqual("xxxxxx", Header(headers, name), name);
         }
@@ -101,6 +110,7 @@ public sealed class PlatformMessageConsumerServiceTests
         Assert.AreEqual("2", Header(headers, "x-bip-attempt"));
         Assert.AreEqual("[\"deliver\"]", Header(headers, "x-bip-redo-steps"));
         Assert.AreEqual("message-1:deliver", Header(headers, "Idempotency-Key"));
+        Assert.AreEqual("message-1:deliver", Header(headers, "x-bip-idempotency-key"));
         Assert.AreEqual("application/json", Header(headers, "content-type"));
         Assert.AreEqual("ERROR", Header(headers, "x-demo-outcome"));
         Assert.AreEqual("message-1", Header(headers, "x-bip-message-id"));
