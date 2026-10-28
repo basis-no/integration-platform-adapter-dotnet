@@ -819,6 +819,102 @@ public sealed class PlatformMessageStorePostgresTests
         return (int)(await command.ExecuteScalarAsync())!;
     }
 
+    [TestMethod]
+    public async Task FanOutThroughOneStepIdSkipsLaterItemsAndWarns()
+    {
+        var connectionString = RequireConnectionString();
+        var options = CreateOptions(connectionString);
+        await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+        var observations = new PlatformStepObservationCollector();
+        var logs = new LogRecorder();
+        var steps = new PlatformStepExecutor(dataSource, observations, logs.For<PlatformStepExecutor>());
+        var message = CreateMessage($"dotnet-test-{Guid.NewGuid():N}", options);
+        observations.BeginHandlerInvocation(message.MessageId);
+
+        // The key is <message-id>:<step-id>, so items sent through one step id
+        // share a key: the first is delivered, the rest are skipped.
+        var sent = new List<string>();
+        foreach (var item in new[] { "line-1", "line-2", "line-3" })
+        {
+            await steps.ExecuteAsync(message, "post-line", "https://target.example/lines", "target",
+                _ => { sent.Add(item); return Task.CompletedTask; }, CancellationToken.None);
+        }
+
+        CollectionAssert.AreEqual(new[] { "line-1" }, sent);
+        Assert.AreEqual(2, logs.Warnings.Count(w => w.Contains("distinct step id per item", StringComparison.Ordinal)));
+
+        // A step id per item delivers every item.
+        sent.Clear();
+        foreach (var item in new[] { "line-1", "line-2", "line-3" })
+        {
+            await steps.ExecuteAsync(message, $"post-line-{item}", "https://target.example/lines", "target",
+                _ => { sent.Add(item); return Task.CompletedTask; }, CancellationToken.None);
+        }
+
+        CollectionAssert.AreEqual(new[] { "line-1", "line-2", "line-3" }, sent);
+    }
+
+    [TestMethod]
+    public async Task InProcessRetryOfADeliveredStepDoesNotWarnAboutReuse()
+    {
+        var connectionString = RequireConnectionString();
+        var options = CreateOptions(connectionString);
+        await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+        var observations = new PlatformStepObservationCollector();
+        var logs = new LogRecorder();
+        var steps = new PlatformStepExecutor(dataSource, observations, logs.For<PlatformStepExecutor>());
+        var message = CreateMessage($"dotnet-test-{Guid.NewGuid():N}", options);
+
+        observations.BeginHandlerInvocation(message.MessageId);
+        await steps.ExecuteAsync(message, "deliver", "https://target.example/orders", "target",
+            _ => Task.CompletedTask, CancellationToken.None);
+        // The consumer starts a new handler invocation for each in-process retry.
+        observations.BeginHandlerInvocation(message.MessageId);
+        var retried = await steps.ExecuteAsync(message, "deliver", "https://target.example/orders", "target",
+            _ => Task.CompletedTask, CancellationToken.None);
+
+        Assert.IsTrue(retried.Skipped);
+        Assert.AreEqual(0, logs.Warnings.Count);
+    }
+
+    [TestMethod]
+    public async Task SharedMessageIdAcrossIntegrationsSkipsTheSecondDeliveryAndWarns()
+    {
+        var connectionString = RequireConnectionString();
+        var first = CreateOptions(connectionString);
+        first.ApplicationName = "integration-first";
+        var second = CreateOptions(connectionString);
+        second.ApplicationName = "integration-second";
+        var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+        await using var dataSource = NpgsqlDataSource.Create(connectionString);
+
+        var (firstStore, firstSteps, _, _) = CreateStore(dataSource, first);
+        var firstMessage = CreateMessage(messageId, first);
+        await firstSteps.ExecuteAsync(firstMessage, "deliver", "https://first.example/orders", "first",
+            _ => Task.CompletedTask, CancellationToken.None);
+        await firstStore.RecordAttemptAsync(firstMessage, "dotnet-handler", "COMPLETED", null, CancellationToken.None);
+
+        // The message id travelled on to a second integration on the same
+        // Message Store. bip_step_outcome is not scoped by integration, so an
+        // equal step id matches the first integration's delivery.
+        var logs = new LogRecorder();
+        var secondSteps = new PlatformStepExecutor(dataSource, new PlatformStepObservationCollector(), logs.For<PlatformStepExecutor>());
+        var secondMessage = CreateMessage(messageId, second);
+        var secondRan = false;
+        var collided = await secondSteps.ExecuteAsync(secondMessage, "deliver", "https://second.example/orders", "second",
+            _ => { secondRan = true; return Task.CompletedTask; }, CancellationToken.None);
+
+        Assert.IsTrue(collided.Skipped);
+        Assert.IsFalse(secondRan);
+        Assert.AreEqual(1, logs.Warnings.Count);
+        StringAssert.Contains(logs.Warnings[0], "journaled by integration integration-first");
+
+        // A step id unique across the integrations is delivered.
+        var distinct = await secondSteps.ExecuteAsync(secondMessage, "second-deliver", "https://second.example/orders", "second",
+            _ => Task.CompletedTask, CancellationToken.None);
+        Assert.AreEqual("DELIVERED", distinct.Status);
+    }
+
     private sealed class RecordingFailingHandler : IPlatformMessageHandler
     {
         public List<IReadOnlyDictionary<string, string>> SeenHeaderSnapshots { get; } = [];

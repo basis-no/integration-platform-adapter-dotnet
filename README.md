@@ -84,6 +84,23 @@ public sealed class MyMessageHandler : IPlatformMessageHandler
 }
 ```
 
+The step key is `<message-id>:<step-id>`, and a step whose key is already
+`DELIVERED` in `bip_step_outcome` is skipped. Choose step ids with that in mind:
+
+- Give every external call its own step id. A handler that sends several items
+  of one message through one step id, such as a loop over order lines, delivers
+  the first item and skips the rest. Put the item's stable key in the step id
+  (`post-line-{lineId}`).
+- The step outcome table has no integration column, so the lookup is not scoped
+  by integration. If a message id travels to another integration on the same
+  Message Store and both use the same step id, the second integration's step is
+  skipped as already delivered. Use step ids unique across integrations, and
+  when one integration produces for another, give the new message its own
+  `x-bip-message-id` and carry continuity in `x-bip-correlation-id`.
+
+The adapter logs a warning when it skips a step that the same handler invocation
+already ran, and when the skipped message id is journaled by another integration.
+
 ## Required Runtime Environment
 
 The shared `integration-app` chart injects these when the catalog enables both

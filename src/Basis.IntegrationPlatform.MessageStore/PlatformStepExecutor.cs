@@ -58,6 +58,7 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
         var idempotencyKey = IdempotencyKey(message.MessageId, stepId);
         if (!ShouldRedo(message, stepId, idempotencyKey, logger) && await WasDeliveredAsync(idempotencyKey, cancellationToken))
         {
+            await WarnAboutSharedStepKeyAsync(message, stepId, idempotencyKey, cancellationToken);
             Observe(message.MessageId, stepId, SkippedStatus, idempotencyKey, endpointUri, targetRef, null);
             return new PlatformStepExecutionResult(idempotencyKey, stepId, SkippedStatus, true);
         }
@@ -78,6 +79,40 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
     }
 
     internal static string IdempotencyKey(string messageId, string stepId) => $"{messageId}:{stepId}";
+
+    /// <summary>
+    /// The key is <c>messageId:stepId</c> (Contract v1 §7) and bip_step_outcome
+    /// has no integration column, so a DELIVERED row may not be this call's own
+    /// delivery. Warn on the two ways that happens; the skip itself is unchanged.
+    /// </summary>
+    private async Task WarnAboutSharedStepKeyAsync(
+        PlatformMessage message,
+        string stepId,
+        string idempotencyKey,
+        CancellationToken cancellationToken)
+    {
+        if (observations.CompletedInCurrentInvocation(message.MessageId, idempotencyKey))
+        {
+            logger.LogWarning(
+                "Step {StepId} already ran in this handler invocation and is skipped messageId={MessageId}. "
+                + "The step key is <message-id>:<step-id>; a handler that sends several items through one step needs a distinct step id per item.",
+                stepId,
+                message.MessageId);
+        }
+
+        var journaledBy = await JournaledIntegrationAsync(message.MessageId, cancellationToken);
+        if (journaledBy is not null && !string.Equals(journaledBy, message.ApplicationName, StringComparison.Ordinal))
+        {
+            logger.LogWarning(
+                "Step {StepId} is skipped as already delivered, but messageId={MessageId} is journaled by integration {JournaledBy}, not {Integration}. "
+                + "Step outcomes are not scoped by integration, so the delivery may be the other integration's. "
+                + "Use a new x-bip-message-id per integration, or step ids unique across integrations.",
+                stepId,
+                message.MessageId,
+                journaledBy,
+                message.ApplicationName);
+        }
+    }
 
     private void Observe(string messageId, string stepId, string status, string idempotencyKey, string endpointUri, string? targetRef, string? error)
     {
@@ -131,6 +166,20 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
         command.Parameters.AddWithValue("idempotency_key", idempotencyKey);
         var result = await command.ExecuteScalarAsync(cancellationToken);
         return result is not null;
+    }
+
+    private async Task<string?> JournaledIntegrationAsync(string messageId, CancellationToken cancellationToken)
+    {
+        await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
+        await using var command = new NpgsqlCommand(
+            """
+            select integration
+            from bip_message_log
+            where message_id = @message_id
+            """,
+            connection);
+        command.Parameters.AddWithValue("message_id", messageId);
+        return await command.ExecuteScalarAsync(cancellationToken) as string;
     }
 
     private async Task RecordAsync(

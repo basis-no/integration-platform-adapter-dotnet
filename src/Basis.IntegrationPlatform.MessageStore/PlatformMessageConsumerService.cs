@@ -137,6 +137,7 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
                 // The handler sees the consumed message unchanged on every
                 // in-process retry: retry diagnostics are recorded in the
                 // auto_redelivery_* columns, never invented as wire headers.
+                stepObservations.BeginHandlerInvocation(message.MessageId);
                 result = await handler.HandleAsync(message, cancellationToken);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
