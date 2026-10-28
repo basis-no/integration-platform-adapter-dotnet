@@ -100,7 +100,19 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
                 message.MessageId);
         }
 
-        var journaledBy = await JournaledIntegrationAsync(message.MessageId, cancellationToken);
+        string? journaledBy;
+        try
+        {
+            journaledBy = await JournaledIntegrationAsync(message.MessageId, cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // The lookup only feeds a warning: a failed read must not turn a
+            // correct skip into a step failure.
+            logger.LogDebug(ex, "Shared step key check skipped messageId={MessageId} step={StepId}", message.MessageId, stepId);
+            return;
+        }
+
         if (journaledBy is not null && !string.Equals(journaledBy, message.ApplicationName, StringComparison.Ordinal))
         {
             logger.LogWarning(

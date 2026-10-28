@@ -916,6 +916,61 @@ public sealed class PlatformMessageStorePostgresTests
     }
 
     [TestMethod]
+    public async Task FailedJournalLookupDoesNotFailASkippedStep()
+    {
+        var connectionString = RequireConnectionString();
+        var options = CreateOptions(connectionString);
+        await using var admin = NpgsqlDataSource.Create(connectionString);
+        var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+        var (_, adminSteps, _, _) = CreateStore(admin, options);
+        var message = CreateMessage(messageId, options);
+        await adminSteps.ExecuteAsync(message, "deliver", "https://target.example/orders", "target",
+            _ => Task.CompletedTask, CancellationToken.None);
+
+        // A role that can use the step ledger but cannot read bip_message_log,
+        // so the lookup behind the shared-key warning fails with 42501.
+        var role = $"bip_steps_only_{Guid.NewGuid():N}";
+        const string password = "synthetic-test-only";
+        try
+        {
+            await using (var connection = await admin.OpenConnectionAsync())
+            {
+                await using var create = new NpgsqlCommand(
+                    $"create role {role} login password '{password}'; grant select, insert, update on bip_step_outcome to {role};",
+                    connection);
+                await create.ExecuteNonQueryAsync();
+            }
+        }
+        catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.InsufficientPrivilege)
+        {
+            Assert.Inconclusive("The test connection cannot create roles.");
+        }
+
+        try
+        {
+            var restricted = new NpgsqlConnectionStringBuilder(connectionString) { Username = role, Password = password, Pooling = false };
+            await using var dataSource = NpgsqlDataSource.Create(restricted.ConnectionString);
+            var logs = new LogRecorder();
+            var steps = new PlatformStepExecutor(dataSource, new PlatformStepObservationCollector(), logs.For<PlatformStepExecutor>());
+            var ran = false;
+
+            var result = await steps.ExecuteAsync(message, "deliver", "https://target.example/orders", "target",
+                _ => { ran = true; return Task.CompletedTask; }, CancellationToken.None);
+
+            Assert.IsTrue(result.Skipped);
+            Assert.AreEqual("SKIPPED", result.Status);
+            Assert.IsFalse(ran);
+            Assert.AreEqual(0, logs.Warnings.Count);
+        }
+        finally
+        {
+            await using var connection = await admin.OpenConnectionAsync();
+            await using var drop = new NpgsqlCommand($"drop owned by {role}; drop role {role};", connection);
+            await drop.ExecuteNonQueryAsync();
+        }
+    }
+
+    [TestMethod]
     public async Task ReplayRecordsANewInlinePayloadExpiry()
     {
         // Pins current behaviour (A12): the upserts write
