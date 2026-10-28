@@ -30,7 +30,12 @@ The adapter owns platform mechanics for .NET integrations:
   of message status)
 - retries handler failures before terminal `COMPLETED` or `DLQ`
 - publishes failed messages to `APP_KAFKA_DLQ_TOPIC`
-  (default `bip.message.dlq`) with `x-bip-error` and `x-bip-dlq-at`
+  (default `bip.message.dlq`) with `x-bip-error` and `x-bip-dlq-at`. The DLQ
+  record also carries the other consumed headers; the values of
+  credential-like ones are masked as `xxxxxx`: `Authorization`, `Cookie`,
+  `Set-Cookie`, `WWW-Authenticate`, and names containing secret, token,
+  password, credential, session, signature, auth or API/subscription key.
+  Their names, `x-bip-*` and `Idempotency-Key` stay readable
 - exposes `POST /admin/messages/{messageId}/resend`
 - republishes replay payloads back to the integration input topic
   (`bip.<integration>.in`), committing the `REQUESTED` audit row before the
