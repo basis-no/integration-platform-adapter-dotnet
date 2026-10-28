@@ -18,6 +18,10 @@
   the delivery. The skip is unchanged; the README describes how to choose step
   ids. All 0.3.x releases are affected.
 
+- A replay records a new inline payload expiry, so each replay extends payload
+  retention from the time it was processed. This is current behaviour, now
+  pinned by a test.
+
 ## 0.3.0
 
 First public release, on NuGet.org, under the package id

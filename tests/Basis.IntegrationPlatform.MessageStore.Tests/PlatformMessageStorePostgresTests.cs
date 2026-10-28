@@ -915,6 +915,43 @@ public sealed class PlatformMessageStorePostgresTests
         Assert.AreEqual("DELIVERED", distinct.Status);
     }
 
+    [TestMethod]
+    public async Task ReplayRecordsANewInlinePayloadExpiry()
+    {
+        // Pins current behaviour (A12): the upserts write
+        // payload_expires_at = excluded.payload_expires_at, so each processed
+        // replay sets the expiry from its own processing time.
+        var connectionString = RequireConnectionString();
+        var options = CreateOptions(connectionString);
+        var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+        await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+        var (store, _, _, _) = CreateStore(dataSource, options);
+
+        await store.RecordAttemptAsync(CreateMessage(messageId, options), "dotnet-handler", "COMPLETED", null, CancellationToken.None);
+        await using (var connection = await dataSource.OpenConnectionAsync())
+        {
+            await using var age = new NpgsqlCommand(
+                "update bip_message_log set payload_expires_at = now() + interval '1 day' where message_id = @message_id",
+                connection);
+            age.Parameters.AddWithValue("message_id", messageId);
+            await age.ExecuteNonQueryAsync();
+        }
+
+        var replay = CreateMessage(messageId, options, new Dictionary<string, string>
+        {
+            ["x-bip-attempt"] = "2",
+            ["x-bip-replay"] = "true",
+        });
+        await store.RecordAttemptAsync(replay, "dotnet-handler", "COMPLETED", null, CancellationToken.None);
+
+        await using var read = await dataSource.OpenConnectionAsync();
+        await using var command = new NpgsqlCommand(
+            "select payload_expires_at > now() + interval '29 days' from bip_message_log where message_id = @message_id",
+            read);
+        command.Parameters.AddWithValue("message_id", messageId);
+        Assert.AreEqual(true, await command.ExecuteScalarAsync(), "A replay currently extends the inline payload expiry.");
+    }
+
     private sealed class RecordingFailingHandler : IPlatformMessageHandler
     {
         public List<IReadOnlyDictionary<string, string>> SeenHeaderSnapshots { get; } = [];
