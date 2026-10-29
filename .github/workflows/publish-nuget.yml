@@ -1,55 +1,203 @@
 name: Publish to NuGet.org
 
 # Tag-driven release per ADR-003: the csproj keeps a -preview version for
-# development; the release version derives from the tag (vX.Y.Z). Publishes
-# with NuGet Trusted Publishing (OIDC via NuGet/login); the only secret is
-# NUGET_USER, the nuget.org profile name.
+# development; the release version derives from the tag (vX.Y.Z). A tag
+# ruleset limits who can create one. Trust boundaries, one per job:
+# - build runs all project code (tests, pack) with a read-only token, no
+#   secrets and no OIDC token.
+# - attest runs no project code. It records checksums and requests an OIDC
+#   token only for GitHub build provenance.
+# - push runs in environment `release` (required reviewers). It never checks
+#   out or runs project code; its OIDC token is exchanged by NuGet/login for a
+#   1-hour API key under the nuget.org Trusted Publishing policy, which is
+#   bound to this workflow file and environment `release`.
 
 on:
   push:
     tags:
-      - "v*"
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions: {}
+
+concurrency:
+  group: publish-nuget-${{ github.ref_name }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  TAG: ${{ github.ref_name }}
+  PACKAGE: Basis.IntegrationPlatform.MessageStore
+  # Release commits must be reachable from one of these.
+  REVIEWED_BRANCHES: main
 
 jobs:
-  publish:
-    if: github.server_url == 'https://github.com'
+  build:
+    # Runs only on github.com, never on a mirror.
+    if: github.server_url == 'https://github.com' && github.ref_type == 'tag'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
-      # Trusted Publishing: the job proves its identity to nuget.org via the
-      # GitHub OIDC token and gets a 1-hour API key back - no stored secret.
-      id-token: write
+    # The same real-Postgres suite as test.yml, before anything is packed.
+    services:
+      postgres:
+        image: postgres@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
+        env:
+          POSTGRES_DB: adapter_test
+          POSTGRES_PASSWORD: synthetic-ci-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d adapter_test"
+          --health-interval 2s --health-timeout 5s --health-retries 30
     env:
-      TAG: ${{ github.ref_name }}
+      POSTGRES_TEST_CONNECTION_STRING: Host=127.0.0.1;Port=5432;Database=adapter_test;Username=postgres;Password=synthetic-ci-only
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      DOTNET_NOLOGO: '1'
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Validate tag format
-        run: |
-          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "Tag '$TAG' is not a release tag (vX.Y.Z); refusing to publish." >&2
-            exit 1
-          fi
-
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          dotnet-version: "8.0.x"
-
-      - name: Test
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check the tag and that it is on a reviewed branch
+        run: |
+          [[ "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]] || { echo "Tag '$TAG' is not a release tag (vX.Y.Z)." >&2; exit 1; }
+          echo "VERSION=${BASH_REMATCH[1]}" >> "$GITHUB_ENV"
+          test "$(git rev-parse "refs/tags/$TAG^{commit}")" = "$GITHUB_SHA"
+          for branch in $REVIEWED_BRANCHES; do
+            if git merge-base --is-ancestor "$GITHUB_SHA" "refs/remotes/origin/$branch"; then exit 0; fi
+          done
+          echo "Tag $TAG is not on a reviewed branch ($REVIEWED_BRANCHES)." >&2
+          exit 1
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: '8.0.x'
+      - name: Install the synthetic contract fixture
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          for sql in tests/fixtures/postgres/*.sql; do
+            docker exec -i "$POSTGRES_CONTAINER" psql -U postgres -d adapter_test --set=ON_ERROR_STOP=1 < "$sql"
+          done
+      - name: Test with real PostgreSQL
         # No solution file at the repo root - target the test project directly.
         run: dotnet test tests/Basis.IntegrationPlatform.MessageStore.Tests/Basis.IntegrationPlatform.MessageStore.Tests.csproj --configuration Release
-
       - name: Pack
-        run: dotnet pack src/Basis.IntegrationPlatform.MessageStore/Basis.IntegrationPlatform.MessageStore.csproj --configuration Release -p:Version="${TAG#v}" --output artifacts
+        run: dotnet pack "src/$PACKAGE/$PACKAGE.csproj" --configuration Release -p:Version="$VERSION" --output package
+      - name: Retain the package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nuget-package-${{ env.VERSION }}
+          path: package/
+          if-no-files-found: error
+          retention-days: 90
 
+  attest:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      id-token: write
+      attestations: write
+    steps:
+      - name: Derive version from the tag
+        run: |
+          [[ "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]
+          echo "VERSION=${BASH_REMATCH[1]}" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: nuget-package-${{ env.VERSION }}
+          path: package
+      - name: Record package checksums (data only, no checkout)
+        working-directory: package
+        run: |
+          set -euo pipefail
+          # Exactly the one package, as a regular file.
+          name="$PACKAGE.$VERSION.nupkg"
+          test "$(find . -mindepth 1 -printf '%y %P\n')" = "f $name"
+          sha256sum -- "$name" > "$GITHUB_WORKSPACE/package.sha256"
+          { echo '```'; cat "$GITHUB_WORKSPACE/package.sha256"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: package.sha256
+      - name: Retain recorded checksums
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nuget-checksums-${{ env.VERSION }}
+          path: package.sha256
+          if-no-files-found: error
+          retention-days: 90
+
+  push:
+    needs: attest
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # nuget.org Trusted Publishing policy: this workflow file and environment
+    # `release` only. Required reviewers approve before the job gets its token.
+    environment: release
+    permissions:
+      actions: read
+      attestations: read
+      id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      DOTNET_NOLOGO: '1'
+    steps:
+      - name: Check environment protection and the tag
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]
+          echo "VERSION=${BASH_REMATCH[1]}" >> "$GITHUB_ENV"
+          repo="repos/$GITHUB_REPOSITORY"
+          # Fail closed if the environment lost its reviewers or tag-only rule.
+          gh api "$repo/environments/release" | jq -e '
+            .can_admins_bypass == false
+            and .deployment_branch_policy.custom_branch_policies == true
+            and ([.protection_rules[] | select(.type == "required_reviewers")
+                  | select(.prevent_self_review == true and (.reviewers | length) >= 2)] | length) == 1' > /dev/null \
+            || { echo "Environment release is not protected as required." >&2; exit 1; }
+          gh api "$repo/environments/release/deployment-branch-policies" | jq -e '
+            .total_count >= 1 and all(.branch_policies[]; .type == "tag")' > /dev/null \
+            || { echo "Environment release must allow release tags only." >&2; exit 1; }
+          tag_object="$(gh api "$repo/git/ref/tags/$TAG" --jq '.object.type + " " + .object.sha')"
+          if [ "${tag_object% *}" = tag ]; then tag_object="$(gh api "$repo/git/tags/${tag_object#* }" --jq '.object.type + " " + .object.sha')"; fi
+          test "$tag_object" = "commit $GITHUB_SHA" || { echo "Tag $TAG no longer points at $GITHUB_SHA." >&2; exit 1; }
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: nuget-package-${{ env.VERSION }}
+          path: package
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: nuget-checksums-${{ env.VERSION }}
+          path: checksums
+      - name: Verify package bytes and build provenance (data only)
+        run: |
+          set -euo pipefail
+          (cd package && sha256sum -c --strict --quiet ../checksums/package.sha256)
+          test "$(find package -mindepth 1 | wc -l)" -eq 1
+          test "$(wc -l < checksums/package.sha256)" -eq 1
+          while read -r _ name; do
+            gh attestation verify "package/$name" --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/publish-nuget.yml" \
+              --signer-digest "$GITHUB_SHA" --source-ref "$GITHUB_REF" --source-digest "$GITHUB_SHA" \
+              --deny-self-hosted-runners > /dev/null
+          done < checksums/package.sha256
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: '8.0.x'
       # Requested right before the push: the exchanged API key lives 1 hour.
       - name: NuGet login (OIDC -> temp API key)
-        uses: NuGet/login@v1
+        uses: NuGet/login@8d196754b4036150537f80ac539e15c2f1028841 # v1.2.0
         id: login
         with:
           user: ${{ secrets.NUGET_USER }}
-
-      - name: Push
-        run: dotnet nuget push "artifacts/*.nupkg" --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json --skip-duplicate
+      # No --skip-duplicate: a version that already exists must fail the run,
+      # never pass while NuGet.org keeps other bytes under that version.
+      - name: Push the verified package
         env:
           NUGET_API_KEY: ${{ steps.login.outputs.NUGET_API_KEY }}
+        run: dotnet nuget push "package/$PACKAGE.$VERSION.nupkg" --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json
