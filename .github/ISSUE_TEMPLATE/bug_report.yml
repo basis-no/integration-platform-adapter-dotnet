@@ -1,0 +1,27 @@
+name: Bug report
+description: Something in the adapter does not work as documented.
+labels: ["bug"]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Adapter version
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: A minimal route or configuration. Remove hostnames, credentials and message contents.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: Remove credentials, hostnames and personal data first.
+      render: text

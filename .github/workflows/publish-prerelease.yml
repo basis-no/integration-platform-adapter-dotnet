@@ -1,0 +1,121 @@
+name: Publish NuGet pre-release
+
+# Manually publishes the checked-out commit to NuGet.org as a pre-release of
+# the csproj's next intended version: X.Y.Z-preview.<UTC date>.<run number>.
+# It does not create a Git tag or a release version; final releases stay
+# tag-driven in publish-nuget.yml. NuGet.org never deletes a version (unlisting
+# only hides it), so every run publishes permanently.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: publish-dotnet-adapter-prerelease
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  publish:
+    # Runs only on github.com, never on a mirror, as publish-nuget.yml.
+    if: github.server_url == 'https://github.com'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      # Trusted Publishing, as publish-nuget.yml; NuGet.org needs a policy for
+      # this workflow file.
+      id-token: write
+    # The same real-Postgres suite as test.yml, before anything is published.
+    services:
+      postgres:
+        image: postgres@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
+        env:
+          POSTGRES_DB: adapter_test
+          POSTGRES_PASSWORD: synthetic-ci-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d adapter_test"
+          --health-interval 2s --health-timeout 5s --health-retries 30
+    env:
+      POSTGRES_TEST_CONNECTION_STRING: Host=127.0.0.1;Port=5432;Database=adapter_test;Username=postgres;Password=synthetic-ci-only
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      DOTNET_NOLOGO: '1'
+      PROJECT: src/Basis.IntegrationPlatform.MessageStore/Basis.IntegrationPlatform.MessageStore.csproj
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Choose the pre-release version
+        id: version
+        run: |
+          development="$(dotnet msbuild "$PROJECT" -getProperty:Version)"
+          if [[ ! "$development" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-[0-9A-Za-z.-]+$ ]]; then
+            echo "Refusing: the csproj Version '$development' is not a development version such as 0.4.0-preview.1." >&2
+            exit 1
+          fi
+          next="${BASH_REMATCH[1]}"
+          released="$(curl -fsS --retry 3 https://api.nuget.org/v3-flatcontainer/basis.integrationplatform.messagestore/index.json)"
+          if jq -e --arg v "$next" '.versions | index($v) != null' <<<"$released" >/dev/null; then
+            echo "Refusing: $next is already released; set the csproj Version to the next intended release." >&2
+            exit 1
+          fi
+          # SemVer forbids leading zeros in numeric labels, which rules out a time
+          # of day such as 090503; the run number keeps each version unique.
+          version="$next-preview.$(date -u +%Y%m%d).$GITHUB_RUN_NUMBER"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Publishing $version from $GITHUB_SHA ($GITHUB_REF_NAME)"
+
+      - name: Install the synthetic contract fixture
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          for sql in tests/fixtures/postgres/*.sql; do
+            docker exec -i "$POSTGRES_CONTAINER" psql -U postgres -d adapter_test --set=ON_ERROR_STOP=1 < "$sql"
+          done
+
+      - name: Test with real PostgreSQL
+        run: dotnet test tests/Basis.IntegrationPlatform.MessageStore.Tests/Basis.IntegrationPlatform.MessageStore.Tests.csproj --configuration Release
+
+      - name: Pack
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: dotnet pack "$PROJECT" --configuration Release -p:Version="$VERSION" --output artifacts
+
+      # Requested right before the push: the exchanged API key lives 1 hour.
+      - name: NuGet login (OIDC -> temp API key)
+        uses: NuGet/login@8d196754b4036150537f80ac539e15c2f1028841 # v1
+        id: login
+        with:
+          user: ${{ secrets.NUGET_USER }}
+
+      # No --skip-duplicate: a version that already exists must fail the run,
+      # never pass while NuGet.org keeps other bytes under that version.
+      - name: Push
+        env:
+          NUGET_API_KEY: ${{ steps.login.outputs.NUGET_API_KEY }}
+        run: dotnet nuget push "artifacts/*.nupkg" --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json
+
+      - name: Summary
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          {
+            echo "Published \`Basis.IntegrationPlatform.MessageStore\` \`$VERSION\` from \`$GITHUB_SHA\` ($GITHUB_REF_NAME)."
+            echo
+            echo "Pin it exactly, for example in \`Directory.Packages.props\`:"
+            echo
+            echo '```xml'
+            echo "<PackageVersion Include=\"Basis.IntegrationPlatform.MessageStore\" Version=\"$VERSION\" />"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,9 @@
+bin/
+obj/
+artifacts/
+TestResults/
+*.user
+.vscode/
+.DS_Store
+artifacts/
+artifacts-release/

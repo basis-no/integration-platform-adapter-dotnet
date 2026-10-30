@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <IsPackable>true</IsPackable>
+    <PackageId>Basis.IntegrationPlatform.MessageStore</PackageId>
+    <Version>0.4.0-preview.1</Version>
+    <Authors>Basis</Authors>
+    <Description>Basis Integration Platform .NET message-store runtime adapter. Implements message-store contract v1.0.0-rc2.</Description>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/basis-no/integration-platform-adapter-dotnet</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/basis-no/integration-platform-adapter-dotnet</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageTags>basis;integration-platform;message-store;kafka;postgres</PackageTags>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="../../README.md" Pack="true" PackagePath="/" />
+    <None Include="../../LICENSE" Pack="true" PackagePath="/" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <PackageReference Include="Confluent.Kafka" />
+    <PackageReference Include="Npgsql" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Basis.IntegrationPlatform.MessageStore.Tests" />
+  </ItemGroup>
+</Project>

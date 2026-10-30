@@ -1,0 +1,48 @@
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
+        env:
+          POSTGRES_DB: adapter_test
+          POSTGRES_PASSWORD: synthetic-ci-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d adapter_test"
+          --health-interval 2s --health-timeout 5s --health-retries 30
+    env:
+      POSTGRES_TEST_CONNECTION_STRING: Host=127.0.0.1;Port=5432;Database=adapter_test;Username=postgres;Password=synthetic-ci-only
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
+        with:
+          dotnet-version: '8.0.x'
+      - name: Install the synthetic contract fixture
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          for sql in tests/fixtures/postgres/*.sql; do
+            docker exec -i "$POSTGRES_CONTAINER" psql -U postgres -d adapter_test --set=ON_ERROR_STOP=1 < "$sql"
+          done
+      - name: Test with real PostgreSQL
+        run: dotnet test tests/Basis.IntegrationPlatform.MessageStore.Tests/Basis.IntegrationPlatform.MessageStore.Tests.csproj --configuration Release
