@@ -819,6 +819,194 @@ public sealed class PlatformMessageStorePostgresTests
         return (int)(await command.ExecuteScalarAsync())!;
     }
 
+    [TestMethod]
+    public async Task FanOutThroughOneStepIdSkipsLaterItemsAndWarns()
+    {
+        var connectionString = RequireConnectionString();
+        var options = CreateOptions(connectionString);
+        await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+        var observations = new PlatformStepObservationCollector();
+        var logs = new LogRecorder();
+        var steps = new PlatformStepExecutor(dataSource, observations, logs.For<PlatformStepExecutor>());
+        var message = CreateMessage($"dotnet-test-{Guid.NewGuid():N}", options);
+        observations.BeginHandlerInvocation(message.MessageId);
+
+        // The key is <message-id>:<step-id>, so items sent through one step id
+        // share a key: the first is delivered, the rest are skipped.
+        var sent = new List<string>();
+        foreach (var item in new[] { "line-1", "line-2", "line-3" })
+        {
+            await steps.ExecuteAsync(message, "post-line", "https://target.example/lines", "target",
+                _ => { sent.Add(item); return Task.CompletedTask; }, CancellationToken.None);
+        }
+
+        CollectionAssert.AreEqual(new[] { "line-1" }, sent);
+        Assert.AreEqual(2, logs.Warnings.Count(w => w.Contains("distinct step id per item", StringComparison.Ordinal)));
+
+        // A step id per item delivers every item.
+        sent.Clear();
+        foreach (var item in new[] { "line-1", "line-2", "line-3" })
+        {
+            await steps.ExecuteAsync(message, $"post-line-{item}", "https://target.example/lines", "target",
+                _ => { sent.Add(item); return Task.CompletedTask; }, CancellationToken.None);
+        }
+
+        CollectionAssert.AreEqual(new[] { "line-1", "line-2", "line-3" }, sent);
+    }
+
+    [TestMethod]
+    public async Task InProcessRetryOfADeliveredStepDoesNotWarnAboutReuse()
+    {
+        var connectionString = RequireConnectionString();
+        var options = CreateOptions(connectionString);
+        await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+        var observations = new PlatformStepObservationCollector();
+        var logs = new LogRecorder();
+        var steps = new PlatformStepExecutor(dataSource, observations, logs.For<PlatformStepExecutor>());
+        var message = CreateMessage($"dotnet-test-{Guid.NewGuid():N}", options);
+
+        observations.BeginHandlerInvocation(message.MessageId);
+        await steps.ExecuteAsync(message, "deliver", "https://target.example/orders", "target",
+            _ => Task.CompletedTask, CancellationToken.None);
+        // The consumer starts a new handler invocation for each in-process retry.
+        observations.BeginHandlerInvocation(message.MessageId);
+        var retried = await steps.ExecuteAsync(message, "deliver", "https://target.example/orders", "target",
+            _ => Task.CompletedTask, CancellationToken.None);
+
+        Assert.IsTrue(retried.Skipped);
+        Assert.AreEqual(0, logs.Warnings.Count);
+    }
+
+    [TestMethod]
+    public async Task SharedMessageIdAcrossIntegrationsSkipsTheSecondDeliveryAndWarns()
+    {
+        var connectionString = RequireConnectionString();
+        var first = CreateOptions(connectionString);
+        first.ApplicationName = "integration-first";
+        var second = CreateOptions(connectionString);
+        second.ApplicationName = "integration-second";
+        var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+        await using var dataSource = NpgsqlDataSource.Create(connectionString);
+
+        var (firstStore, firstSteps, _, _) = CreateStore(dataSource, first);
+        var firstMessage = CreateMessage(messageId, first);
+        await firstSteps.ExecuteAsync(firstMessage, "deliver", "https://first.example/orders", "first",
+            _ => Task.CompletedTask, CancellationToken.None);
+        await firstStore.RecordAttemptAsync(firstMessage, "dotnet-handler", "COMPLETED", null, CancellationToken.None);
+
+        // The message id travelled on to a second integration on the same
+        // Message Store. bip_step_outcome is not scoped by integration, so an
+        // equal step id matches the first integration's delivery.
+        var logs = new LogRecorder();
+        var secondSteps = new PlatformStepExecutor(dataSource, new PlatformStepObservationCollector(), logs.For<PlatformStepExecutor>());
+        var secondMessage = CreateMessage(messageId, second);
+        var secondRan = false;
+        var collided = await secondSteps.ExecuteAsync(secondMessage, "deliver", "https://second.example/orders", "second",
+            _ => { secondRan = true; return Task.CompletedTask; }, CancellationToken.None);
+
+        Assert.IsTrue(collided.Skipped);
+        Assert.IsFalse(secondRan);
+        Assert.AreEqual(1, logs.Warnings.Count);
+        StringAssert.Contains(logs.Warnings[0], "journaled by integration integration-first");
+
+        // A step id unique across the integrations is delivered.
+        var distinct = await secondSteps.ExecuteAsync(secondMessage, "second-deliver", "https://second.example/orders", "second",
+            _ => Task.CompletedTask, CancellationToken.None);
+        Assert.AreEqual("DELIVERED", distinct.Status);
+    }
+
+    [TestMethod]
+    public async Task FailedJournalLookupDoesNotFailASkippedStep()
+    {
+        var connectionString = RequireConnectionString();
+        var options = CreateOptions(connectionString);
+        await using var admin = NpgsqlDataSource.Create(connectionString);
+        var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+        var (_, adminSteps, _, _) = CreateStore(admin, options);
+        var message = CreateMessage(messageId, options);
+        await adminSteps.ExecuteAsync(message, "deliver", "https://target.example/orders", "target",
+            _ => Task.CompletedTask, CancellationToken.None);
+
+        // A role that can use the step ledger but cannot read bip_message_log,
+        // so the lookup behind the shared-key warning fails with 42501.
+        var role = $"bip_steps_only_{Guid.NewGuid():N}";
+        const string password = "synthetic-test-only";
+        try
+        {
+            await using (var connection = await admin.OpenConnectionAsync())
+            {
+                await using var create = new NpgsqlCommand(
+                    $"create role {role} login password '{password}'; grant select, insert, update on bip_step_outcome to {role};",
+                    connection);
+                await create.ExecuteNonQueryAsync();
+            }
+        }
+        catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.InsufficientPrivilege)
+        {
+            Assert.Inconclusive("The test connection cannot create roles.");
+        }
+
+        try
+        {
+            var restricted = new NpgsqlConnectionStringBuilder(connectionString) { Username = role, Password = password, Pooling = false };
+            await using var dataSource = NpgsqlDataSource.Create(restricted.ConnectionString);
+            var logs = new LogRecorder();
+            var steps = new PlatformStepExecutor(dataSource, new PlatformStepObservationCollector(), logs.For<PlatformStepExecutor>());
+            var ran = false;
+
+            var result = await steps.ExecuteAsync(message, "deliver", "https://target.example/orders", "target",
+                _ => { ran = true; return Task.CompletedTask; }, CancellationToken.None);
+
+            Assert.IsTrue(result.Skipped);
+            Assert.AreEqual("SKIPPED", result.Status);
+            Assert.IsFalse(ran);
+            Assert.AreEqual(0, logs.Warnings.Count);
+        }
+        finally
+        {
+            await using var connection = await admin.OpenConnectionAsync();
+            await using var drop = new NpgsqlCommand($"drop owned by {role}; drop role {role};", connection);
+            await drop.ExecuteNonQueryAsync();
+        }
+    }
+
+    [TestMethod]
+    public async Task ReplayRecordsANewInlinePayloadExpiry()
+    {
+        // Pins current behaviour (A12): the upserts write
+        // payload_expires_at = excluded.payload_expires_at, so each processed
+        // replay sets the expiry from its own processing time.
+        var connectionString = RequireConnectionString();
+        var options = CreateOptions(connectionString);
+        var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+        await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+        var (store, _, _, _) = CreateStore(dataSource, options);
+
+        await store.RecordAttemptAsync(CreateMessage(messageId, options), "dotnet-handler", "COMPLETED", null, CancellationToken.None);
+        await using (var connection = await dataSource.OpenConnectionAsync())
+        {
+            await using var age = new NpgsqlCommand(
+                "update bip_message_log set payload_expires_at = now() + interval '1 day' where message_id = @message_id",
+                connection);
+            age.Parameters.AddWithValue("message_id", messageId);
+            await age.ExecuteNonQueryAsync();
+        }
+
+        var replay = CreateMessage(messageId, options, new Dictionary<string, string>
+        {
+            ["x-bip-attempt"] = "2",
+            ["x-bip-replay"] = "true",
+        });
+        await store.RecordAttemptAsync(replay, "dotnet-handler", "COMPLETED", null, CancellationToken.None);
+
+        await using var read = await dataSource.OpenConnectionAsync();
+        await using var command = new NpgsqlCommand(
+            "select payload_expires_at > now() + interval '29 days' from bip_message_log where message_id = @message_id",
+            read);
+        command.Parameters.AddWithValue("message_id", messageId);
+        Assert.AreEqual(true, await command.ExecuteScalarAsync(), "A replay currently extends the inline payload expiry.");
+    }
+
     private sealed class RecordingFailingHandler : IPlatformMessageHandler
     {
         public List<IReadOnlyDictionary<string, string>> SeenHeaderSnapshots { get; } = [];

@@ -9,6 +9,19 @@ namespace Basis.IntegrationPlatform.MessageStore;
 
 internal sealed class PlatformMessageConsumerService : BackgroundService
 {
+    internal const string MaskedHeaderValue = "xxxxxx";
+
+    private static readonly HashSet<string> CredentialHeaders = new(StringComparer.Ordinal)
+    {
+        "authorization", "proxy-authorization", "cookie", "set-cookie", "www-authenticate", "proxy-authenticate",
+    };
+
+    private static readonly string[] CredentialNameParts =
+    [
+        "secret", "token", "password", "passwd", "credential", "session", "signature",
+        "apikey", "api-key", "api_key", "subscription-key", "private-key", "auth",
+    ];
+
     private readonly IPlatformMessageHandler handler;
     private readonly PlatformMessageStore store;
     private readonly PlatformStepObservationCollector stepObservations;
@@ -124,6 +137,7 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
                 // The handler sees the consumed message unchanged on every
                 // in-process retry: retry diagnostics are recorded in the
                 // auto_redelivery_* columns, never invented as wire headers.
+                stepObservations.BeginHandlerInvocation(message.MessageId);
                 result = await handler.HandleAsync(message, cancellationToken);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
@@ -222,7 +236,17 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
 
     internal static Headers CreateDlqHeaders(PlatformMessage message, string error)
     {
-        var values = new Dictionary<string, string>(message.Headers, StringComparer.OrdinalIgnoreCase)
+        // Contract v1 §8 requires only the x-bip-* envelope on the DLQ record.
+        // The other consumed headers are kept for diagnosis, but a producer can
+        // forward credentials (Authorization, cookies, API keys) onto the input
+        // topic, and the DLQ topic is shared: keep their names, mask the values.
+        var values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var header in message.Headers)
+        {
+            values[header.Key] = IsCredentialHeader(header.Key) ? MaskedHeaderValue : header.Value;
+        }
+
+        var envelope = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
             ["x-bip-message-id"] = message.MessageId,
             ["x-bip-correlation-id"] = message.CorrelationId,
@@ -232,6 +256,10 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
             ["x-bip-error"] = error,
             ["x-bip-dlq-at"] = DateTimeOffset.UtcNow.ToString("O"),
         };
+        foreach (var header in envelope)
+        {
+            values[header.Key] = header.Value;
+        }
 
         var headers = new Headers();
         foreach (var header in values)
@@ -240,6 +268,24 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
         }
 
         return headers;
+    }
+
+    // Same rule as the Camel adapter's DLQ parking (0.3.6), so both runtimes
+    // mask the same header names on the shared DLQ topic. A -key or _key
+    // suffix covers vendor keys such as x-functions-key; Idempotency-Key is
+    // a delivery identifier, not a credential.
+    internal static bool IsCredentialHeader(string name)
+    {
+        var lower = name.ToLowerInvariant();
+        if (lower.StartsWith("x-bip-", StringComparison.Ordinal) || lower == "idempotency-key")
+        {
+            return false;
+        }
+
+        return CredentialHeaders.Contains(lower)
+            || CredentialNameParts.Any(part => lower.Contains(part, StringComparison.Ordinal))
+            || lower.EndsWith("-key", StringComparison.Ordinal)
+            || lower.EndsWith("_key", StringComparison.Ordinal);
     }
 
     private static string? Header(IReadOnlyDictionary<string, string> headers, string name)

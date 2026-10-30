@@ -30,7 +30,13 @@ The adapter owns platform mechanics for .NET integrations:
   of message status)
 - retries handler failures before terminal `COMPLETED` or `DLQ`
 - publishes failed messages to `APP_KAFKA_DLQ_TOPIC`
-  (default `bip.message.dlq`) with `x-bip-error` and `x-bip-dlq-at`
+  (default `bip.message.dlq`) with `x-bip-error` and `x-bip-dlq-at`. The DLQ
+  record also carries the other consumed headers; the values of
+  credential-like ones are masked as `xxxxxx`: `Authorization`, `Cookie`,
+  `Set-Cookie`, `WWW-Authenticate`, and names containing secret, token,
+  password, credential, session, signature, auth or API/subscription key, and
+  names ending in `-key` or `_key` (`x-functions-key`). Their names, `x-bip-*`
+  and `Idempotency-Key` stay readable
 - exposes `POST /admin/messages/{messageId}/resend`
 - republishes replay payloads back to the integration input topic
   (`bip.<integration>.in`), committing the `REQUESTED` audit row before the
@@ -78,6 +84,26 @@ public sealed class MyMessageHandler : IPlatformMessageHandler
     }
 }
 ```
+
+The step key is `<message-id>:<step-id>`, and a step whose key is already
+`DELIVERED` in `bip_step_outcome` is skipped. Choose step ids with that in mind:
+
+- Give every external call its own step id. A handler that sends several items
+  of one message through one step id, such as a loop over order lines, delivers
+  the first item and skips the rest. Put the item's stable key in the step id
+  (`post-line-{lineId}`).
+- The step outcome table has no integration column, so the lookup is not scoped
+  by integration. If a message id travels to another integration on the same
+  Message Store and both use the same step id, the second integration's step is
+  skipped as already delivered. Use step ids unique across integrations, and
+  when one integration produces for another, give the new message its own
+  `x-bip-message-id` and carry continuity in `x-bip-correlation-id`.
+
+The adapter logs a warning when it skips a step that the same handler invocation
+already ran, and when the skipped message id is journaled by another integration.
+The second warning reads `bip_message_log`. Under runtime isolation, row-level
+security hides the other integration's row, so that warning never fires there.
+If the read fails, the step is still skipped and the check is logged at debug.
 
 ## Required Runtime Environment
 
