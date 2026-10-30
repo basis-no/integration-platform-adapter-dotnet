@@ -70,11 +70,13 @@ incident details in code, tests, docs, commits or PRs. Examples stay provider-ne
    variable breaks integrations on upgrade. Add an overload or keep a compatibility path, as the
    `RecordAttemptAsync(message, routeId, ...)` overload and the default datasource registration do.
 5. **Publishing.** NuGet.org never deletes a version, so both lanes publish permanently. A pushed
-   `v*` tag runs `publish-nuget.yml`, which tests, packs with the version from the tag and pushes;
-   tag only when asked. A manual run of `publish-prerelease.yml` publishes the selected branch as
-   `X.Y.Z-preview.<date>.<run>`; run it only when asked. The csproj `<Version>` is the next
-   intended release with a `-preview` label: the pre-release takes `X.Y.Z` from it and the tag
-   sets the release version. `docs/releasing.md` is the procedure.
+   `vX.Y.Z` tag runs `publish-nuget.yml`, which tests and packs, then pushes after an approval in
+   environment `release`; tag only when asked. A manual run of `publish-prerelease.yml` publishes
+   the selected branch as `X.Y.Z-preview.<date>.<run>` after an approval in environment
+   `prerelease`; run it only when asked. Never run `dotnet test`, `dotnet pack` or any repository
+   code in a job that has `id-token: write`, and never give the build job secrets. The csproj
+   `<Version>` is the next intended release with a `-preview` label: the pre-release takes `X.Y.Z`
+   from it and the tag sets the release version. `docs/releasing.md` is the procedure.
 
 ## How it works
 

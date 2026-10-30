@@ -143,8 +143,9 @@ is captured, unexpired, and undeleted.
 ## Publish
 
 Releases are published to NuGet.org as `Basis.IntegrationPlatform.MessageStore`
-by `.github/workflows/publish-nuget.yml` when a `vX.Y.Z` tag is pushed (NuGet
-Trusted Publishing); the version comes from the tag. Pre-releases for
+by `.github/workflows/publish-nuget.yml` when a `vX.Y.Z` tag is pushed and a
+release reviewer approves (NuGet Trusted Publishing); the version comes from the
+tag, and each package has GitHub build provenance. Pre-releases for
 acceptance testing, `X.Y.Z-preview.<date>.<run>`, are published by the manual
 `publish-prerelease.yml` workflow and never tagged. A pre-release is an
 uncertified test build: use one only by pinning its exact version, never as a
