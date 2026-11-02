@@ -86,7 +86,9 @@ public sealed class MyMessageHandler : IPlatformMessageHandler
 ```
 
 The step key is `<message-id>:<step-id>`, and a step whose key is already
-`DELIVERED` in `bip_step_outcome` is skipped. Choose step ids with that in mind:
+`DELIVERED` in `bip_step_outcome` is skipped, unless the message's
+`x-bip-redo-steps` header (a JSON array of step ids or step keys) names it.
+Choose step ids with that in mind:
 
 - Give every external call its own step id. A handler that sends several items
   of one message through one step id, such as a loop over order lines, delivers
