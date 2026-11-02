@@ -129,11 +129,9 @@ build: use one only by pinning its exact version, never as a production
 dependency. `docs/releasing.md` in the repository describes both lanes.
 NuGet.org is the canonical channel.
 
-## License and support
+## License
 
-Apache-2.0. Basis maintains the adapter; customers with a Basis support
-agreement get production support through it. Issues and pull requests from
-other users are welcome and handled best-effort.
+Apache-2.0. Issues and pull requests are welcome and handled best-effort.
 
 ## Turning payload capture off
 
