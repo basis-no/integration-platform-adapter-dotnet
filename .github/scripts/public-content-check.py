@@ -33,7 +33,7 @@ PRIVATE_IP = re.compile(
 # Written so that none of these lines matches its own pattern.
 EXTERNAL_CITATIONS = {
     "decision-number": re.compile(r"\bDECISION\s+D\d+\b", re.IGNORECASE),
-    "adr-number": re.compile(r"(?<![\w-])ADR-\d+\b", re.IGNORECASE),
+    "adr-number": re.compile(r"(?<![\w-])ADR-\d+(?![\w-])", re.IGNORECASE),
     "section-number": re.compile(r"§\s*\d"),
     "certification-suite": re.compile(r"\bcertification\s+suite\b", re.IGNORECASE),
 }
