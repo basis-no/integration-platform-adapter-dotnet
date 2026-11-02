@@ -24,11 +24,19 @@ The adapter owns the message-store mechanics of a .NET integration:
 - records terminal status in `bip_message_log` and `bip_message_attempt`
 - records per-attempt step observations (`DELIVERED`/`FAILED`/`SKIPPED`)
   in `bip_message_attempt.steps_json`
-- records idempotent external step outcomes in `bip_step_outcome`
+- records idempotent external step outcomes in `bip_step_outcome`. The
+  recorded endpoint URI, there and in `steps_json`, has its user info and the
+  values of credential-like query parameters masked as `xxxxxx` (the DLQ
+  header rule below, plus `key`, `code`, `sig`, `pwd`, passphrase, passcode
+  and private, access or account key). Only the recorded copy is masked
 - stores replayable payload bytes in Postgres under the payload policy
   (`replayable` = payload captured, not expired, not deleted — independent
   of message status)
-- retries handler failures before terminal `COMPLETED` or `DLQ`
+- retries handler failures before terminal `COMPLETED` or `DLQ`. A
+  cancellation is shutdown only when the host is stopping; any other, such as
+  an `HttpClient` timeout, is a handler failure, and a timed-out step is
+  recorded as `FAILED`. Recoverable Kafka consume errors are logged and
+  retried; a fatal one stops the consumer
 - publishes failed messages to `APP_KAFKA_DLQ_TOPIC`
   (default `bip.message.dlq`) with `x-bip-error` and `x-bip-dlq-at`. The DLQ
   record also carries the other consumed headers; the values of
@@ -37,7 +45,10 @@ The adapter owns the message-store mechanics of a .NET integration:
   password, credential, session, signature, auth or API/subscription key, and
   names ending in `-key` or `_key` (`x-functions-key`). Their names, `x-bip-*`
   and `Idempotency-Key` stay readable
-- exposes `POST /admin/messages/{messageId}/resend`
+- exposes `POST /admin/messages/{messageId}/resend` for messages this
+  integration journaled. A message of another integration on the same
+  Message Store is refused with `409 NOT_REPLAYABLE` before any audit row or
+  produce
 - republishes replay payloads back to the integration input topic
   (`bip.<integration>.in`), committing the `REQUESTED` audit row before the
   Kafka produce
