@@ -1,8 +1,8 @@
--- Message Store schema, contract v1.0.0-rc2. Refresh this copy when the contract changes.
--- Contract version metadata (spec §10).
+-- Store schema version metadata for the Message Store schema (store schema major 1).
+-- Change it only as a deliberate schema change in both the .NET and Camel Quarkus adapters.
 --
--- Applied by the database operator together with 002/003. Adapters read this at startup and refuse to start
--- against an unknown contract_major.
+-- Applied by the database operator together with 002 and the runtime role's grants. Adapters read this at
+-- startup and refuse to start against an unknown contract_major.
 
 create table if not exists bip_contract (
     contract_major integer not null,

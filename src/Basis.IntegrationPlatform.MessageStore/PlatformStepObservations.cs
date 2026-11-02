@@ -3,9 +3,9 @@ using System.Collections.Concurrent;
 namespace Basis.IntegrationPlatform.MessageStore;
 
 /// <summary>
-/// One step outcome as observed by the current processing attempt
-/// (contract v1 DECISION D4). Serialized into bip_message_attempt.steps_json
-/// with the exact camelCase field set of spec/schemas/steps-json.schema.json.
+/// One step outcome as observed by the current processing attempt.
+/// Serialized into bip_message_attempt.steps_json with exactly these fields,
+/// in camelCase.
 /// </summary>
 public sealed record PlatformStepObservation(
     string Step,

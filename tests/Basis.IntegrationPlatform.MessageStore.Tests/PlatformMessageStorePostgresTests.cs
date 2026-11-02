@@ -189,7 +189,7 @@ public sealed class PlatformMessageStorePostgresTests
         Assert.AreEqual(1, reader.GetInt32(1));
         Assert.AreEqual(options.ApplicationName, reader.GetString(2));
         Assert.AreEqual("postgres_inline", reader.GetString(3));
-        // DECISION D3: replayable follows payload availability, not status.
+        // Replayable follows payload availability, not status.
         Assert.IsTrue(reader.GetBoolean(4), "COMPLETED message with captured payload must be replayable.");
         Assert.IsTrue(reader.IsDBNull(5));
         Assert.IsTrue(reader.GetBoolean(6));
@@ -229,7 +229,7 @@ public sealed class PlatformMessageStorePostgresTests
         Assert.IsTrue(attemptReader.GetBoolean(1));
         Assert.AreEqual(1, attemptReader.GetInt32(2));
         Assert.AreEqual(2, attemptReader.GetInt32(3));
-        // DECISION D4: steps_json records what THIS attempt observed, including
+        // steps_json records what THIS attempt observed, including
         // the dedup-skipped second execution.
         Assert.AreEqual(2, attemptReader.GetInt32(4));
         Assert.AreEqual("target-system", attemptReader.GetString(5));
@@ -296,7 +296,7 @@ public sealed class PlatformMessageStorePostgresTests
         await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
         var (store, _, _, _) = CreateStore(dataSource, options);
 
-        // DECISION D2: the attempt number comes from x-bip-attempt, never the DB.
+        // The attempt number comes from x-bip-attempt, never the DB.
         var replayDelivery = CreateMessage(messageId, options, new Dictionary<string, string>
         {
             ["x-bip-attempt"] = "3",
@@ -341,7 +341,7 @@ public sealed class PlatformMessageStorePostgresTests
         await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
         var (store, _, _, _) = CreateStore(dataSource, options);
 
-        // §3 / S20 end to end: producer declares x-bip-schema-version=7 ⇒ the
+        // End to end: producer declares x-bip-schema-version=7 ⇒ the
         // store persists 7 in both tables ⇒ replay re-emits the stored value.
         var kafkaMessage = new Message<string, byte[]>
         {
@@ -426,7 +426,7 @@ public sealed class PlatformMessageStorePostgresTests
         var message = CreateMessage(messageId, options);
         var commits = 0;
 
-        // S12 (§8): publish to DLQ first, then record DLQ status, then commit.
+        // Publish to DLQ first, then record DLQ status, then commit.
         // A failed DLQ publish must leave NO DLQ status row and NO committed offset.
         await Assert.ThrowsExactlyAsync<KafkaException>(() => service.ProcessAsync(message, () => commits++, CancellationToken.None));
         Assert.AreEqual(0, commits, "The offset must not be committed when the DLQ publish fails.");
@@ -446,7 +446,7 @@ public sealed class PlatformMessageStorePostgresTests
         var dlqHeaders = PlatformMessageConsumerService.ReadHeaders(produced.Headers);
         Assert.AreEqual("simulated handler failure", dlqHeaders["x-bip-error"]);
         Assert.AreEqual(messageId, dlqHeaders["x-bip-message-id"]);
-        // §3: no invented wire headers leak onto DLQ records — in-process retry
+        // No invented wire headers leak onto DLQ records — in-process retry
         // diagnostics belong to the auto_redelivery_* columns only.
         Assert.IsFalse(dlqHeaders.ContainsKey("x-bip-redelivered"), "x-bip-redelivered must not leak onto DLQ records.");
         Assert.IsFalse(dlqHeaders.ContainsKey("x-bip-redelivery-count"), "x-bip-redelivery-count must not leak onto DLQ records.");
@@ -602,14 +602,14 @@ public sealed class PlatformMessageStorePostgresTests
         await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
         var (store, _, _, _) = CreateStore(dataSource, options);
 
-        // COMPLETED outcome: still resendable per DECISION D3.
+        // COMPLETED outcome: still resendable while the payload is available.
         await store.RecordAttemptAsync(CreateMessage(messageId, options), "dotnet-handler", "COMPLETED", null, CancellationToken.None);
 
         string? auditStatusDuringProduce = null;
         var producer = new FakeProducer(async (topic, message) =>
         {
             // The REQUESTED audit row must already be committed and visible from
-            // a separate connection while the produce is in flight (§9).
+            // a separate connection while the produce is in flight.
             await using var connection = await dataSource.OpenConnectionAsync();
             await using var command = new NpgsqlCommand(
                 "select status from bip_message_replay_audit where message_id = @message_id order by requested_at desc limit 1",
@@ -681,12 +681,12 @@ public sealed class PlatformMessageStorePostgresTests
     [TestMethod]
     public async Task VerifyContractFailsFastWhenGateCannotRead()
     {
-        // Certification S19b: unreadable bip_contract (permissions/connectivity)
-        // retries transient conditions, then FAILS startup - fail fast over
-        // masked errors (safe under rolling updates).
+        // Unreadable bip_contract (permissions/connectivity) retries transient
+        // conditions, then FAILS startup - fail fast over masked errors (safe
+        // under rolling updates).
         var options = Microsoft.Extensions.Options.Options.Create(new PlatformMessageStoreOptions
         {
-            ApplicationName = "cert-s19b",
+            ApplicationName = "gate-unreadable",
             KafkaBootstrapServers = "unused:9092",
             PostgresConnectionString = "Host=127.0.0.1;Port=1;Username=x;Password=x;Database=x;Timeout=1",
             ContractGateMaxAttempts = 2,

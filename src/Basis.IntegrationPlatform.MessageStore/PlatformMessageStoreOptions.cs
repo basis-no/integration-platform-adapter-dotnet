@@ -29,8 +29,8 @@ public sealed class PlatformMessageStoreOptions
     public long PayloadMaxBytes { get; set; } = LongFromEnvironment("BASIS_MESSAGE_STORE_PAYLOAD_MAX_BYTES", 1_048_576);
     public int PayloadRetentionDays { get; set; } = IntFromEnvironment("BASIS_MESSAGE_STORE_PAYLOAD_RETENTION_DAYS", 30);
 
-    /// Contract gate (spec section 10): bounded retries before degrading to a
-    /// warning when the version cannot be read. Not env-driven; tests may lower.
+    /// Startup schema gate: bounded retries before startup fails when
+    /// bip_contract cannot be read. Not env-driven; tests may lower.
     public int ContractGateMaxAttempts { get; set; } = 10;
     public int ContractGateRetryDelayMs { get; set; } = 3_000;
 
@@ -38,11 +38,11 @@ public sealed class PlatformMessageStoreOptions
     {
         if (string.IsNullOrWhiteSpace(ApplicationName))
         {
-            throw new InvalidOperationException("APP_NAME is required for the Basis message-store adapter.");
+            throw new InvalidOperationException("APP_NAME is required for the message-store adapter.");
         }
         if (string.IsNullOrWhiteSpace(KafkaBootstrapServers))
         {
-            throw new InvalidOperationException("KAFKA_BOOTSTRAP_SERVERS is required for the Basis message-store adapter.");
+            throw new InvalidOperationException("KAFKA_BOOTSTRAP_SERVERS is required for the message-store adapter.");
         }
         if (!Enum.IsDefined(KafkaSecurityProtocol) || !Enum.IsDefined(KafkaSaslMechanism))
         {
@@ -91,7 +91,7 @@ public sealed class PlatformMessageStoreOptions
         }
         if (string.IsNullOrWhiteSpace(PostgresConnectionString))
         {
-            throw new InvalidOperationException("POSTGRES_JDBC_URL or POSTGRES_CONNECTION_STRING is required for the Basis message-store adapter.");
+            throw new InvalidOperationException("POSTGRES_JDBC_URL or POSTGRES_CONNECTION_STRING is required for the message-store adapter.");
         }
     }
 

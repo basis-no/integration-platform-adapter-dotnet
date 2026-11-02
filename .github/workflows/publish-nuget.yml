@@ -1,6 +1,6 @@
 name: Publish to NuGet.org
 
-# Tag-driven release per ADR-003: the csproj keeps a -preview version for
+# Tag-driven release: the csproj keeps a -preview version for
 # development; the release version derives from the tag (vX.Y.Z). Publishes
 # with NuGet Trusted Publishing (OIDC via NuGet/login); the only secret is
 # NUGET_USER, the nuget.org profile name.
