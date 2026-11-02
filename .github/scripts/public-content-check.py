@@ -11,10 +11,13 @@ a CI log never reveals a pattern.
 
 It also refuses citations of documents outside this repository (decision, ADR and
 section numbers, and an external test suite): the adapter describes its behaviour
-in its own terms. These patterns are public and reported by name.
+in its own terms. These patterns are public and reported by name. --public-only
+runs them, and the private-IP check, without the private patterns, for pull
+requests from forks, which cannot read the secret.
 
 usage: public-content-check.py --range BASE..HEAD
-       [--patterns-file PATH | patterns in $PUBLIC_CONTENT_PATTERNS] [--check-emails]
+       [--patterns-file PATH | patterns in $PUBLIC_CONTENT_PATTERNS | --public-only]
+       [--check-emails]
 """
 
 import argparse
@@ -30,7 +33,7 @@ PRIVATE_IP = re.compile(
 # Written so that none of these lines matches its own pattern.
 EXTERNAL_CITATIONS = {
     "decision-number": re.compile(r"\bDECISION\s+D\d+\b", re.IGNORECASE),
-    "adr-number": re.compile(r"\bADR-\d+\b", re.IGNORECASE),
+    "adr-number": re.compile(r"(?<![\w-])ADR-\d+\b", re.IGNORECASE),
     "section-number": re.compile(r"§\s*\d"),
     "certification-suite": re.compile(r"\bcertification\s+suite\b", re.IGNORECASE),
 }
@@ -56,10 +59,11 @@ def main():
     parser.add_argument("--range", required=True)
     parser.add_argument("--patterns-file")
     parser.add_argument("--check-emails", action="store_true")
+    parser.add_argument("--public-only", action="store_true")
     args = parser.parse_args()
 
-    patterns = load_patterns(args.patterns_file)
-    if not patterns:
+    patterns = [] if args.public_only else load_patterns(args.patterns_file)
+    if not patterns and not args.public_only:
         print("No private patterns configured; refusing to report a clean result.", file=sys.stderr)
         return 2
 

@@ -114,8 +114,8 @@ republishes the stored payload to the input topic with the next attempt number.
   `POSTGRES_TEST_CONNECTION_STRING`. When you touch SQL or persistence, run it against a
   disposable Postgres with `tests/fixtures/postgres/*.sql` applied in order, as `test.yml` does.
 - The `Test` workflow runs the whole suite against real Postgres on every PR; do not run the whole
-  suite locally unless asked. CI tests only this adapter: a contract-facing change also needs the
-  matching change, and its tests, in the Camel adapter.
+  suite locally unless asked. CI tests only this adapter: before releasing a contract-facing change,
+  verify that both adapters still agree on the affected rows, headers and recovery behaviour.
 - Tests use synthetic data. Report what you ran and what you did not.
 
 ## Pull requests

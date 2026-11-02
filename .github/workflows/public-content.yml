@@ -61,7 +61,8 @@ jobs:
           if [ -z "$PUBLIC_CONTENT_PATTERNS" ]; then
             if [ "$FROM_FORK" = true ]; then
               echo "::notice::Pull request from a fork: the private-name check runs on the target branch after merge."
-              exit 0
+              python3 -I .github/scripts/public-content-check.py --range "$RANGE" --public-only
+              exit
             fi
             echo "::error::The PUBLIC_CONTENT_PATTERNS secret is not configured."
             exit 1

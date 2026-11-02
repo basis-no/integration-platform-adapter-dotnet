@@ -96,10 +96,12 @@ POSTGRES_PASSWORD
 BASIS_MESSAGE_STORE_REPLAY_INPUT_TOPIC_PATTERN
 ```
 
-`APP_NAME`, `KAFKA_BOOTSTRAP_SERVERS` and either `POSTGRES_JDBC_URL` (with
-`POSTGRES_USERNAME` and `POSTGRES_PASSWORD`) or `POSTGRES_CONNECTION_STRING`
-are required. The input and DLQ topics default as listed above, and the replay
-topic pattern defaults to `bip.%s.in`.
+Startup fails without `KAFKA_BOOTSTRAP_SERVERS` and a Postgres connection:
+either `POSTGRES_CONNECTION_STRING`, or `POSTGRES_JDBC_URL` with the
+credentials in `POSTGRES_USERNAME` and `POSTGRES_PASSWORD`. `APP_NAME`
+defaults to `dotnet-integration`; set it, because it also names the Kafka
+consumer group and the default input topic. The input and DLQ topics default
+as listed above, and the replay topic pattern defaults to `bip.%s.in`.
 
 ## Payload policy
 
