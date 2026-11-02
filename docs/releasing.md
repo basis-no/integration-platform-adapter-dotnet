@@ -32,9 +32,10 @@ either lane is permanent.
    ```
 
    The branch must contain the workflow. It runs the test suite against
-   Postgres with the vendored contract schema, packs the commit as, for example,
-   `0.4.0-preview.20261017.3` and pushes it. The run summary shows the version
-   and source commit. It creates no Git tag and no GitHub release.
+   Postgres with the schema in `tests/fixtures/postgres/`, packs the commit
+   as, for example, `0.4.0-preview.20261017.3` and pushes it. The run summary
+   shows the version and source commit. It creates no Git tag and no GitHub
+   release.
 4. Pin that exact version in the validation integration, for example in
    `Directory.Packages.props`. NuGet.org validates and indexes a new version
    before restore can find it, usually within minutes. Pre-releases do not
@@ -44,15 +45,14 @@ either lane is permanent.
    pre-release version and the image digest in the acceptance evidence. The
    version names one immutable package, so a rebuild restores the same bytes.
 
-A pre-release is an uncertified test build. The platform builds and runs it in
-development and test environments with a warning and refuses it for
-production. After the final release, superseded pre-releases may be unlisted;
-exact pins keep restoring.
+A pre-release is a test build: pin it in development and test environments
+only, never in production. After the final release, superseded pre-releases
+may be unlisted; exact pins keep restoring.
 
 ## Final release
 
 Release the accepted commit, after a `CHANGELOG.md` section for the version and
-with the README's contract version in step with the code:
+with the README's store schema major in step with the code:
 
 ```sh
 git tag v0.4.0

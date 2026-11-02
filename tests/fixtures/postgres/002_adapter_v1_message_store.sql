@@ -1,15 +1,12 @@
--- Message Store schema, contract v1.0.0-rc2. Refresh this copy when the contract changes.
--- Adapter V1 direct-Postgres message-store schema.
+-- Direct-Postgres Message Store schema the adapter expects (store schema major 1).
+-- Change it only as a deliberate schema change in both the .NET and Camel Quarkus adapters.
 --
--- This is the canonical dashboard/resend/audit read model used by runtime
--- adapters when the platform injects:
+-- The message, attempt, replay-audit and step-outcome tables the adapter writes
+-- and reads for resend and audit.
 --
---   BASIS_MESSAGE_STORE_SINK=postgres
---   BASIS_MESSAGE_STORE_STEP_OUTCOME_STORE=postgres
---
--- The schema is platform-owned and should be provisioned once per integration
--- database before adapter-enabled integrations are started. Integration
--- repositories and runtime pods must not own these migrations.
+-- The adapter never creates or migrates these tables. Provision them once per
+-- integration database before adapter-enabled integrations are started.
+-- Integration repositories and runtime pods must not own these migrations.
 
 create table if not exists bip_message_log (
     message_id text primary key,

@@ -1,0 +1,68 @@
+name: Public content
+
+# This repository is public. Every pull request and every push to a protected
+# branch is scanned for credentials (gitleaks) and for private names and hosts.
+# The private patterns live in the PUBLIC_CONTENT_PATTERNS secret, never here,
+# and the check reports only file, line and pattern number.
+on:
+  pull_request:
+  push:
+    branches: [main, "release/**"]
+
+permissions:
+  contents: read
+
+jobs:
+  public-content:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Select the new commits
+        id: range
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          if [ "$EVENT" = pull_request ]; then base="$PR_BASE"; head="$PR_HEAD"; else base="$BEFORE"; head="$AFTER"; fi
+          if [ -n "$base" ] && [ "$base" != 0000000000000000000000000000000000000000 ] && git cat-file -e "$base^{commit}" 2>/dev/null; then
+            range="$base..$head"
+          else
+            range="$head"
+          fi
+          echo "range=$range" >> "$GITHUB_OUTPUT"
+
+      - name: Scan for credentials
+        env:
+          RANGE: ${{ steps.range.outputs.range }}
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          archive="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl -fsSL -o "$archive" "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  ${archive}" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" gitleaks
+          "$RUNNER_TEMP/gitleaks" git --redact --no-banner --exit-code 1 --log-opts="$RANGE" .
+
+      - name: Scan for private names and hosts
+        env:
+          RANGE: ${{ steps.range.outputs.range }}
+          PUBLIC_CONTENT_PATTERNS: ${{ secrets.PUBLIC_CONTENT_PATTERNS }}
+          FROM_FORK: ${{ github.event.pull_request.head.repo.fork }}
+        run: |
+          if [ -z "$PUBLIC_CONTENT_PATTERNS" ]; then
+            if [ "$FROM_FORK" = true ]; then
+              echo "::notice::Pull request from a fork: the private-name check runs on the target branch after merge."
+              exit 0
+            fi
+            echo "::error::The PUBLIC_CONTENT_PATTERNS secret is not configured."
+            exit 1
+          fi
+          python3 -I .github/scripts/public-content-check.py --range "$RANGE"

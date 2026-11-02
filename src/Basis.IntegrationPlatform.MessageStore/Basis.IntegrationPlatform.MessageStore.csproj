@@ -5,13 +5,13 @@
     <PackageId>Basis.IntegrationPlatform.MessageStore</PackageId>
     <Version>0.4.0-preview.1</Version>
     <Authors>Basis</Authors>
-    <Description>Basis Integration Platform .NET message-store runtime adapter. Implements message-store contract v1.0.0-rc2.</Description>
+    <Description>.NET message-store adapter for Kafka and Postgres: records every message and attempt before committing the offset, parks failures in a DLQ and serves controlled replay.</Description>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/basis-no/integration-platform-adapter-dotnet</PackageProjectUrl>
     <RepositoryUrl>https://github.com/basis-no/integration-platform-adapter-dotnet</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PackageReadmeFile>README.md</PackageReadmeFile>
-    <PackageTags>basis;integration-platform;message-store;kafka;postgres</PackageTags>
+    <PackageTags>message-store;kafka;postgres;dlq;replay;idempotency</PackageTags>
   </PropertyGroup>
 
   <ItemGroup>
