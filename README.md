@@ -24,14 +24,31 @@ The adapter owns the message-store mechanics of a .NET integration:
 - records terminal status in `bip_message_log` and `bip_message_attempt`
 - records per-attempt step observations (`DELIVERED`/`FAILED`/`SKIPPED`)
   in `bip_message_attempt.steps_json`
-- records idempotent external step outcomes in `bip_step_outcome`
+- records idempotent external step outcomes in `bip_step_outcome`. The
+  recorded endpoint URI, there and in `steps_json`, has its user info and the
+  values of credential-like query parameters masked as `xxxxxx` (the DLQ
+  header rule below, plus `key`, `code`, `sig`, `pwd`, passphrase, passcode
+  and private, access or account key). Only the recorded copy is masked
 - stores replayable payload bytes in Postgres under the payload policy
   (`replayable` = payload captured, not expired, not deleted — independent
   of message status)
-- retries handler failures before terminal `COMPLETED` or `DLQ`
+- retries handler failures before terminal `COMPLETED` or `DLQ`. A
+  cancellation is shutdown only when the host is stopping; any other, such as
+  an `HttpClient` timeout, is a handler failure, and a timed-out step is
+  recorded as `FAILED`. Recoverable Kafka consume errors are logged and
+  retried; a fatal one stops the consumer
 - publishes failed messages to `APP_KAFKA_DLQ_TOPIC`
-  (default `bip.message.dlq`) with `x-bip-error` and `x-bip-dlq-at`
-- exposes `POST /admin/messages/{messageId}/resend`
+  (default `bip.message.dlq`) with `x-bip-error` and `x-bip-dlq-at`. The DLQ
+  record also carries the other consumed headers; the values of
+  credential-like ones are masked as `xxxxxx`: `Authorization`, `Cookie`,
+  `Set-Cookie`, `WWW-Authenticate`, and names containing secret, token,
+  password, credential, session, signature, auth or API/subscription key, and
+  names ending in `-key` or `_key` (`x-functions-key`). Their names, `x-bip-*`
+  and `Idempotency-Key` stay readable
+- exposes `POST /admin/messages/{messageId}/resend` for messages this
+  integration journaled. A message of another integration on the same
+  Message Store is refused with `409 NOT_REPLAYABLE` before any audit row or
+  produce
 - republishes replay payloads back to the integration input topic
   (`bip.<integration>.in`), committing the `REQUESTED` audit row before the
   Kafka produce
@@ -78,6 +95,29 @@ public sealed class MyMessageHandler : IPlatformMessageHandler
     }
 }
 ```
+
+The step key is `<message-id>:<step-id>`, and a step whose key is already
+`DELIVERED` in `bip_step_outcome` is skipped, unless the message's
+`x-bip-redo-steps` header (a JSON array of step ids or step keys) names it.
+Choose step ids with that in mind:
+
+- Give every external call its own step id. A handler that sends several items
+  of one message through one step id, such as a loop over order lines, delivers
+  the first item and skips the rest. Put the item's stable key in the step id
+  (`post-line-{lineId}`).
+- The step outcome table has no integration column, so the lookup is not scoped
+  by integration. If a message id travels to another integration on the same
+  Message Store and both use the same step id, the second integration's step is
+  skipped as already delivered. Use step ids unique across integrations, and
+  when one integration produces for another, give the new message its own
+  `x-bip-message-id` and carry continuity in `x-bip-correlation-id`.
+
+The adapter logs a warning when it skips a step that the same handler invocation
+already ran, and when the skipped message id is journaled by another integration.
+The second warning reads `bip_message_log`. Where row-level security limits
+each integration to its own rows, the other integration's row is hidden, so that
+warning never fires there.
+If the read fails, the step is still skipped and the check is logged at debug.
 
 ## Required Runtime Environment
 

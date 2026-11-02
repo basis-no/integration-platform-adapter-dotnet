@@ -819,6 +819,485 @@ public sealed class PlatformMessageStorePostgresTests
         return (int)(await command.ExecuteScalarAsync())!;
     }
 
+    [TestMethod]
+    public async Task FanOutThroughOneStepIdSkipsLaterItemsAndWarns()
+    {
+        var connectionString = RequireConnectionString();
+        var options = CreateOptions(connectionString);
+        await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+        var observations = new PlatformStepObservationCollector();
+        var logs = new LogRecorder();
+        var steps = new PlatformStepExecutor(dataSource, observations, logs.For<PlatformStepExecutor>());
+        var message = CreateMessage($"dotnet-test-{Guid.NewGuid():N}", options);
+        observations.BeginHandlerInvocation(message.MessageId);
+
+        // The key is <message-id>:<step-id>, so items sent through one step id
+        // share a key: the first is delivered, the rest are skipped.
+        var sent = new List<string>();
+        foreach (var item in new[] { "line-1", "line-2", "line-3" })
+        {
+            await steps.ExecuteAsync(message, "post-line", "https://target.example/lines", "target",
+                _ => { sent.Add(item); return Task.CompletedTask; }, CancellationToken.None);
+        }
+
+        CollectionAssert.AreEqual(new[] { "line-1" }, sent);
+        Assert.AreEqual(2, logs.Warnings.Count(w => w.Contains("distinct step id per item", StringComparison.Ordinal)));
+
+        // A step id per item delivers every item.
+        sent.Clear();
+        foreach (var item in new[] { "line-1", "line-2", "line-3" })
+        {
+            await steps.ExecuteAsync(message, $"post-line-{item}", "https://target.example/lines", "target",
+                _ => { sent.Add(item); return Task.CompletedTask; }, CancellationToken.None);
+        }
+
+        CollectionAssert.AreEqual(new[] { "line-1", "line-2", "line-3" }, sent);
+    }
+
+    [TestMethod]
+    public async Task InProcessRetryOfADeliveredStepDoesNotWarnAboutReuse()
+    {
+        var connectionString = RequireConnectionString();
+        var options = CreateOptions(connectionString);
+        await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+        var observations = new PlatformStepObservationCollector();
+        var logs = new LogRecorder();
+        var steps = new PlatformStepExecutor(dataSource, observations, logs.For<PlatformStepExecutor>());
+        var message = CreateMessage($"dotnet-test-{Guid.NewGuid():N}", options);
+
+        observations.BeginHandlerInvocation(message.MessageId);
+        await steps.ExecuteAsync(message, "deliver", "https://target.example/orders", "target",
+            _ => Task.CompletedTask, CancellationToken.None);
+        // The consumer starts a new handler invocation for each in-process retry.
+        observations.BeginHandlerInvocation(message.MessageId);
+        var retried = await steps.ExecuteAsync(message, "deliver", "https://target.example/orders", "target",
+            _ => Task.CompletedTask, CancellationToken.None);
+
+        Assert.IsTrue(retried.Skipped);
+        Assert.AreEqual(0, logs.Warnings.Count);
+    }
+
+    [TestMethod]
+    public async Task SharedMessageIdAcrossIntegrationsSkipsTheSecondDeliveryAndWarns()
+    {
+        var connectionString = RequireConnectionString();
+        var first = CreateOptions(connectionString);
+        first.ApplicationName = "integration-first";
+        var second = CreateOptions(connectionString);
+        second.ApplicationName = "integration-second";
+        var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+        await using var dataSource = NpgsqlDataSource.Create(connectionString);
+
+        var (firstStore, firstSteps, _, _) = CreateStore(dataSource, first);
+        var firstMessage = CreateMessage(messageId, first);
+        await firstSteps.ExecuteAsync(firstMessage, "deliver", "https://first.example/orders", "first",
+            _ => Task.CompletedTask, CancellationToken.None);
+        await firstStore.RecordAttemptAsync(firstMessage, "dotnet-handler", "COMPLETED", null, CancellationToken.None);
+
+        // The message id travelled on to a second integration on the same
+        // Message Store. bip_step_outcome is not scoped by integration, so an
+        // equal step id matches the first integration's delivery.
+        var logs = new LogRecorder();
+        var secondSteps = new PlatformStepExecutor(dataSource, new PlatformStepObservationCollector(), logs.For<PlatformStepExecutor>());
+        var secondMessage = CreateMessage(messageId, second);
+        var secondRan = false;
+        var collided = await secondSteps.ExecuteAsync(secondMessage, "deliver", "https://second.example/orders", "second",
+            _ => { secondRan = true; return Task.CompletedTask; }, CancellationToken.None);
+
+        Assert.IsTrue(collided.Skipped);
+        Assert.IsFalse(secondRan);
+        Assert.AreEqual(1, logs.Warnings.Count);
+        StringAssert.Contains(logs.Warnings[0], "journaled by integration integration-first");
+
+        // A step id unique across the integrations is delivered.
+        var distinct = await secondSteps.ExecuteAsync(secondMessage, "second-deliver", "https://second.example/orders", "second",
+            _ => Task.CompletedTask, CancellationToken.None);
+        Assert.AreEqual("DELIVERED", distinct.Status);
+    }
+
+    [TestMethod]
+    public async Task FailedJournalLookupDoesNotFailASkippedStep()
+    {
+        var connectionString = RequireConnectionString();
+        var options = CreateOptions(connectionString);
+        await using var admin = NpgsqlDataSource.Create(connectionString);
+        var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+        var (_, adminSteps, _, _) = CreateStore(admin, options);
+        var message = CreateMessage(messageId, options);
+        await adminSteps.ExecuteAsync(message, "deliver", "https://target.example/orders", "target",
+            _ => Task.CompletedTask, CancellationToken.None);
+
+        // A role that can use the step ledger but cannot read bip_message_log,
+        // so the lookup behind the shared-key warning fails with 42501.
+        var role = $"bip_steps_only_{Guid.NewGuid():N}";
+        const string password = "synthetic-test-only";
+        try
+        {
+            await using (var connection = await admin.OpenConnectionAsync())
+            {
+                await using var create = new NpgsqlCommand(
+                    $"create role {role} login password '{password}'; grant select, insert, update on bip_step_outcome to {role};",
+                    connection);
+                await create.ExecuteNonQueryAsync();
+            }
+        }
+        catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.InsufficientPrivilege)
+        {
+            Assert.Inconclusive("The test connection cannot create roles.");
+        }
+
+        try
+        {
+            var restricted = new NpgsqlConnectionStringBuilder(connectionString) { Username = role, Password = password, Pooling = false };
+            await using var dataSource = NpgsqlDataSource.Create(restricted.ConnectionString);
+            var logs = new LogRecorder();
+            var steps = new PlatformStepExecutor(dataSource, new PlatformStepObservationCollector(), logs.For<PlatformStepExecutor>());
+            var ran = false;
+
+            var result = await steps.ExecuteAsync(message, "deliver", "https://target.example/orders", "target",
+                _ => { ran = true; return Task.CompletedTask; }, CancellationToken.None);
+
+            Assert.IsTrue(result.Skipped);
+            Assert.AreEqual("SKIPPED", result.Status);
+            Assert.IsFalse(ran);
+            Assert.AreEqual(0, logs.Warnings.Count);
+        }
+        finally
+        {
+            await using var connection = await admin.OpenConnectionAsync();
+            await using var drop = new NpgsqlCommand($"drop owned by {role}; drop role {role};", connection);
+            await drop.ExecuteNonQueryAsync();
+        }
+    }
+
+    [TestMethod]
+    public async Task ReplayRecordsANewInlinePayloadExpiry()
+    {
+        // Pins current behaviour: the upserts write
+        // payload_expires_at = excluded.payload_expires_at, so each processed
+        // replay sets the expiry from its own processing time.
+        var connectionString = RequireConnectionString();
+        var options = CreateOptions(connectionString);
+        var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+        await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+        var (store, _, _, _) = CreateStore(dataSource, options);
+
+        await store.RecordAttemptAsync(CreateMessage(messageId, options), "dotnet-handler", "COMPLETED", null, CancellationToken.None);
+        await using (var connection = await dataSource.OpenConnectionAsync())
+        {
+            await using var age = new NpgsqlCommand(
+                "update bip_message_log set payload_expires_at = now() + interval '1 day' where message_id = @message_id",
+                connection);
+            age.Parameters.AddWithValue("message_id", messageId);
+            await age.ExecuteNonQueryAsync();
+        }
+
+        var replay = CreateMessage(messageId, options, new Dictionary<string, string>
+        {
+            ["x-bip-attempt"] = "2",
+            ["x-bip-replay"] = "true",
+        });
+        await store.RecordAttemptAsync(replay, "dotnet-handler", "COMPLETED", null, CancellationToken.None);
+
+        await using var read = await dataSource.OpenConnectionAsync();
+        await using var command = new NpgsqlCommand(
+            "select payload_expires_at > now() + interval '29 days' from bip_message_log where message_id = @message_id",
+            read);
+        command.Parameters.AddWithValue("message_id", messageId);
+        Assert.AreEqual(true, await command.ExecuteScalarAsync(), "A replay currently extends the inline payload expiry.");
+    }
+
+    [TestMethod]
+    public async Task HandlerTimeoutIsRetriedThenParkedAndConsumptionContinues()
+    {
+        var connectionString = RequireConnectionString();
+        var options = CreateOptions(connectionString);
+        options.MaxHandlerAttempts = 3;
+        options.HandlerRetryDelayMs = 0;
+        var timedOutId = $"dotnet-test-{Guid.NewGuid():N}";
+        var nextId = $"dotnet-test-{Guid.NewGuid():N}";
+        await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+        var (store, _, observations, _) = CreateStore(dataSource, options);
+        var producer = new FakeProducer();
+        // An HttpClient timeout surfaces as TaskCanceledException while the
+        // stopping token is still active.
+        var handler = new DelegateHandler(async (message, _) =>
+        {
+            await Task.Yield();
+            if (message.MessageId == timedOutId)
+            {
+                throw new TaskCanceledException(
+                    "The request was canceled due to the configured HttpClient.Timeout of 100 seconds elapsing.",
+                    new TimeoutException());
+            }
+
+            return PlatformMessageResult.Completed();
+        });
+        var service = CreateConsumerService(handler, store, observations, producer, options);
+        using var stopping = new CancellationTokenSource();
+        var consumer = new FakeConsumer(stopping, ConsumeResultFor(timedOutId, 0, options), ConsumeResultFor(nextId, 1, options));
+
+        await service.ConsumeAsync(consumer, stopping.Token).WaitAsync(TimeSpan.FromSeconds(30));
+
+        Assert.AreEqual(3, handler.Calls.Count(id => id == timedOutId), "A timeout goes through the in-process retry.");
+        Assert.AreEqual(1, producer.Produced.Count, "The timed-out message is parked once.");
+        var (topic, parked) = producer.Produced[0];
+        Assert.AreEqual(options.DlqTopic, topic);
+        var dlqHeaders = PlatformMessageConsumerService.ReadHeaders(parked.Headers);
+        Assert.AreEqual(timedOutId, dlqHeaders["x-bip-message-id"]);
+        StringAssert.Contains(dlqHeaders["x-bip-error"], "HttpClient.Timeout");
+        Assert.AreEqual("DLQ", await LogStatusAsync(dataSource, timedOutId));
+        Assert.AreEqual("COMPLETED", await LogStatusAsync(dataSource, nextId), "Consumption continues after the parked message.");
+        CollectionAssert.AreEqual(new long[] { 0, 1 }, consumer.Commits);
+        Assert.AreEqual(0, consumer.Seeks.Count);
+    }
+
+    [TestMethod]
+    public async Task ShutdownDuringTheHandlerStopsWithoutParkingTheMessage()
+    {
+        var connectionString = RequireConnectionString();
+        var options = CreateOptions(connectionString);
+        options.MaxHandlerAttempts = 3;
+        options.HandlerRetryDelayMs = 0;
+        var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+        await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+        var (store, _, observations, _) = CreateStore(dataSource, options);
+        var producer = new FakeProducer();
+        using var stopping = new CancellationTokenSource();
+        var handler = new DelegateHandler((_, cancellationToken) =>
+        {
+            stopping.Cancel();
+            cancellationToken.ThrowIfCancellationRequested();
+            return Task.FromResult(PlatformMessageResult.Completed());
+        });
+        var service = CreateConsumerService(handler, store, observations, producer, options);
+        var consumer = new FakeConsumer(stopping, ConsumeResultFor(messageId, 0, options));
+
+        await Assert.ThrowsExactlyAsync<OperationCanceledException>(() => service.ConsumeAsync(consumer, stopping.Token));
+
+        Assert.AreEqual(1, handler.Calls.Count, "Shutdown is not retried.");
+        Assert.AreEqual(0, producer.Produced.Count, "Shutdown never parks the message.");
+        Assert.AreEqual(0, consumer.Commits.Count, "The delivery is consumed again after restart.");
+        Assert.AreEqual(0, await CountRowsAsync(dataSource, "bip_message_log", messageId));
+    }
+
+    [TestMethod]
+    public async Task RecoverableConsumeErrorDoesNotStopConsumption()
+    {
+        var connectionString = RequireConnectionString();
+        var options = CreateOptions(connectionString);
+        var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+        await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+        var (store, _, observations, _) = CreateStore(dataSource, options);
+        var handler = new DelegateHandler((_, _) => Task.FromResult(PlatformMessageResult.Completed()));
+        var service = CreateConsumerService(handler, store, observations, new FakeProducer(), options);
+        using var stopping = new CancellationTokenSource();
+        var consumer = new FakeConsumer(
+            stopping,
+            new ConsumeException(new ConsumeResult<byte[], byte[]>(), new Error(ErrorCode.UnknownTopicOrPart, "Subscribed topic not available")),
+            ConsumeResultFor(messageId, 0, options));
+
+        await service.ConsumeAsync(consumer, stopping.Token).WaitAsync(TimeSpan.FromSeconds(30));
+
+        Assert.AreEqual("COMPLETED", await LogStatusAsync(dataSource, messageId));
+        CollectionAssert.AreEqual(new long[] { 0 }, consumer.Commits);
+    }
+
+    [TestMethod]
+    public async Task FatalConsumeErrorStillStopsTheConsumer()
+    {
+        var connectionString = RequireConnectionString();
+        var options = CreateOptions(connectionString);
+        await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+        var (store, _, observations, _) = CreateStore(dataSource, options);
+        var handler = new DelegateHandler((_, _) => Task.FromResult(PlatformMessageResult.Completed()));
+        var service = CreateConsumerService(handler, store, observations, new FakeProducer(), options);
+        using var stopping = new CancellationTokenSource();
+        var consumer = new FakeConsumer(
+            stopping,
+            new ConsumeException(new ConsumeResult<byte[], byte[]>(), new Error(ErrorCode.Local_Fatal, "synthetic fatal error", true)),
+            ConsumeResultFor($"dotnet-test-{Guid.NewGuid():N}", 0, options));
+
+        await Assert.ThrowsExactlyAsync<ConsumeException>(() => service.ConsumeAsync(consumer, stopping.Token));
+        Assert.AreEqual(0, handler.Calls.Count);
+    }
+
+    [TestMethod]
+    public async Task StepTimeoutIsRecordedAsAFailedStep()
+    {
+        var connectionString = RequireConnectionString();
+        var options = CreateOptions(connectionString);
+        var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+        await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+        var (_, steps, observations, _) = CreateStore(dataSource, options);
+        var message = CreateMessage(messageId, options);
+
+        await Assert.ThrowsExactlyAsync<TaskCanceledException>(() => steps.ExecuteAsync(
+            message, "deliver", "https://target.example/orders", "target",
+            _ => throw new TaskCanceledException("The request was canceled due to the configured HttpClient.Timeout of 100 seconds elapsing."),
+            CancellationToken.None));
+
+        await using var connection = await dataSource.OpenConnectionAsync();
+        await using var command = new NpgsqlCommand(
+            "select status from bip_step_outcome where idempotency_key = @idempotency_key",
+            connection);
+        command.Parameters.AddWithValue("idempotency_key", $"{messageId}:deliver");
+        Assert.AreEqual("FAILED", await command.ExecuteScalarAsync());
+        var observed = observations.Snapshot(messageId).Single();
+        Assert.AreEqual("FAILED", observed.Status);
+        StringAssert.Contains(observed.Error, "HttpClient.Timeout");
+    }
+
+    [TestMethod]
+    public async Task StepEndpointCredentialsAreMaskedInTheLedgerAndTheAttempt()
+    {
+        const string endpoint =
+            "https://svc-user:synthetic-password@target.example/api/orders"
+            + "?code=synthetic-function-key&api_key=synthetic-api-key&access_token=synthetic-token&sig=synthetic-signature&orderId=42";
+        const string masked =
+            "https://xxxxxx@target.example/api/orders?code=xxxxxx&api_key=xxxxxx&access_token=xxxxxx&sig=xxxxxx&orderId=42";
+        // A network-path reference, resolved against the HTTP client's base address.
+        const string relativeEndpoint = "//svc-user:synthetic-password@target.example/notify?sig=synthetic-signature";
+        const string relativeMasked = "//xxxxxx@target.example/notify?sig=xxxxxx";
+        var connectionString = RequireConnectionString();
+        var options = CreateOptions(connectionString);
+        var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+        await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+        var (store, steps, observations, _) = CreateStore(dataSource, options);
+        var message = CreateMessage(messageId, options);
+        var called = 0;
+
+        // The operation is the application's own call to the destination; the
+        // adapter only records the URI.
+        await steps.ExecuteAsync(message, "deliver", endpoint, "target", _ => { called++; return Task.CompletedTask; }, CancellationToken.None);
+        var skipped = await steps.ExecuteAsync(message, "deliver", endpoint, "target", _ => { called++; return Task.CompletedTask; }, CancellationToken.None);
+        await steps.ExecuteAsync(message, "notify", relativeEndpoint, "target", _ => { called++; return Task.CompletedTask; }, CancellationToken.None);
+
+        Assert.AreEqual(2, called);
+        Assert.IsTrue(skipped.Skipped);
+        CollectionAssert.AreEqual(
+            new[] { masked, masked, relativeMasked },
+            observations.Snapshot(messageId).Select(observation => observation.EndpointUri).ToArray());
+
+        await store.RecordAttemptAsync(message, "dotnet-handler", "COMPLETED", null, CancellationToken.None);
+        await using var connection = await dataSource.OpenConnectionAsync();
+        await using (var ledger = new NpgsqlCommand(
+            "select step_id, endpoint_uri from bip_step_outcome where message_id = @message_id order by step_id",
+            connection))
+        {
+            ledger.Parameters.AddWithValue("message_id", messageId);
+            await using var rows = await ledger.ExecuteReaderAsync();
+            var recorded = new List<string>();
+            while (await rows.ReadAsync())
+            {
+                recorded.Add($"{rows.GetString(0)} {rows.GetString(1)}");
+            }
+
+            CollectionAssert.AreEqual(new[] { $"deliver {masked}", $"notify {relativeMasked}" }, recorded);
+        }
+
+        await using var attempt = new NpgsqlCommand(
+            """
+            select steps_json -> 0 ->> 'endpointUri',
+                   steps_json -> 1 ->> 'endpointUri',
+                   steps_json -> 2 ->> 'endpointUri',
+                   steps_json::text
+            from bip_message_attempt
+            where message_id = @message_id and attempt = 1
+            """,
+            connection);
+        attempt.Parameters.AddWithValue("message_id", messageId);
+        await using var reader = await attempt.ExecuteReaderAsync();
+        Assert.IsTrue(await reader.ReadAsync());
+        Assert.AreEqual(masked, reader.GetString(0));
+        Assert.AreEqual(masked, reader.GetString(1));
+        Assert.AreEqual(relativeMasked, reader.GetString(2));
+        Assert.IsFalse(reader.GetString(3).Contains("synthetic-", StringComparison.Ordinal), "steps_json must not carry the credentials.");
+    }
+
+    [TestMethod]
+    public async Task ReplayRefusesAMessageOfAnotherIntegration()
+    {
+        var connectionString = RequireConnectionString();
+        var first = CreateOptions(connectionString);
+        first.ApplicationName = "integration-first";
+        var second = CreateOptions(connectionString);
+        second.ApplicationName = "integration-second";
+        var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+        await using var dataSource = NpgsqlDataSource.Create(connectionString);
+        var (firstStore, _, _, _) = CreateStore(dataSource, first);
+        var (secondStore, _, _, _) = CreateStore(dataSource, second);
+        await secondStore.RecordAttemptAsync(CreateMessage(messageId, second), "dotnet-handler", "COMPLETED", null, CancellationToken.None);
+        var producer = new FakeProducer();
+
+        var refused = await firstStore.ReplayAsync(messageId, new MessageReplayRequest("operator", "re-run"), producer, CancellationToken.None);
+
+        Assert.AreEqual("FAILED", refused.Status);
+        Assert.AreEqual(MessageReplayErrorCodes.NotReplayable, refused.ErrorCode);
+        Assert.AreEqual("Message is not replayable by this integration.", refused.Error);
+        Assert.IsNull(refused.ReplayId, "A refused replay writes no audit row.");
+        Assert.AreEqual(0, producer.Produced.Count, "A refused replay never produces.");
+        Assert.AreEqual(0, await CountAuditRowsAsync(dataSource, messageId));
+        Assert.AreEqual(1, await CountRowsAsync(dataSource, "bip_message_attempt", messageId));
+
+        // The owning integration still replays it to its own input topic.
+        var replayed = await secondStore.ReplayAsync(messageId, new MessageReplayRequest("operator", "re-run"), producer, CancellationToken.None);
+        Assert.AreEqual("PUBLISHED", replayed.Status);
+        Assert.AreEqual("bip.integration-second.in", producer.Produced.Single().Topic);
+    }
+
+    private static PlatformMessageConsumerService CreateConsumerService(
+        IPlatformMessageHandler handler,
+        PlatformMessageStore store,
+        PlatformStepObservationCollector observations,
+        IProducer<string, byte[]> producer,
+        PlatformMessageStoreOptions options)
+    {
+        return new PlatformMessageConsumerService(
+            handler,
+            store,
+            observations,
+            producer,
+            Options.Create(options),
+            NullLogger<PlatformMessageConsumerService>.Instance)
+        {
+            FailureBackoff = TimeSpan.Zero,
+        };
+    }
+
+    private static ConsumeResult<string, byte[]> ConsumeResultFor(string messageId, long offset, PlatformMessageStoreOptions options)
+    {
+        return new ConsumeResult<string, byte[]>
+        {
+            TopicPartitionOffset = new TopicPartitionOffset(options.InputTopic, new Partition(0), new Offset(offset)),
+            Message = new Message<string, byte[]>
+            {
+                Key = messageId,
+                Value = """{"messageType":"e2e.order","runtime":"dotnet"}"""u8.ToArray(),
+                Headers = new Headers { { "x-bip-message-id", Encoding.UTF8.GetBytes(messageId) } },
+            },
+        };
+    }
+
+    private static async Task<string?> LogStatusAsync(NpgsqlDataSource dataSource, string messageId)
+    {
+        await using var connection = await dataSource.OpenConnectionAsync();
+        await using var command = new NpgsqlCommand("select status from bip_message_log where message_id = @message_id", connection);
+        command.Parameters.AddWithValue("message_id", messageId);
+        return await command.ExecuteScalarAsync() as string;
+    }
+
+    private sealed class DelegateHandler(Func<PlatformMessage, CancellationToken, Task<PlatformMessageResult>> handle) : IPlatformMessageHandler
+    {
+        public List<string> Calls { get; } = [];
+
+        public Task<PlatformMessageResult> HandleAsync(PlatformMessage message, CancellationToken cancellationToken)
+        {
+            Calls.Add(message.MessageId);
+            return handle(message, cancellationToken);
+        }
+    }
+
     private sealed class RecordingFailingHandler : IPlatformMessageHandler
     {
         public List<IReadOnlyDictionary<string, string>> SeenHeaderSnapshots { get; } = [];
@@ -849,6 +1328,122 @@ public sealed class PlatformMessageStorePostgresTests
                     parent.Warnings.Add(formatter(state, exception));
                 }
             }
+        }
+    }
+
+    /// <summary>
+    /// Hands out a scripted sequence of deliveries and consume errors, then
+    /// requests shutdown the way the host does.
+    /// </summary>
+    private sealed class FakeConsumer(CancellationTokenSource stopping, params object[] steps) : IConsumer<string, byte[]>
+    {
+        private readonly Queue<object> script = new(steps);
+
+        public List<long> Commits { get; } = [];
+
+        public List<long> Seeks { get; } = [];
+
+        public ConsumeResult<string, byte[]> Consume(CancellationToken cancellationToken = default)
+        {
+            if (script.Count == 0)
+            {
+                stopping.Cancel();
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+
+            return script.Dequeue() switch
+            {
+                Exception exception => throw exception,
+                ConsumeResult<string, byte[]> result => result,
+                var other => throw new InvalidOperationException($"Unexpected script step {other}."),
+            };
+        }
+
+        public ConsumeResult<string, byte[]> Consume(int millisecondsTimeout) => throw new NotSupportedException();
+
+        public ConsumeResult<string, byte[]> Consume(TimeSpan timeout) => throw new NotSupportedException();
+
+        public void Commit(ConsumeResult<string, byte[]> result) => Commits.Add(result.Offset.Value);
+
+        public List<TopicPartitionOffset> Commit() => throw new NotSupportedException();
+
+        public void Commit(IEnumerable<TopicPartitionOffset> offsets) => throw new NotSupportedException();
+
+        public void Seek(TopicPartitionOffset tpo) => Seeks.Add(tpo.Offset.Value);
+
+        public string MemberId => "fake-member";
+
+        public List<TopicPartition> Assignment => [];
+
+        public List<string> Subscription => [];
+
+        public IConsumerGroupMetadata ConsumerGroupMetadata => throw new NotSupportedException();
+
+        public Handle Handle => throw new NotSupportedException();
+
+        public string Name => "fake-consumer";
+
+        public void Subscribe(IEnumerable<string> topics)
+        {
+        }
+
+        public void Subscribe(string topic)
+        {
+        }
+
+        public void Unsubscribe()
+        {
+        }
+
+        public void Assign(TopicPartition partition) => throw new NotSupportedException();
+
+        public void Assign(TopicPartitionOffset partition) => throw new NotSupportedException();
+
+        public void Assign(IEnumerable<TopicPartitionOffset> partitions) => throw new NotSupportedException();
+
+        public void Assign(IEnumerable<TopicPartition> partitions) => throw new NotSupportedException();
+
+        public void IncrementalAssign(IEnumerable<TopicPartitionOffset> partitions) => throw new NotSupportedException();
+
+        public void IncrementalAssign(IEnumerable<TopicPartition> partitions) => throw new NotSupportedException();
+
+        public void IncrementalUnassign(IEnumerable<TopicPartition> partitions) => throw new NotSupportedException();
+
+        public void Unassign() => throw new NotSupportedException();
+
+        public void StoreOffset(ConsumeResult<string, byte[]> result) => throw new NotSupportedException();
+
+        public void StoreOffset(TopicPartitionOffset offset) => throw new NotSupportedException();
+
+        public void Pause(IEnumerable<TopicPartition> partitions) => throw new NotSupportedException();
+
+        public void Resume(IEnumerable<TopicPartition> partitions) => throw new NotSupportedException();
+
+        public List<TopicPartitionOffset> Committed(TimeSpan timeout) => throw new NotSupportedException();
+
+        public List<TopicPartitionOffset> Committed(IEnumerable<TopicPartition> partitions, TimeSpan timeout) => throw new NotSupportedException();
+
+        public Offset Position(TopicPartition partition) => throw new NotSupportedException();
+
+        public List<TopicPartitionOffset> OffsetsForTimes(IEnumerable<TopicPartitionTimestamp> timestampsToSearch, TimeSpan timeout)
+            => throw new NotSupportedException();
+
+        public WatermarkOffsets GetWatermarkOffsets(TopicPartition topicPartition) => throw new NotSupportedException();
+
+        public WatermarkOffsets QueryWatermarkOffsets(TopicPartition topicPartition, TimeSpan timeout) => throw new NotSupportedException();
+
+        public void Close()
+        {
+        }
+
+        public int AddBrokers(string brokers) => 0;
+
+        public void SetSaslCredentials(string username, string password)
+        {
+        }
+
+        public void Dispose()
+        {
         }
     }
 

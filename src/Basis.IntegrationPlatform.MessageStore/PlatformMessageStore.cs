@@ -162,6 +162,21 @@ public sealed class PlatformMessageStore
                 ErrorCode: MessageReplayErrorCodes.NotFound);
         }
 
+        if (!string.Equals(stored.Integration, options.ApplicationName, StringComparison.Ordinal))
+        {
+            // A shared Message Store holds other integrations' messages too.
+            // Only the integration that journaled a message may replay it, so
+            // refuse before any audit row or produce, as the Camel adapter does.
+            return new MessageReplayResult(
+                "FAILED",
+                messageId,
+                options.ApplicationName,
+                ResolveReplayTopic(options.ApplicationName),
+                0,
+                Error: "Message is not replayable by this integration.",
+                ErrorCode: MessageReplayErrorCodes.NotReplayable);
+        }
+
         var targetTopic = ResolveReplayTopic(stored.Integration);
         var nextAttempt = stored.LastAttempt + 1;
         var replayValidationError = ReplayValidationError(stored);

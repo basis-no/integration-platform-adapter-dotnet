@@ -26,6 +26,10 @@ public sealed record PlatformStepObservation(
 public sealed class PlatformStepObservationCollector
 {
     private readonly ConcurrentDictionary<string, List<PlatformStepObservation>> observations = new(StringComparer.Ordinal);
+    // Index of the first observation made by the current handler invocation.
+    // In-process retries re-run the handler within one processing attempt, so
+    // a step seen again in a later invocation is a retry, not a reused id.
+    private readonly ConcurrentDictionary<string, int> invocationStarts = new(StringComparer.Ordinal);
 
     public void Record(string messageId, PlatformStepObservation observation)
     {
@@ -54,5 +58,24 @@ public sealed class PlatformStepObservationCollector
     public void Clear(string messageId)
     {
         observations.TryRemove(messageId, out _);
+        invocationStarts.TryRemove(messageId, out _);
+    }
+
+    internal void BeginHandlerInvocation(string messageId)
+    {
+        invocationStarts[messageId] = Snapshot(messageId).Count;
+    }
+
+    /// <summary>
+    /// True when the current handler invocation already delivered or skipped
+    /// this idempotency key, so a further call with it is skipped as well.
+    /// </summary>
+    internal bool CompletedInCurrentInvocation(string messageId, string idempotencyKey)
+    {
+        var start = invocationStarts.TryGetValue(messageId, out var index) ? index : 0;
+        return Snapshot(messageId)
+            .Skip(start)
+            .Any(observation => string.Equals(observation.IdempotencyKey, idempotencyKey, StringComparison.Ordinal)
+                && observation.Status is "DELIVERED" or "SKIPPED");
     }
 }

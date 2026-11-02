@@ -9,6 +9,19 @@ namespace Basis.IntegrationPlatform.MessageStore;
 
 internal sealed class PlatformMessageConsumerService : BackgroundService
 {
+    internal const string MaskedHeaderValue = "xxxxxx";
+
+    private static readonly HashSet<string> CredentialHeaders = new(StringComparer.Ordinal)
+    {
+        "authorization", "proxy-authorization", "cookie", "set-cookie", "www-authenticate", "proxy-authenticate",
+    };
+
+    private static readonly string[] CredentialNameParts =
+    [
+        "secret", "token", "password", "passwd", "credential", "session", "signature",
+        "apikey", "api-key", "api_key", "subscription-key", "private-key", "auth",
+    ];
+
     private readonly IPlatformMessageHandler handler;
     private readonly PlatformMessageStore store;
     private readonly PlatformStepObservationCollector stepObservations;
@@ -48,7 +61,13 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
         using var consumer = new ConsumerBuilder<string, byte[]>(config).Build();
         consumer.Subscribe(options.InputTopic);
         logger.LogInformation("Message-store adapter consuming topic {Topic} group {GroupId}", options.InputTopic, options.ConsumerGroupId);
+        await ConsumeAsync(consumer, stoppingToken);
+    }
 
+    internal TimeSpan FailureBackoff { get; init; } = TimeSpan.FromSeconds(5);
+
+    internal async Task ConsumeAsync(IConsumer<string, byte[]> consumer, CancellationToken stoppingToken)
+    {
         while (!stoppingToken.IsCancellationRequested)
         {
             ConsumeResult<string, byte[]> result;
@@ -60,17 +79,28 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
             {
                 break;
             }
+            catch (ConsumeException ex) when (!ex.Error.IsFatal)
+            {
+                // The client reports recoverable errors, such as a subscribed
+                // topic that does not exist yet, and keeps going; so does the
+                // loop. The deserializers cannot fail (keys are decoded as UTF-8
+                // with replacement, values are raw bytes), so no record is
+                // skipped. A fatal error still ends the consumer.
+                logger.LogWarning("Message-store adapter consume error, retrying code={ErrorCode} reason={Reason}", ex.Error.Code, ex.Error.Reason);
+                await Task.Delay(FailureBackoff, stoppingToken);
+                continue;
+            }
 
             var message = ToPlatformMessage(result.Message, options);
             try
             {
                 await ProcessAsync(message, () => consumer.Commit(result), stoppingToken);
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
+            catch (Exception ex) when (!IsShutdown(ex, stoppingToken))
             {
                 logger.LogError(ex, "Message-store adapter failed to persist or publish message result messageId={MessageId}", message.MessageId);
                 consumer.Seek(result.TopicPartitionOffset);
-                await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
+                await Task.Delay(FailureBackoff, stoppingToken);
             }
         }
     }
@@ -124,9 +154,10 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
                 // The handler sees the consumed message unchanged on every
                 // in-process retry: retry diagnostics are recorded in the
                 // auto_redelivery_* columns, never invented as wire headers.
+                stepObservations.BeginHandlerInvocation(message.MessageId);
                 result = await handler.HandleAsync(message, cancellationToken);
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
+            catch (Exception ex) when (!IsShutdown(ex, cancellationToken))
             {
                 logger.LogError(ex, "Unhandled .NET integration message failure messageId={MessageId} handlerAttempt={HandlerAttempt}", message.MessageId, attempt);
                 result = PlatformMessageResult.Failed(ex.Message);
@@ -150,6 +181,14 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
         }
 
         return new HandledMessage(result, maxAttempts);
+    }
+
+    // Only the host's stopping token means shutdown. Any other cancellation,
+    // such as the TaskCanceledException of an HttpClient timeout, is a handler
+    // failure: retried, then parked, never a reason to stop consuming.
+    private static bool IsShutdown(Exception exception, CancellationToken stoppingToken)
+    {
+        return exception is OperationCanceledException && stoppingToken.IsCancellationRequested;
     }
 
     internal static PlatformMessage ToPlatformMessage(Message<string, byte[]> message, PlatformMessageStoreOptions options)
@@ -222,7 +261,17 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
 
     internal static Headers CreateDlqHeaders(PlatformMessage message, string error)
     {
-        var values = new Dictionary<string, string>(message.Headers, StringComparer.OrdinalIgnoreCase)
+        // Only the x-bip-* envelope is required on the DLQ record. The other
+        // consumed headers are kept for diagnosis, but a producer can forward
+        // credentials (Authorization, cookies, API keys) onto the input topic,
+        // and the DLQ topic is shared: keep their names, mask the values.
+        var values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var header in message.Headers)
+        {
+            values[header.Key] = IsCredentialHeader(header.Key) ? MaskedHeaderValue : header.Value;
+        }
+
+        var envelope = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
             ["x-bip-message-id"] = message.MessageId,
             ["x-bip-correlation-id"] = message.CorrelationId,
@@ -232,6 +281,10 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
             ["x-bip-error"] = error,
             ["x-bip-dlq-at"] = DateTimeOffset.UtcNow.ToString("O"),
         };
+        foreach (var header in envelope)
+        {
+            values[header.Key] = header.Value;
+        }
 
         var headers = new Headers();
         foreach (var header in values)
@@ -240,6 +293,24 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
         }
 
         return headers;
+    }
+
+    // Same rule as the Camel adapter's DLQ parking (0.3.6), so both adapters
+    // mask the same header names on the shared DLQ topic. A -key or _key
+    // suffix covers vendor keys such as x-functions-key; Idempotency-Key is
+    // a delivery identifier, not a credential.
+    internal static bool IsCredentialHeader(string name)
+    {
+        var lower = name.ToLowerInvariant();
+        if (lower.StartsWith("x-bip-", StringComparison.Ordinal) || lower == "idempotency-key")
+        {
+            return false;
+        }
+
+        return CredentialHeaders.Contains(lower)
+            || CredentialNameParts.Any(part => lower.Contains(part, StringComparison.Ordinal))
+            || lower.EndsWith("-key", StringComparison.Ordinal)
+            || lower.EndsWith("_key", StringComparison.Ordinal);
     }
 
     private static string? Header(IReadOnlyDictionary<string, string> headers, string name)
