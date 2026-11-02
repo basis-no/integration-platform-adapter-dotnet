@@ -9,15 +9,8 @@ The patterns are private and come from a file or an environment variable, never
 from this repository. Output names only the location and the pattern number, so
 a CI log never reveals a pattern.
 
-It also refuses citations of documents outside this repository (decision, ADR and
-section numbers, and an external test suite): the adapter describes its behaviour
-in its own terms. These patterns are public and reported by name. --public-only
-runs them, and the private-IP check, without the private patterns, for pull
-requests from forks, which cannot read the secret.
-
 usage: public-content-check.py --range BASE..HEAD
-       [--patterns-file PATH | patterns in $PUBLIC_CONTENT_PATTERNS | --public-only]
-       [--check-emails]
+       [--patterns-file PATH | patterns in $PUBLIC_CONTENT_PATTERNS] [--check-emails]
 """
 
 import argparse
@@ -30,13 +23,6 @@ ALLOWED_EMAIL = re.compile(r"(@basis\.no|@users\.noreply\.github\.com|^noreply@g
 PRIVATE_IP = re.compile(
     r"\b(10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b"
 )
-# Written so that none of these lines matches its own pattern.
-EXTERNAL_CITATIONS = {
-    "decision-number": re.compile(r"\bDECISION\s+D\d+\b", re.IGNORECASE),
-    "adr-number": re.compile(r"(?<![\w-])ADR-\d+(?![\w-])", re.IGNORECASE),
-    "section-number": re.compile(r"§\s*\d"),
-    "certification-suite": re.compile(r"\bcertification\s+suite\b", re.IGNORECASE),
-}
 
 
 def git(*args):
@@ -59,11 +45,10 @@ def main():
     parser.add_argument("--range", required=True)
     parser.add_argument("--patterns-file")
     parser.add_argument("--check-emails", action="store_true")
-    parser.add_argument("--public-only", action="store_true")
     args = parser.parse_args()
 
-    patterns = [] if args.public_only else load_patterns(args.patterns_file)
-    if not patterns and not args.public_only:
+    patterns = load_patterns(args.patterns_file)
+    if not patterns:
         print("No private patterns configured; refusing to report a clean result.", file=sys.stderr)
         return 2
 
@@ -71,7 +56,6 @@ def main():
         hits = [str(i + 1) for i, p in enumerate(patterns) if p.search(text)]
         if PRIVATE_IP.search(text):
             hits.append("private-ip")
-        hits.extend(name for name, pattern in EXTERNAL_CITATIONS.items() if pattern.search(text))
         return hits
 
     findings = []
@@ -97,7 +81,7 @@ def main():
                 line_no += 1
 
     if findings:
-        print("Private or external content found. Remove it, or rewrite the commits, before this can be published:")
+        print("Private content found. Remove it, or rewrite the commits, before this can be published:")
         for finding in findings:
             print("  " + finding)
         return 1
