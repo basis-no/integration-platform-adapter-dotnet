@@ -65,7 +65,7 @@ public sealed class PlatformMessageConsumerServiceTests
         Assert.AreEqual("application/json", Header(headers, "x-bip-content-type"));
         Assert.AreEqual("simulated failure", Header(headers, "x-bip-error"));
         Assert.IsFalse(string.IsNullOrWhiteSpace(Header(headers, "x-bip-dlq-at")));
-        // §3: in-process retry diagnostics live in the auto_redelivery_* columns
+        // In-process retry diagnostics live in the auto_redelivery_* columns
         // only — the adapter must never invent non-contract wire headers.
         Assert.IsFalse(headers.TryGetLastBytes("x-bip-redelivered", out _), "x-bip-redelivered is not a contract header and must not appear on DLQ records.");
         Assert.IsFalse(headers.TryGetLastBytes("x-bip-redelivery-count", out _), "x-bip-redelivery-count is not a contract header and must not appear on DLQ records.");
@@ -114,7 +114,7 @@ public sealed class PlatformMessageConsumerServiceTests
     [TestMethod]
     public async Task ReadReplayRequestHonorsChunkedBodyWithoutContentLength()
     {
-        // §9: a chunked-transfer POST has no Content-Length; the redoSteps body
+        // A chunked-transfer POST has no Content-Length; the redoSteps body
         // must still be honored — ignoring it would be a silent redo no-op.
         var json = """{"requestedBy":"operator","reason":"redo","redoSteps":["target-system"]}"""u8.ToArray();
         await using var body = new NonSeekableReadStream(json);
@@ -219,8 +219,8 @@ public sealed class PlatformMessageConsumerServiceTests
     [TestMethod]
     public void StepExecutorMalformedRedoHeaderWarnsAndTreatsAsEmpty()
     {
-        // Contract v1 DECISION D1: malformed x-bip-redo-steps is a WARNING and
-        // treated as empty, never a processing failure.
+        // Malformed x-bip-redo-steps is a WARNING and treated as empty, never a
+        // processing failure.
         var message = Message(new Dictionary<string, string>
         {
             ["x-bip-redo-steps"] = "target-system,other-step",

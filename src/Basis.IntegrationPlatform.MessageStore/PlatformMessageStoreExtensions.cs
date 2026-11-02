@@ -97,9 +97,9 @@ public static class PlatformMessageStoreExtensions
     /// Reads the optional resend request body. The body is buffered and parsed
     /// whenever any bytes are actually present — never gated on Content-Length,
     /// which is absent for chunked transfer encoding. Silently dropping a
-    /// chunked body carrying redoSteps would be the silent-redo-noop that
-    /// contract v1 §9 forbids. An empty body yields no request (header
-    /// fallback applies); a malformed body yields a BAD_REQUEST error.
+    /// chunked body carrying redoSteps would turn the requested redo into a
+    /// silent no-op. An empty body yields no request (header fallback
+    /// applies); a malformed body yields a BAD_REQUEST error.
     /// </summary>
     internal static async Task<(MessageReplayRequest? Request, string? Error)> ReadReplayRequestAsync(
         Stream body,
@@ -126,7 +126,6 @@ public static class PlatformMessageStoreExtensions
 }
 
 /// <summary>
-/// Error body of the resend endpoint per spec/openapi/resend-api.v1.yaml:
-/// { code, error, replayId? }.
+/// Error body of the resend endpoint: { code, error, replayId? }.
 /// </summary>
 public sealed record ReplayErrorBody(string Code, string Error, string? ReplayId = null);

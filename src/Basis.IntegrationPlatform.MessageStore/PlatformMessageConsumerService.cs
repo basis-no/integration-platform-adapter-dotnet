@@ -35,8 +35,8 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         options.Validate();
-        // Contract v1 §10 startup gate: verify the provisioned contract major
-        // before consuming anything. Wrong major fails fast; missing table warns.
+        // Startup gate: verify the store schema major in bip_contract before
+        // consuming anything. Wrong major fails fast; missing table warns.
         await store.VerifyContractAsync(stoppingToken);
         var config = new ConsumerConfig(options.CreateKafkaClientConfig())
         {
@@ -47,7 +47,7 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
 
         using var consumer = new ConsumerBuilder<string, byte[]>(config).Build();
         consumer.Subscribe(options.InputTopic);
-        logger.LogInformation("Basis message-store adapter consuming topic {Topic} group {GroupId}", options.InputTopic, options.ConsumerGroupId);
+        logger.LogInformation("Message-store adapter consuming topic {Topic} group {GroupId}", options.InputTopic, options.ConsumerGroupId);
 
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -68,7 +68,7 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                logger.LogError(ex, "Basis message-store adapter failed to persist or publish message result messageId={MessageId}", message.MessageId);
+                logger.LogError(ex, "Message-store adapter failed to persist or publish message result messageId={MessageId}", message.MessageId);
                 consumer.Seek(result.TopicPartitionOffset);
                 await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
             }
@@ -78,21 +78,21 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
     /// <summary>
     /// Processes one consumed delivery end to end: handler invocation (with
     /// bounded in-process retry), outcome persistence and offset commit.
-    /// Contract v1 §8 ordering on give-up (scenario S12): publish to the DLQ
-    /// topic FIRST, then record the attempt with status DLQ, then commit the
-    /// Kafka offset. A failed DLQ publish therefore leaves NO DLQ status row
-    /// and NO committed offset, so the seek/redelivery path re-processes the
-    /// same delivery until the park succeeds.
+    /// Ordering on give-up: publish to the DLQ topic FIRST, then record the
+    /// attempt with status DLQ, then commit the Kafka offset. A failed DLQ
+    /// publish therefore leaves NO DLQ status row and NO committed offset, so
+    /// the seek/redelivery path re-processes the same delivery until the park
+    /// succeeds.
     /// </summary>
     internal async Task ProcessAsync(PlatformMessage message, Action commitOffset, CancellationToken cancellationToken)
     {
         // Reset the per-message step observations for this delivery so the
-        // attempt row records exactly what THIS processing attempt observed (D4).
+        // attempt row records exactly what THIS processing attempt observed.
         stepObservations.Clear(message.MessageId);
         var handled = await HandleWithRetryAsync(message, cancellationToken);
         // In-process retry diagnostics flow ONLY into the auto_redelivered /
         // auto_redelivery_count / auto_redelivery_max columns, derived from the
-        // retry-loop state. They are never invented as x-bip-* wire headers (§3).
+        // retry-loop state. They are never invented as x-bip-* wire headers.
         var metadata = new PlatformMessageAttemptMetadata(
             options.RouteId,
             handled.HandlerAttempts > 1,
@@ -174,9 +174,9 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
 
     internal static int SchemaVersionFrom(IReadOnlyDictionary<string, string> headers)
     {
-        // Contract v1 §3: x-bip-schema-version is an integer string declared by
-        // the producer. Absent or unparseable values default to schema version 1
-        // (parity with the Camel adapter's header conversion).
+        // x-bip-schema-version is an integer string declared by the producer.
+        // Absent or unparseable values default to schema version 1 (parity
+        // with the Camel adapter's header conversion).
         var raw = Header(headers, "x-bip-schema-version");
         return raw is not null
             && int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var schemaVersion)

@@ -31,8 +31,9 @@ rules the agents follow; human contributors follow the same rules.
 - Never put customer names, internal hostnames, credentials, personal data or
   test-run evidence in code, documentation, commits or pull requests. The
   `Public content` check scans every pull request and every push to `main` and
-  `release/*` for credentials and for private names and hosts. It reports only
-  the file, line and pattern number.
+  `release/*` for credentials, for private names and hosts and for citations
+  of documents outside this repository (decision, ADR and section numbers). It
+  reports only the file, line and pattern number or name.
 
 ## Security
 

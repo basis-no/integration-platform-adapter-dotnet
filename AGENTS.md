@@ -1,34 +1,35 @@
 # .NET adapter
 
-This repository is the .NET adapter of the Basis Integration Platform, published on NuGet.org as
-`Basis.IntegrationPlatform.MessageStore`. Customer integrations built on the platform depend on it
-to consume their input topic, record every message in the Message Store (the `bip_*` Postgres
-tables), commit Kafka offsets only after that record is durable, park failures in the DLQ and
-serve resend. Each integration pins an exact package version. This file is for contributors and
-the coding agents working with them. `CLAUDE.md` is a symlink to it.
+This repository is the .NET Message Store adapter, published on NuGet.org as
+`Basis.IntegrationPlatform.MessageStore`. Integrations depend on it to consume their input topic,
+record every message in the Message Store (the `bip_*` Postgres tables), commit Kafka offsets only
+after that record is durable, park failures in the DLQ and serve resend. Each integration pins an
+exact package version. This file is for contributors and the coding agents working with them.
+`CLAUDE.md` is a symlink to it.
 
-The adapter implements one version of the Message Store contract; `README.md` names that version.
-The contract defines headers, statuses, attempts, steps, DLQ records, resend and the SQL schema
-(copied in `tests/fixtures/postgres/`). This repository owns the .NET implementation, its
-configuration and its tests.
+The Message Store contract is what this adapter shares with the
+[Camel adapter](https://github.com/basis-no/integration-platform-adapter-camel-quarkus): headers,
+statuses, attempts, steps, DLQ records, resend and the SQL schema. `README.md` describes it,
+`tests/fixtures/postgres/` holds the schema, and `SupportedContractMajor` is the store schema major
+the adapter accepts. This repository owns the .NET implementation, its configuration and its tests.
 
 Treat this file as good defaults, not hard law. The developer's instructions override it; when a
 rule here fights the task, say so plainly and get a human decision.
 
 ## What we never compromise on
 
-### 1. The contract defines behavior, in both runtimes
+### 1. The contract defines behavior, in both adapters
 
-Cross-runtime semantics come from the contract, not from this code; when they disagree, the code is
-wrong. The [Camel adapter](https://github.com/basis-no/integration-platform-adapter-camel-quarkus)
-implements the same contract and the platform reads both through one model, so a semantic change
-starts as a contract change and never lands here alone.
+Semantics come from the contract as `README.md` and the fixture schema describe it, not from this
+code; when they disagree, the code is wrong. The Camel adapter writes the same rows and headers and
+readers of the store rely on both behaving alike, so a semantic change is a deliberate contract
+change made in both adapters, never here alone.
 
 ### 2. Deployed integrations keep working
 
 Integrations upgrade by an explicit change to their package pin. A release accepts the code and
 configuration that worked with the previous one: public types and signatures, the environment
-variables the platform injects, headers, request bodies and defaults. Existing deployments keep
+variables deployments set, headers, request bodies and defaults. Existing deployments keep
 their behavior until they opt in; Kafka stays plaintext until security is configured. Published
 packages are immutable; fixes ship as new versions.
 
@@ -41,7 +42,7 @@ guarantee is at-least-once; external calls rely on the step ledger and the recei
 
 ### 4. Fail closed
 
-Startup refuses an unknown contract major in `bip_contract`, and an unreadable `bip_contract`
+Startup refuses an unknown store schema major in `bip_contract`, and an unreadable `bip_contract`
 after bounded retries. `PlatformMessageStoreOptions.Validate` rejects missing required settings,
 unknown payload modes or security values, and Kafka SASL without credentials. Kafka TLS keeps
 certificate and hostname verification on.
@@ -50,16 +51,17 @@ certificate and hostname verification on.
 
 No customer names, environments, private hosts or registries, topology, payloads, credentials or
 incident details in code, tests, docs, commits or PRs. Examples stay provider-neutral
-(`target.example`).
+(`target.example`). The adapter is generic open source: describe what it does in its own terms,
+never the products, deployments or internal documents built around it.
 
 ## The ways to hurt yourself
 
 1. **Changing the Message Store from this side.** The SQL in `PlatformMessageStore.cs` and
    `PlatformStepExecutor.cs`, the `x-bip-*` headers, the status strings and
-   `SupportedContractMajor` are contract surface. The platform provisions the `bip_*` tables.
-   `tests/fixtures/postgres/` is vendored contract DDL: refresh it from the contract, never edit
-   it to pass a test. Do not widen the gate's rollout grace: a missing or empty `bip_contract`
-   only warns.
+   `SupportedContractMajor` are contract surface. The adapter never creates or migrates the
+   `bip_*` tables; deployments provision them. `tests/fixtures/postgres/` is the schema the adapter
+   expects: change it only as part of a deliberate schema change in both adapters, never to pass a
+   test. Do not widen the gate's grace: a missing or empty `bip_contract` only warns.
 2. **Reordering the delivery path.** Recording before the DLQ publish, committing before
    recording, or holding a transaction or lock across a Kafka produce breaks the contract. Resend
    commits its `REQUESTED` audit row on its own connection before the produce.
@@ -98,7 +100,7 @@ republishes the stored payload to the input topic with the next attempt number.
   `PlatformStepExecutor.cs` and `PlatformStepObservations.cs` the step ledger and `steps_json`;
   `PlatformMessageStoreOptions.cs` configuration; `PlatformMessage.cs` the public message types.
 - `tests/Basis.IntegrationPlatform.MessageStore.Tests/`: MSTest. `tests/fixtures/postgres/`: the
-  vendored contract schema the Postgres tests run against.
+  store schema the Postgres tests run against.
 - `Directory.Build.props` (nullable on, warnings as errors), `Directory.Packages.props` (central
   package versions; add versions there, not in a csproj).
 - `.github/workflows/`: `test.yml` (PRs and `main`), `publish-nuget.yml` (tags) and
@@ -112,8 +114,8 @@ republishes the stored payload to the input topic with the next attempt number.
   `POSTGRES_TEST_CONNECTION_STRING`. When you touch SQL or persistence, run it against a
   disposable Postgres with `tests/fixtures/postgres/*.sql` applied in order, as `test.yml` does.
 - The `Test` workflow runs the whole suite against real Postgres on every PR; do not run the whole
-  suite locally unless asked. Contract-facing changes also need the contract's cross-runtime
-  certification suite before release; CI here does not run it.
+  suite locally unless asked. CI tests only this adapter: a contract-facing change also needs the
+  matching change, and its tests, in the Camel adapter.
 - Tests use synthetic data. Report what you ran and what you did not.
 
 ## Pull requests
@@ -122,8 +124,8 @@ republishes the stored payload to the input topic with the next attempt number.
   `github.com/basis-no/integration-platform-adapter-dotnet`. Push and open PRs only when asked.
 - Title: a plain imperative sentence, like the history ("Ignore local VS Code settings").
 - Body: the problem in a sentence or two, the change, and what you verified. Say when the change
-  affects compatibility, defaults, limitations or the contract version, so maintainers can update
-  the platform's adapter-version matrix. No AI or agent attribution in commits or PR text.
+  affects compatibility, defaults, limitations or the store schema major, and whether the Camel
+  adapter needs the same change. No AI or agent attribution in commits or PR text.
 - Stage paths explicitly; never `git add -A`.
 
 ## Documentation
@@ -132,8 +134,7 @@ Most code changes need no documentation change. `README.md` is the user referenc
 the NuGet package: a change to usage, environment variables or defaults updates it, and a change
 users will notice gets a line in `CHANGELOG.md`.
 
-- Keep the README's contract version and the csproj `<Description>` in step with the contract the
-  code implements.
+- Keep the store schema major in the README in step with `SupportedContractMajor`.
 - Rewrite text in place. Never append dated updates, status sections or evidence logs.
 
 ## Plans and work artifacts
@@ -147,6 +148,6 @@ users will notice gets a line in `CHANGELOG.md`.
 - Configuration comes from environment variables in `PlatformMessageStoreOptions`; `Validate()`
   fails with a message that names the variable to fix.
 - SQL is inline and parameterized; never build it from strings.
-- Comments sit next to the code, explain why, and cite the contract section or decision that
-  constrains it (`Contract v1 §10`, `DECISION D2`).
+- Comments sit next to the code and explain why in terms of what the adapter does. They do not
+  cite documents outside this repository by section, decision or ADR number.
 - Prove persistence against real Postgres rather than mocks.

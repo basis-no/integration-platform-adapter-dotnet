@@ -34,16 +34,16 @@ public sealed class PlatformMessageStore
     }
 
     /// <summary>
-    /// Contract v1 §10 startup gate: read the provisioned contract major from
-    /// bip_contract before consuming. A missing table is a loud warning
-    /// (treated as major 1 during the v1.0 rollout); a different major fails fast.
+    /// Startup gate: read the store schema major (bip_contract.contract_major)
+    /// before consuming. A missing or empty table is a loud warning (treated as
+    /// major 1, for stores provisioned without it); a different major fails fast.
     /// </summary>
     public async Task VerifyContractAsync(CancellationToken cancellationToken)
     {
-        // Contract spec section 10: absent table (42P01) warns and continues
-        // during the v1.0 rollout; any other failure to obtain an answer gets
-        // bounded retries (cold pools) and then FAILS startup - fail fast over
-        // masked errors. A mismatched contract major always fails startup.
+        // An absent table (42P01) warns and continues; any other failure to
+        // obtain an answer gets bounded retries (cold pools) and then FAILS
+        // startup - fail fast over masked errors. A mismatched schema major
+        // always fails startup.
         object? result;
         Exception? lastFailure = null;
         var attempt = 0;
@@ -60,7 +60,7 @@ public sealed class PlatformMessageStore
             catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UndefinedTable)
             {
                 logger.LogWarning(
-                    "bip_contract table is missing; assuming message-store contract major {ContractMajor} during the v1.0 rollout. " +
+                    "bip_contract table is missing; assuming message-store contract major {ContractMajor}. " +
                     "Provision the contract metadata (004_contract_metadata.sql) so the adapter can verify the schema before consuming.",
                     SupportedContractMajor);
                 return;
@@ -70,14 +70,14 @@ public sealed class PlatformMessageStore
                 lastFailure = ex;
                 if (attempt >= options.ContractGateMaxAttempts)
                 {
-                    // Platform principle: fail fast over masked errors. Startup
-                    // failure is safe under rolling updates (previous pods keep
-                    // serving) and an adapter that cannot reach its journal must
-                    // not consume anyway (contract spec section 10).
+                    // Fail fast over masked errors. Startup failure is safe
+                    // under rolling updates (previous pods keep serving) and an
+                    // adapter that cannot reach its journal must not consume
+                    // anyway.
                     throw new InvalidOperationException(
                         $"Message-store contract gate could not read bip_contract after {attempt} attempts " +
                         $"({lastFailure.Message}). Refusing to start: fix grants/connectivity " +
-                        "(sql/postgres/003 grants select on bip_contract to the runtime role).",
+                        "(the runtime role needs select on bip_contract).",
                         lastFailure);
                 }
                 logger.LogInformation(
@@ -93,7 +93,7 @@ public sealed class PlatformMessageStore
         if (result is null or DBNull)
         {
             logger.LogWarning(
-                "bip_contract table has no rows; assuming message-store contract major {ContractMajor} during the v1.0 rollout.",
+                "bip_contract table has no rows; assuming message-store contract major {ContractMajor}.",
                 SupportedContractMajor);
             return;
         }
@@ -104,7 +104,7 @@ public sealed class PlatformMessageStore
             throw new InvalidOperationException(
                 $"The provisioned message-store schema declares contract major {contractMajor}, but this adapter " +
                 $"implements contract major {SupportedContractMajor}. Refusing to start: writing a mismatched schema " +
-                "shape would corrupt the platform message store. Deploy an adapter version matching the provisioned contract.");
+                "shape would corrupt the message store. Deploy an adapter version matching the provisioned contract.");
         }
 
         logger.LogInformation("Message-store contract major {ContractMajor} verified against bip_contract.", contractMajor);
@@ -127,12 +127,12 @@ public sealed class PlatformMessageStore
         string? error,
         CancellationToken cancellationToken)
     {
-        // DECISION D2: the attempt number comes from the x-bip-attempt header of
-        // the consumed message (absent => 1) and is never derived from the database.
+        // The attempt number comes from the x-bip-attempt header of the
+        // consumed message (absent => 1) and is never derived from the database.
         var attempt = AttemptFrom(message);
         var payload = CapturePayload(message);
-        // DECISION D4: steps_json records what THIS processing attempt observed,
-        // not a cumulative snapshot of bip_step_outcome.
+        // steps_json records what THIS processing attempt observed, not a
+        // cumulative snapshot of bip_step_outcome.
         var stepsJson = JsonSerializer.Serialize(stepObservations.Snapshot(message.MessageId), JsonOptions);
 
         await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
@@ -167,7 +167,7 @@ public sealed class PlatformMessageStore
         var replayValidationError = ReplayValidationError(stored);
         if (replayValidationError is not null)
         {
-            // Not replayable (§6): rejected before any audit row or produce.
+            // Not replayable: rejected before any audit row or produce.
             return new MessageReplayResult(
                 "FAILED",
                 messageId,
@@ -178,7 +178,7 @@ public sealed class PlatformMessageStore
                 ErrorCode: MessageReplayErrorCodes.NotReplayable);
         }
 
-        // Audit ordering (§9): commit the REQUESTED audit row on its own
+        // Audit ordering: commit the REQUESTED audit row on its own
         // connection/transaction BEFORE the Kafka produce. No database lock or
         // open transaction spans the produce call.
         var replayId = Guid.NewGuid().ToString();
@@ -231,7 +231,7 @@ public sealed class PlatformMessageStore
 
     internal PayloadCapture CapturePayload(PlatformMessage message)
     {
-        // DECISION D3 payload policy, identical semantics to the Camel adapter.
+        // Payload policy, identical semantics to the Camel adapter.
         var sizeBytes = (long)message.Payload.Length;
         if (options.PayloadMode == PlatformMessageStoreOptions.PayloadModeMetadataOnly)
         {
@@ -268,8 +268,8 @@ public sealed class PlatformMessageStore
 
     private static string? ReplayValidationError(ReplayableStoredMessage message)
     {
-        // DECISION D3: replayable = payload captured AND not expired AND not
-        // deleted — independent of terminal status.
+        // Replayable = payload captured AND not expired AND not deleted —
+        // independent of terminal status.
         if (message.PayloadDeletedAt is not null)
         {
             return "Payload was deleted.";
@@ -395,7 +395,7 @@ public sealed class PlatformMessageStore
         AddMessageParameters(command, message);
         command.Parameters.AddWithValue("status", status);
         command.Parameters.AddWithValue("attempt", attempt);
-        // §3: schema_version is the producer-declared x-bip-schema-version
+        // schema_version is the producer-declared x-bip-schema-version
         // (default 1), never a hardcoded constant.
         command.Parameters.AddWithValue("schema_version", message.SchemaVersion);
         AddPayloadParameters(command, payload);
@@ -418,8 +418,8 @@ public sealed class PlatformMessageStore
         string stepsJson,
         CancellationToken cancellationToken)
     {
-        // DECISION D2: infra redeliveries re-record the same (message_id, attempt)
-        // row instead of appending a new attempt or failing on the primary key.
+        // Infra redeliveries re-record the same (message_id, attempt) row
+        // instead of appending a new attempt or failing on the primary key.
         await using var command = new NpgsqlCommand(
             """
             insert into bip_message_attempt (
@@ -461,7 +461,7 @@ public sealed class PlatformMessageStore
         command.Parameters.AddWithValue("attempt", attempt);
         command.Parameters.AddWithValue("route_id", metadata.RouteId);
         command.Parameters.AddWithValue("status", status);
-        // §3: schema_version is the producer-declared x-bip-schema-version
+        // schema_version is the producer-declared x-bip-schema-version
         // (default 1), never a hardcoded constant.
         command.Parameters.AddWithValue("schema_version", message.SchemaVersion);
         AddPayloadParameters(command, payload);
@@ -567,7 +567,7 @@ public sealed record PlatformMessageAttemptMetadata(
     int? AutoRedeliveryMax = null);
 
 /// <summary>
-/// Result of the DECISION D3 payload policy for one recorded message.
+/// Result of the payload policy for one recorded message.
 /// metadata_only rows store no payload bytes and are never replayable.
 /// </summary>
 internal sealed record PayloadCapture(
