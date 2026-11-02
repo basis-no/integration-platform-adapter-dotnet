@@ -973,7 +973,7 @@ public sealed class PlatformMessageStorePostgresTests
     [TestMethod]
     public async Task ReplayRecordsANewInlinePayloadExpiry()
     {
-        // Pins current behaviour (A12): the upserts write
+        // Pins current behaviour: the upserts write
         // payload_expires_at = excluded.payload_expires_at, so each processed
         // replay sets the expiry from its own processing time.
         var connectionString = RequireConnectionString();

@@ -101,8 +101,9 @@ The step key is `<message-id>:<step-id>`, and a step whose key is already
 
 The adapter logs a warning when it skips a step that the same handler invocation
 already ran, and when the skipped message id is journaled by another integration.
-The second warning reads `bip_message_log`. Under runtime isolation, row-level
-security hides the other integration's row, so that warning never fires there.
+The second warning reads `bip_message_log`. Where row-level security limits
+each integration to its own rows, the other integration's row is hidden, so that
+warning never fires there.
 If the read fails, the step is still skipped and the check is logged at debug.
 
 ## Required Runtime Environment

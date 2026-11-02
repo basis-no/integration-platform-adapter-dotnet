@@ -81,8 +81,8 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
     internal static string IdempotencyKey(string messageId, string stepId) => $"{messageId}:{stepId}";
 
     /// <summary>
-    /// The key is <c>messageId:stepId</c> (Contract v1 §7) and bip_step_outcome
-    /// has no integration column, so a DELIVERED row may not be this call's own
+    /// The key is <c>messageId:stepId</c> and bip_step_outcome has no
+    /// integration column, so a DELIVERED row may not be this call's own
     /// delivery. Warn on the two ways that happens; the skip itself is unchanged.
     /// </summary>
     private async Task WarnAboutSharedStepKeyAsync(

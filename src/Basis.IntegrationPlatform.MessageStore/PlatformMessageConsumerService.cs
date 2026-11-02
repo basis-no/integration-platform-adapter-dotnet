@@ -236,10 +236,10 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
 
     internal static Headers CreateDlqHeaders(PlatformMessage message, string error)
     {
-        // Contract v1 §8 requires only the x-bip-* envelope on the DLQ record.
-        // The other consumed headers are kept for diagnosis, but a producer can
-        // forward credentials (Authorization, cookies, API keys) onto the input
-        // topic, and the DLQ topic is shared: keep their names, mask the values.
+        // Only the x-bip-* envelope is required on the DLQ record. The other
+        // consumed headers are kept for diagnosis, but a producer can forward
+        // credentials (Authorization, cookies, API keys) onto the input topic,
+        // and the DLQ topic is shared: keep their names, mask the values.
         var values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         foreach (var header in message.Headers)
         {
@@ -270,7 +270,7 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
         return headers;
     }
 
-    // Same rule as the Camel adapter's DLQ parking (0.3.6), so both runtimes
+    // Same rule as the Camel adapter's DLQ parking (0.3.6), so both adapters
     // mask the same header names on the shared DLQ topic. A -key or _key
     // suffix covers vendor keys such as x-functions-key; Idempotency-Key is
     // a delivery identifier, not a credential.
