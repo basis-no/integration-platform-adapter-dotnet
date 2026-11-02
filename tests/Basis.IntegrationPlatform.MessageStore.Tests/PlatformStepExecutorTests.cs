@@ -8,6 +8,9 @@ public sealed class PlatformStepExecutorTests
     [DataRow("https://svc-user:synthetic-password@target.example/a", "https://xxxxxx@target.example/a")]
     [DataRow("https://synthetic-token@target.example/a", "https://xxxxxx@target.example/a")]
     [DataRow("https://svc-user:synthetic-password@target.example?token=t", "https://xxxxxx@target.example?token=xxxxxx")]
+    [DataRow("//svc-user:synthetic-password@target.example/orders", "//xxxxxx@target.example/orders")]
+    [DataRow("//target.example/orders?token=t", "//target.example/orders?token=xxxxxx")]
+    [DataRow("/orders/user:pw@x?page=2", "/orders/user:pw@x?page=2")]
     [DataRow(
         "https://target.example/a?key=k&code=c&sig=s&Signature=s2&X-Amz-Credential=c2&X-Amz-Security-Token=t&client_secret=cs&password=p&ok=1",
         "https://target.example/a?key=xxxxxx&code=xxxxxx&sig=xxxxxx&Signature=xxxxxx&X-Amz-Credential=xxxxxx&X-Amz-Security-Token=xxxxxx&client_secret=xxxxxx&password=xxxxxx&ok=1")]

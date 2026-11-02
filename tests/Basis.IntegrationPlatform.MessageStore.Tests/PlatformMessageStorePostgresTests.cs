@@ -1156,6 +1156,9 @@ public sealed class PlatformMessageStorePostgresTests
             + "?code=synthetic-function-key&api_key=synthetic-api-key&access_token=synthetic-token&sig=synthetic-signature&orderId=42";
         const string masked =
             "https://xxxxxx@target.example/api/orders?code=xxxxxx&api_key=xxxxxx&access_token=xxxxxx&sig=xxxxxx&orderId=42";
+        // A network-path reference, resolved against the HTTP client's base address.
+        const string relativeEndpoint = "//svc-user:synthetic-password@target.example/notify?sig=synthetic-signature";
+        const string relativeMasked = "//xxxxxx@target.example/notify?sig=xxxxxx";
         var connectionString = RequireConnectionString();
         var options = CreateOptions(connectionString);
         var messageId = $"dotnet-test-{Guid.NewGuid():N}";
@@ -1168,32 +1171,47 @@ public sealed class PlatformMessageStorePostgresTests
         // adapter only records the URI.
         await steps.ExecuteAsync(message, "deliver", endpoint, "target", _ => { called++; return Task.CompletedTask; }, CancellationToken.None);
         var skipped = await steps.ExecuteAsync(message, "deliver", endpoint, "target", _ => { called++; return Task.CompletedTask; }, CancellationToken.None);
+        await steps.ExecuteAsync(message, "notify", relativeEndpoint, "target", _ => { called++; return Task.CompletedTask; }, CancellationToken.None);
 
-        Assert.AreEqual(1, called);
+        Assert.AreEqual(2, called);
         Assert.IsTrue(skipped.Skipped);
         CollectionAssert.AreEqual(
-            new[] { masked, masked },
+            new[] { masked, masked, relativeMasked },
             observations.Snapshot(messageId).Select(observation => observation.EndpointUri).ToArray());
 
         await store.RecordAttemptAsync(message, "dotnet-handler", "COMPLETED", null, CancellationToken.None);
         await using var connection = await dataSource.OpenConnectionAsync();
-        await using var command = new NpgsqlCommand(
+        await using (var ledger = new NpgsqlCommand(
+            "select step_id, endpoint_uri from bip_step_outcome where message_id = @message_id order by step_id",
+            connection))
+        {
+            ledger.Parameters.AddWithValue("message_id", messageId);
+            await using var rows = await ledger.ExecuteReaderAsync();
+            var recorded = new List<string>();
+            while (await rows.ReadAsync())
+            {
+                recorded.Add($"{rows.GetString(0)} {rows.GetString(1)}");
+            }
+
+            CollectionAssert.AreEqual(new[] { $"deliver {masked}", $"notify {relativeMasked}" }, recorded);
+        }
+
+        await using var attempt = new NpgsqlCommand(
             """
-            select outcome.endpoint_uri,
-                   attempt.steps_json -> 0 ->> 'endpointUri',
-                   attempt.steps_json -> 1 ->> 'endpointUri',
-                   attempt.steps_json::text
-            from bip_step_outcome outcome
-            join bip_message_attempt attempt using (message_id)
-            where outcome.idempotency_key = @idempotency_key and attempt.attempt = 1
+            select steps_json -> 0 ->> 'endpointUri',
+                   steps_json -> 1 ->> 'endpointUri',
+                   steps_json -> 2 ->> 'endpointUri',
+                   steps_json::text
+            from bip_message_attempt
+            where message_id = @message_id and attempt = 1
             """,
             connection);
-        command.Parameters.AddWithValue("idempotency_key", $"{messageId}:deliver");
-        await using var reader = await command.ExecuteReaderAsync();
+        attempt.Parameters.AddWithValue("message_id", messageId);
+        await using var reader = await attempt.ExecuteReaderAsync();
         Assert.IsTrue(await reader.ReadAsync());
         Assert.AreEqual(masked, reader.GetString(0));
         Assert.AreEqual(masked, reader.GetString(1));
-        Assert.AreEqual(masked, reader.GetString(2));
+        Assert.AreEqual(relativeMasked, reader.GetString(2));
         Assert.IsFalse(reader.GetString(3).Contains("synthetic-", StringComparison.Ordinal), "steps_json must not carry the credentials.");
     }
 

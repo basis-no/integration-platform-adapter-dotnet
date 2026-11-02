@@ -125,13 +125,24 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
 
     private static string MaskUserInfo(string hierarchy)
     {
-        var scheme = hierarchy.IndexOf("://", StringComparison.Ordinal);
-        if (scheme < 0)
+        // The authority follows "scheme://" or, in a network-path reference
+        // such as "//host/path", the leading "//".
+        int authorityStart;
+        if (hierarchy.StartsWith("//", StringComparison.Ordinal))
         {
-            return hierarchy;
+            authorityStart = 2;
+        }
+        else
+        {
+            var scheme = hierarchy.IndexOf("://", StringComparison.Ordinal);
+            if (scheme < 0)
+            {
+                return hierarchy;
+            }
+
+            authorityStart = scheme + 3;
         }
 
-        var authorityStart = scheme + 3;
         var authorityEnd = hierarchy.IndexOf('/', authorityStart);
         var authority = hierarchy.AsSpan(authorityStart, (authorityEnd < 0 ? hierarchy.Length : authorityEnd) - authorityStart);
         var at = authority.LastIndexOf('@');
