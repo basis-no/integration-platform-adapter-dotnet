@@ -19,6 +19,9 @@ rules the agents follow; human contributors follow the same rules.
 
 ## Pull requests
 
+- Every problem or feature starts with an issue. A pull request links the
+  issues it addresses, with `Closes #N` when it resolves one or `Refs #N` when
+  it does part of it, and says how the change resolves them.
 - One topic per pull request. Stack pull requests only when one really depends
   on another.
 - Pull requests are squash-merged, and the pull-request title becomes the
