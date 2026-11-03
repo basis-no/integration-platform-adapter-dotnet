@@ -122,10 +122,12 @@ republishes the stored payload to the input topic with the next attempt number.
 
 - Small, from a branch off freshly fetched `origin/main` at
   `github.com/basis-no/integration-platform-adapter-dotnet`. Push and open PRs only when asked.
+- Every problem or feature has an issue before its PR; file one first if there is none.
 - Title: a plain imperative sentence, like the history ("Ignore local VS Code settings").
-- Body: the problem in a sentence or two, the change, and what you verified. Say when the change
-  affects compatibility, defaults, limitations or the store schema major, and whether the Camel
-  adapter needs the same change. No AI or agent attribution in commits or PR text.
+- Body: `Closes #N` for an issue the PR resolves, `Refs #N` for one it does part of, then how the
+  change resolves it and what you verified. Say when the change affects compatibility, defaults,
+  limitations or the store schema major, and whether the Camel adapter needs the same change. No
+  AI or agent attribution in commits or PR text.
 - Stage paths explicitly; never `git add -A`.
 
 ## Documentation
@@ -140,7 +142,7 @@ users will notice gets a line in `CHANGELOG.md`.
 ## Plans and work artifacts
 
 - Do not commit implementation plans, research notes, acceptance evidence or scratch files.
-- Track active work in the issue or PR that owns it.
+- Track active work in its issue and in the PR that resolves it.
 
 ## Taste
 
