@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Late deliveries of an older attempt still update their own attempt row but
+  leave every message summary column unchanged. Redelivery of the latest
+  attempt can update it normally, matching the Camel adapter.
+
 - The DLQ record no longer repeats credentials from the consumed message in
   clear text. It carries every consumed header, so an `Authorization`, cookie,
   client secret or API/subscription key a producer put on the input topic
