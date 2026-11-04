@@ -52,9 +52,11 @@
   before any audit row or produce, as the Camel adapter does. All 0.3.x
   releases are affected.
 
-- A replay records a new inline payload expiry, so each replay extends payload
-  retention from the time it was processed. This is current behaviour, now
-  pinned by a test.
+- Replay renews inline payload expiry only up to first receipt plus twice the
+  configured retention, matching the Camel adapter. Both the summary and new
+  attempt use the cap; earlier attempts keep their expiry. First receipt is
+  the earliest attempt recorded by this integration. Re-consuming that earliest
+  attempt rewrites its receipt time and can move the cap; replay cannot.
 
 ## 0.3.0
 
