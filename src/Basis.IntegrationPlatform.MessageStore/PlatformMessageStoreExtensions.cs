@@ -23,6 +23,12 @@ public static class PlatformMessageStoreExtensions
         where THandler : class, IPlatformMessageHandler
     {
         services.AddOptions<PlatformMessageStoreOptions>().Configure(options => configure?.Invoke(options));
+        services.AddSingleton(provider =>
+        {
+            var options = provider.GetRequiredService<IOptions<PlatformMessageStoreOptions>>().Value;
+            options.Validate();
+            return new PlatformTrafficMetrics(options);
+        });
         services.AddKeyedSingleton<NpgsqlDataSource>(MessageStoreDataSourceKey, (provider, _) =>
         {
             var options = provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<PlatformMessageStoreOptions>>().Value;
@@ -46,7 +52,9 @@ public static class PlatformMessageStoreExtensions
         services.AddSingleton<IProducer<string, byte[]>>(provider =>
         {
             var options = provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<PlatformMessageStoreOptions>>().Value;
-            return new ProducerBuilder<string, byte[]>(new ProducerConfig(options.CreateKafkaClientConfig())).Build();
+            return new PlatformTrafficProducer(
+                new ProducerBuilder<string, byte[]>(new ProducerConfig(options.CreateKafkaClientConfig())).Build(),
+                provider.GetRequiredService<PlatformTrafficMetrics>());
         });
         services.AddSingleton<IPlatformMessageHandler, THandler>();
         services.AddHostedService<PlatformMessageConsumerService>();

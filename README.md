@@ -183,6 +183,43 @@ a reason. Replayability is a property of payload availability, never of the
 message outcome: `COMPLETED` messages are resendable as long as the payload
 is captured, unexpired, and undeleted.
 
+## Kafka activity metrics
+
+From 0.4, admission activity is enabled by default. The adapter exports through
+`System.Diagnostics.Metrics` under the meter name
+`Basis.IntegrationPlatform.MessageStore`. Subscribe to that meter in the
+application's exporter (for example OpenTelemetry); the adapter adds no metrics
+endpoint or exporter dependency.
+
+| Metric | Labels | Meaning |
+| --- | --- | --- |
+| `integration_traffic_events_total` | `signal` | Process-local count for `record_admitted` or `record_published` while supported |
+| `integration_traffic_signal_supported` | `signal` | `1` for a selected, supported signal; `0` means unknown coverage |
+| `integration_traffic_process_start_time_seconds` | none | Process start time as Unix seconds |
+
+`record_admitted` counts every input record handed to processing, including
+Kafka redeliveries, once per consumed delivery. In-process handler retries do
+not add admissions. This measures Kafka activity, not business completion or
+unique messages.
+
+`BASIS_TRAFFIC_SIGNALS` is a comma-separated selection of `record_admitted` and
+`record_published`; its default is `record_admitted`. Set it to an empty string
+to disable both. Publication is opt-in: select `record_published` and set
+`BASIS_TRAFFIC_INPUT_TOPICS` to the exact, comma-separated destination topics
+that count (no wildcards). Only broker-acknowledged records sent through the
+adapter's registered `IProducer<string, byte[]>` count, including callback-based
+sends. Failed and unacknowledged sends add nothing. Application-owned producers
+are outside this coverage; replacing the registered producer leaves publication
+unsupported. DLQ and replay sends count only if their destination is listed.
+
+Unselected signals, invalid signal names or topic lists, a missing producer or
+consumer boundary, and ambiguous acknowledgement metadata report
+`supported=0`. Transactional sends and cancellation before an observed ACK also
+make publication coverage unknown. Unknown coverage and absent metrics must
+never be interpreted as zero traffic. Counters reset when the process restarts;
+no topic, message, integration, payload or header values become metric labels.
+Options `TrafficSignals` and `TrafficInputTopics` can also be set in registration.
+
 ## Publish
 
 Releases are published to NuGet.org as `Basis.IntegrationPlatform.MessageStore`
