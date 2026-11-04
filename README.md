@@ -88,12 +88,16 @@ public sealed class MyMessageHandler : IPlatformMessageHandler
             stepId: "target-system",
             endpointUri: "https://target.example/api/orders",
             targetRef: message.TargetSystem,
-            operation: async ct =>
+            operation: async (step, ct) =>
             {
-                using var content = new ByteArrayContent(message.Payload);
-                content.Headers.ContentType = MediaTypeHeaderValue.Parse(message.ContentType);
-                using var response = await httpClients.CreateClient("target-system")
-                    .PostAsync("api/orders", content, ct);
+                using var request = new HttpRequestMessage(HttpMethod.Post, "api/orders")
+                {
+                    Content = new ByteArrayContent(message.Payload),
+                };
+                request.Content.Headers.ContentType = MediaTypeHeaderValue.Parse(message.ContentType);
+                // The step's stable key lets the receiver deduplicate.
+                request.Headers.Add("Idempotency-Key", step.IdempotencyKey);
+                using var response = await httpClients.CreateClient("target-system").SendAsync(request, ct);
                 // HttpClient returns a 4xx or 5xx response without throwing.
                 response.EnsureSuccessStatusCode();
             },
@@ -119,6 +123,14 @@ the handler and then parks the message.
 The step key is `<message-id>:<step-id>`, and a step whose key is already
 `DELIVERED` in `bip_step_outcome` is skipped, unless the message's
 `x-bip-redo-steps` header (a JSON array of step ids or step keys) names it.
+The two-argument operation receives `PlatformStepExecutionContext` before the
+call, with `StepId` and `IdempotencyKey`. The key is stable across redelivery,
+replay and explicit redo. The integration sends it to the receiver, as in the
+HTTP example; receiver deduplication protects the gap between the external
+side effect and the ledger write. Redo uses the same key, so a receiver may
+still deduplicate it. The original `Func<CancellationToken, Task>` overload
+continues to work unchanged.
+
 Choose step ids with that in mind:
 
 - Give every external call its own step id. A handler that sends several items

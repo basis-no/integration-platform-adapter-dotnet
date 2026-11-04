@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- A new step-executor overload passes the operation a
+  `PlatformStepExecutionContext` with the step's idempotency key and step id
+  before the call. Send the key as `Idempotency-Key` so the receiver can
+  deduplicate a redelivery, a replay or a redo of a call it already applied.
+  The original overload, and implementations of `IPlatformStepExecutor` written
+  against it, keep working unchanged.
+
 - A late, older attempt no longer overwrites the message summary. When attempt
   1 was consumed again after its replay, attempt 2, had been recorded,
   `bip_message_log` took attempt 1's status, error, payload and expiry while

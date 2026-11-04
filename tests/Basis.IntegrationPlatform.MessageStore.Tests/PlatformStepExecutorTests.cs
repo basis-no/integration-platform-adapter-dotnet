@@ -26,4 +26,34 @@ public sealed class PlatformStepExecutorTests
     {
         Assert.AreEqual(expected, PlatformStepExecutor.MaskEndpointUri(endpointUri));
     }
+    [TestMethod]
+    public async Task ContextOverloadWorksWithAnExistingInterfaceImplementation()
+    {
+        IPlatformStepExecutor steps = new LegacyExecutor();
+        var message = new PlatformMessage("message-1", "correlation-1", "app", "test", "demo", "source", "target",
+            "application/json", [], new Dictionary<string, string>());
+        var calls = 0;
+        var result = await steps.ExecuteAsync(message, "deliver", "https://target.example/orders", null,
+            (context, ct) =>
+            {
+                Assert.AreEqual("message-1:deliver", context.IdempotencyKey);
+                Assert.AreEqual("deliver", context.StepId);
+                Assert.AreEqual(CancellationToken.None, ct);
+                calls++;
+                return Task.CompletedTask;
+            }, CancellationToken.None);
+        Assert.AreEqual(1, calls);
+        Assert.AreEqual("message-1:deliver", result.IdempotencyKey);
+    }
+
+    private sealed class LegacyExecutor : IPlatformStepExecutor
+    {
+        public async Task<PlatformStepExecutionResult> ExecuteAsync(PlatformMessage message, string stepId,
+            string endpointUri, string? targetRef, Func<CancellationToken, Task> operation, CancellationToken cancellationToken)
+        {
+            await operation(cancellationToken);
+            return new PlatformStepExecutionResult($"{message.MessageId}:{stepId}", stepId, "DELIVERED", false);
+        }
+    }
+
 }
