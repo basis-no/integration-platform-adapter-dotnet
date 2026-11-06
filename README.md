@@ -192,6 +192,26 @@ a reason. Replayability is a property of payload availability, never of the
 message outcome: `COMPLETED` messages are resendable as long as the payload
 is captured, unexpired, and undeleted.
 
+## Replay order
+
+A resend publishes a new record at the end of the input topic; it never returns
+to the original offset. The record's Kafka key is the message's correlation id:
+`x-bip-correlation-id`, else the original record's key, else the message id.
+Kafka keeps order only per key within one partition, so:
+
+- records for the same key that were published after the original may already
+  have been processed. Replaying an old failure after a newer update for the
+  same entity can restore stale data at the receiver;
+- resending several messages has no overall order. Resend per key, oldest
+  first, and do not resend a failure that a newer message for the same key has
+  superseded;
+- a replay lands on the original's partition only when its key is the
+  original record's key and both producers partition keys the same way. Keep
+  `x-bip-correlation-id` equal to the record key, or leave it out. This
+  adapter's producer uses the Kafka client's default partitioner
+  (`consistent_random`), which places a key differently from the Java client's
+  default (`murmur2`).
+
 ## Publish
 
 Releases are published to NuGet.org as `Basis.IntegrationPlatform.MessageStore`
