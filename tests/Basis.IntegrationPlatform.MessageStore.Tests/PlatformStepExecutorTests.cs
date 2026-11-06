@@ -101,7 +101,7 @@ public sealed class PlatformStepExecutorTests
     }
 
     [TestMethod]
-    public async Task ContextOverloadWorksWithAnExistingInterfaceImplementation()
+    public async Task ContextApiWorksWithAnExistingInterfaceImplementation()
     {
         IPlatformStepExecutor steps = new LegacyExecutor();
         var message = new PlatformMessage("message-1", "correlation-1", "app", "test", "demo", "source", "target",
