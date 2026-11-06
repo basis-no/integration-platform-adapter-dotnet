@@ -83,7 +83,7 @@ public sealed class MyMessageHandler : IPlatformMessageHandler
         PlatformMessage message,
         CancellationToken cancellationToken)
     {
-        await steps.ExecuteAsync(
+        await steps.ExecuteWithContextAsync(
             message,
             stepId: "target-system",
             endpointUri: "https://target.example/api/orders",
@@ -123,13 +123,13 @@ the handler and then parks the message.
 The step key is `<message-id>:<step-id>`, and a step whose key is already
 `DELIVERED` in `bip_step_outcome` is skipped, unless the message's
 `x-bip-redo-steps` header (a JSON array of step ids or step keys) names it.
-The two-argument operation receives `PlatformStepExecutionContext` before the
-call, with `StepId` and `IdempotencyKey`. The key is stable across redelivery,
-replay and explicit redo. The integration sends it to the receiver, as in the
-HTTP example; receiver deduplication protects the gap between the external
-side effect and the ledger write. Redo uses the same key, so a receiver may
-still deduplicate it. The original `Func<CancellationToken, Task>` overload
-continues to work unchanged.
+`ExecuteWithContextAsync` passes the operation a `PlatformStepExecutionContext`
+before the call, with `StepId` and `IdempotencyKey`, the key
+`bip_step_outcome` records. The key is stable across redelivery, replay and
+explicit redo. Send it to the receiver, as in the example, so the receiver can
+deduplicate a call it already applied: after a crash between the call and the
+ledger write, and on a redo, which sends the same key. `ExecuteAsync`, whose
+operation receives only the cancellation token, works as before.
 
 Choose step ids with that in mind:
 

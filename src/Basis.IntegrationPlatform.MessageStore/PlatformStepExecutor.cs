@@ -15,8 +15,13 @@ public interface IPlatformStepExecutor
         Func<CancellationToken, Task> operation,
         CancellationToken cancellationToken);
 
-    /// <summary>Provides the stable step key before the external call.</summary>
-    Task<PlatformStepExecutionResult> ExecuteAsync(
+    /// <summary>
+    /// As <c>ExecuteAsync</c>, but the operation receives the step's stable
+    /// idempotency key before the external call. A separate name, not an
+    /// overload, so no call that compiled against <c>ExecuteAsync</c> becomes
+    /// ambiguous.
+    /// </summary>
+    Task<PlatformStepExecutionResult> ExecuteWithContextAsync(
         PlatformMessage message,
         string stepId,
         string endpointUri,
@@ -82,10 +87,10 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(operation);
-        return await ExecuteAsync(message, stepId, endpointUri, targetRef, (_, ct) => operation(ct), cancellationToken);
+        return await ExecuteWithContextAsync(message, stepId, endpointUri, targetRef, (_, ct) => operation(ct), cancellationToken);
     }
 
-    public async Task<PlatformStepExecutionResult> ExecuteAsync(
+    public async Task<PlatformStepExecutionResult> ExecuteWithContextAsync(
         PlatformMessage message,
         string stepId,
         string endpointUri,

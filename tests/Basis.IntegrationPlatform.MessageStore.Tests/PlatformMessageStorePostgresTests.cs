@@ -1232,19 +1232,19 @@ public sealed class PlatformMessageStorePostgresTests
             response.EnsureSuccessStatusCode();
         }
 
-        // The receiver applied the first call, but its local outcome failed.
-        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => steps.ExecuteAsync(
+        // The receiver applied the first call, then the attempt failed.
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => steps.ExecuteWithContextAsync(
             message, "deliver", "https://target.example/orders", "target", async (context, ct) =>
             {
                 await Send(context, ct);
                 throw new InvalidOperationException("synthetic failure after receiver applied call");
             }, cancellation.Token));
         CollectionAssert.AreEqual(new[] { expectedKey }, receiver.Keys);
-        var delivered = await steps.ExecuteAsync(message, "deliver", "https://target.example/orders", "target", Send, cancellation.Token);
+        var delivered = await steps.ExecuteWithContextAsync(message, "deliver", "https://target.example/orders", "target", Send, cancellation.Token);
         var replay = message with { Headers = new Dictionary<string, string> { ["x-bip-attempt"] = "2", ["x-bip-replay"] = "true" } };
-        var skipped = await steps.ExecuteAsync(replay, "deliver", "https://target.example/orders", "target", Send, cancellation.Token);
+        var skipped = await steps.ExecuteWithContextAsync(replay, "deliver", "https://target.example/orders", "target", Send, cancellation.Token);
         var redo = replay with { Headers = new Dictionary<string, string> { ["x-bip-attempt"] = "2", ["x-bip-replay"] = "true", ["x-bip-redo-steps"] = "[\"deliver\"]" } };
-        var redone = await steps.ExecuteAsync(redo, "deliver", "https://target.example/orders", "target", Send, cancellation.Token);
+        var redone = await steps.ExecuteWithContextAsync(redo, "deliver", "https://target.example/orders", "target", Send, cancellation.Token);
         Assert.IsTrue(skipped.Skipped);
         Assert.IsFalse(redone.Skipped);
         Assert.AreEqual(expectedKey, delivered.IdempotencyKey);
