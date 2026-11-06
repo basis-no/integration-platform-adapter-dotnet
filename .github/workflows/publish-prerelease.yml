@@ -6,10 +6,15 @@ name: Publish NuGet pre-release
 # tag-driven in publish-nuget.yml. NuGet.org never deletes a version (unlisting
 # only hides it), so every run publishes permanently.
 #
-# build runs the project code (tests, pack) with no secrets and no OIDC token.
-# push runs in environment `prerelease` (required reviewers), never checks out
-# or runs project code, and is the only job that can request an OIDC token. The
-# nuget.org Trusted Publishing policy for this file is bound to `prerelease`.
+# Trust boundaries, one per job, as in publish-nuget.yml:
+# - build runs the project code (tests, pack) with no secrets and no OIDC token.
+# - attest runs no project code. It records the package checksum and requests
+#   an OIDC token only for GitHub build provenance.
+# - push runs in environment `prerelease` (required reviewers), never checks
+#   out or runs project code, verifies the package against the recorded
+#   checksum and provenance, and is the only job whose OIDC token is exchanged
+#   for a NuGet.org key. The nuget.org Trusted Publishing policy for this file
+#   is bound to `prerelease`.
 
 on:
   workflow_dispatch:
@@ -103,14 +108,52 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  push:
+  attest:
     needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      id-token: write
+      attestations: write
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+      PACKAGE: Basis.IntegrationPlatform.MessageStore
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: nuget-prerelease-package
+          path: package
+      - name: Record the package checksum (data only, no checkout)
+        working-directory: package
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-preview\.[0-9]{8}\.[1-9][0-9]*$ ]] || { echo "Unexpected version '$VERSION'." >&2; exit 1; }
+          # Exactly the one package, as a regular file.
+          name="$PACKAGE.$VERSION.nupkg"
+          test "$(find . -mindepth 1 -printf '%y %P\n')" = "f $name"
+          sha256sum -- "$name" > "$GITHUB_WORKSPACE/package.sha256"
+          { echo '```'; cat "$GITHUB_WORKSPACE/package.sha256"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: package.sha256
+      - name: Retain the recorded checksum
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nuget-prerelease-checksums
+          path: package.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  push:
+    needs: [build, attest]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # nuget.org Trusted Publishing policy: this workflow file and environment
     # `prerelease` only. A reviewer approves before the job gets its token.
     environment: prerelease
     permissions:
+      actions: read
+      attestations: read
       id-token: write
     env:
       GH_TOKEN: ${{ github.token }}
@@ -131,11 +174,21 @@ jobs:
         with:
           name: nuget-prerelease-package
           path: package
-      - name: Check the package is exactly the pre-release version (data only)
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: nuget-prerelease-checksums
+          path: checksums
+      - name: Verify package bytes and build provenance (data only)
         run: |
+          set -euo pipefail
           [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-preview\.[0-9]{8}\.[1-9][0-9]*$ ]] || { echo "Unexpected version '$VERSION'." >&2; exit 1; }
           test "$(find package -mindepth 1 -printf '%y %P\n')" = "f $PACKAGE.$VERSION.nupkg"
-          sha256sum "package/$PACKAGE.$VERSION.nupkg"
+          test "$(wc -l < checksums/package.sha256)" -eq 1
+          (cd package && sha256sum -c --strict --quiet ../checksums/package.sha256)
+          gh attestation verify "package/$PACKAGE.$VERSION.nupkg" --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/publish-prerelease.yml" \
+            --signer-digest "$GITHUB_SHA" --source-ref "$GITHUB_REF" --source-digest "$GITHUB_SHA" \
+            --deny-self-hosted-runners > /dev/null
       - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           dotnet-version: '8.0.x'

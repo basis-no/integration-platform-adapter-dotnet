@@ -22,6 +22,25 @@ NuGet.org keeps every version it accepts. Deleting a version only unlists it,
 and an unlisted version still restores by its exact version, so every run of
 either lane is permanent.
 
+## One-time settings
+
+The push jobs check the environment settings below before they log in, and
+refuse to publish when an environment is missing or less protected.
+
+- **Environment `release`:** required reviewers, at least two people;
+  "Prevent self-review" on; administrators cannot bypass the protection;
+  deployment restricted to selected tags, with a rule for `v*.*.*` and no branch
+  rule.
+- **Environment `prerelease`:** required reviewers; "Prevent self-review" on;
+  administrators cannot bypass the protection. Any branch may deploy, since a
+  pre-release is run from the branch under test.
+- **Tag ruleset:** creating, updating and deleting `v*` tags is restricted to
+  the release managers.
+- **NuGet.org Trusted Publishing:** one policy per workflow file and
+  environment, as in step 1 below.
+- **`NUGET_USER`:** the NuGet.org profile name the login uses, as an
+  environment or repository secret. It is not a credential.
+
 ## Pre-release for acceptance
 
 1. One time, the package owner adds a Trusted Publishing policy on NuGet.org
@@ -40,10 +59,12 @@ either lane is permanent.
    ```
 
    The branch must contain the workflow. Its `build` job runs the test suite
-   against Postgres with the schema in `tests/fixtures/postgres/` and packs the commit as,
-   for example, `0.4.0-preview.20261017.3`. A reviewer of environment
+   against Postgres with the schema in `tests/fixtures/postgres/` and packs the
+   commit as, for example, `0.4.0-preview.20261017.3`; `attest` records the
+   package's SHA-256 and build provenance. A reviewer of environment
    `prerelease` other than the person who started the run then approves the
-   `push` job, which pushes exactly that package. The run summary shows the
+   `push` job, which verifies the package against the recorded checksum and
+   provenance and pushes exactly that package. The run summary shows the
    version and source commit. It creates no Git tag and no GitHub release.
 4. Pin that exact version in the validation integration, for example in
    `Directory.Packages.props`. NuGet.org validates and indexes a new version
