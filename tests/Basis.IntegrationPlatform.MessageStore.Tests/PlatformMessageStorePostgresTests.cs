@@ -908,6 +908,39 @@ public sealed class PlatformMessageStorePostgresTests
         Assert.IsTrue(skipped.Skipped);
         Assert.AreEqual(0, logs.Errors.Count);
         Assert.AreEqual(0, logs.Warnings.Count);
+
+        // A handler that repeats the key in the replay: which item the earlier
+        // attempt sent is unknown, so each repeat keeps the warning.
+        for (var call = 0; call < 2; call++)
+        {
+            Assert.IsTrue((await replaySteps.ExecuteAsync(replay, "deliver", "https://target.example/orders", "target",
+                _ => Task.CompletedTask, CancellationToken.None)).Skipped);
+        }
+
+        Assert.AreEqual(0, logs.Errors.Count);
+        Assert.AreEqual(2, logs.Warnings.Count);
+    }
+
+    [TestMethod]
+    public async Task RepeatedKeyWithoutAHandlerInvocationKeepsTheWarning()
+    {
+        var connectionString = RequireConnectionString();
+        var options = CreateOptions(connectionString);
+        await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+        var observations = new PlatformStepObservationCollector();
+        var logs = new LogRecorder();
+        var steps = new PlatformStepExecutor(dataSource, observations, logs.For<PlatformStepExecutor>());
+        var message = CreateMessage($"dotnet-test-{Guid.NewGuid():N}", options);
+
+        // Called outside the consumer, so no handler invocation is known.
+        await steps.ExecuteAsync(message, "deliver", "https://target.example/orders", "target",
+            _ => Task.CompletedTask, CancellationToken.None);
+        var repeated = await steps.ExecuteAsync(message, "deliver", "https://target.example/orders", "target",
+            _ => Task.CompletedTask, CancellationToken.None);
+
+        Assert.IsTrue(repeated.Skipped);
+        Assert.AreEqual(0, logs.Errors.Count);
+        Assert.AreEqual(1, logs.Warnings.Count);
     }
 
     [TestMethod]

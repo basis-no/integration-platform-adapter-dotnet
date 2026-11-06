@@ -178,17 +178,26 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
         string idempotencyKey,
         CancellationToken cancellationToken)
     {
-        if (observations.CompletedInCurrentInvocation(message.MessageId, idempotencyKey))
+        switch (observations.ReuseInCurrentInvocation(message.MessageId, idempotencyKey))
         {
-            // The same invocation used this key before, so this call's item is
-            // never sent although the message completes: lost data, so ERROR.
-            // A skip of a key an earlier attempt delivered cannot tell which
-            // item that attempt sent, and is not logged here.
-            logger.LogError(
-                "Step {StepId} already ran in this handler invocation and is skipped messageId={MessageId}; this call is not sent. "
-                + "The step key is <message-id>:<step-id>; a handler that sends several items through one step needs a distinct step id per item.",
-                stepId,
-                message.MessageId);
+            case StepKeyReuse.AfterDeliveryInThisInvocation:
+                // This invocation delivered the key, so this call's item is
+                // never sent although the message completes: lost data.
+                logger.LogError(
+                    "Step {StepId} already ran in this handler invocation and is skipped messageId={MessageId}; this call is not sent. "
+                    + "The step key is <message-id>:<step-id>; a handler that sends several items through one step needs a distinct step id per item.",
+                    stepId,
+                    message.MessageId);
+                break;
+            case StepKeyReuse.Repeated:
+                // An earlier attempt delivered the key; which item it sent is
+                // unknown, so the reuse stays a warning.
+                logger.LogWarning(
+                    "Step {StepId} already ran in this handler invocation and is skipped messageId={MessageId}. "
+                    + "The step key is <message-id>:<step-id>; a handler that sends several items through one step needs a distinct step id per item.",
+                    stepId,
+                    message.MessageId);
+                break;
         }
 
         string? journaledBy;
