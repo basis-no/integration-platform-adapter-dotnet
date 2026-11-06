@@ -1345,6 +1345,74 @@ public sealed class PlatformMessageStorePostgresTests
     }
 
     [TestMethod]
+    public async Task StepContextSuppliesReceiverKeyBeforeCallAcrossRedeliveryReplayAndRedo()
+    {
+        var options = CreateOptions(RequireConnectionString());
+        await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+        var (_, executor, _, _) = CreateStore(dataSource, options);
+        IPlatformStepExecutor steps = executor;
+        var message = CreateMessage($"dotnet-test-{Guid.NewGuid():N}", options);
+        using var receiver = new IdempotentReceiver();
+        using var client = new HttpClient(receiver);
+        using var cancellation = new CancellationTokenSource();
+        var expectedKey = $"{message.MessageId}:deliver";
+        async Task Send(PlatformStepExecutionContext context, CancellationToken ct)
+        {
+            Assert.AreEqual("deliver", context.StepId);
+            Assert.AreEqual(expectedKey, context.IdempotencyKey);
+            Assert.AreEqual(cancellation.Token, ct);
+            using var request = new HttpRequestMessage(HttpMethod.Post, "https://target.example/orders");
+            request.Headers.Add("Idempotency-Key", context.IdempotencyKey);
+            using var response = await client.SendAsync(request, ct);
+            response.EnsureSuccessStatusCode();
+        }
+
+        // The receiver applied the first call, then the attempt failed.
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => steps.ExecuteWithContextAsync(
+            message, "deliver", "https://target.example/orders", "target", async (context, ct) =>
+            {
+                await Send(context, ct);
+                throw new InvalidOperationException("synthetic failure after receiver applied call");
+            }, cancellation.Token));
+        CollectionAssert.AreEqual(new[] { expectedKey }, receiver.Keys);
+        var delivered = await steps.ExecuteWithContextAsync(message, "deliver", "https://target.example/orders", "target", Send, cancellation.Token);
+        var replay = message with { Headers = new Dictionary<string, string> { ["x-bip-attempt"] = "2", ["x-bip-replay"] = "true" } };
+        var skipped = await steps.ExecuteWithContextAsync(replay, "deliver", "https://target.example/orders", "target", Send, cancellation.Token);
+        var redo = replay with { Headers = new Dictionary<string, string> { ["x-bip-attempt"] = "2", ["x-bip-replay"] = "true", ["x-bip-redo-steps"] = "[\"deliver\"]" } };
+        var redone = await steps.ExecuteWithContextAsync(redo, "deliver", "https://target.example/orders", "target", Send, cancellation.Token);
+        Assert.IsTrue(skipped.Skipped);
+        Assert.IsFalse(redone.Skipped);
+        Assert.AreEqual(expectedKey, delivered.IdempotencyKey);
+        Assert.AreEqual(expectedKey, skipped.IdempotencyKey);
+        Assert.AreEqual(expectedKey, redone.IdempotencyKey);
+        CollectionAssert.AreEqual(new[] { expectedKey, expectedKey, expectedKey }, receiver.Keys);
+        Assert.AreEqual(1, receiver.Applied.Count, "A receiver can deduplicate retries and explicit redo with the stable key.");
+        await using var connection = await dataSource.OpenConnectionAsync();
+        await using var read = new NpgsqlCommand(
+            "select idempotency_key, step_id, status from bip_step_outcome where message_id = @id", connection);
+        read.Parameters.AddWithValue("id", message.MessageId);
+        await using var reader = await read.ExecuteReaderAsync();
+        Assert.IsTrue(await reader.ReadAsync());
+        Assert.AreEqual(receiver.Keys[0], reader.GetString(0));
+        Assert.AreEqual("deliver", reader.GetString(1));
+        Assert.AreEqual("DELIVERED", reader.GetString(2));
+        Assert.IsFalse(await reader.ReadAsync());
+    }
+
+    private sealed class IdempotentReceiver : HttpMessageHandler
+    {
+        public List<string> Keys { get; } = [];
+        public HashSet<string> Applied { get; } = new(StringComparer.Ordinal);
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            var key = request.Headers.GetValues("Idempotency-Key").Single();
+            Keys.Add(key);
+            Applied.Add(key);
+            return Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.OK));
+        }
+    }
+
+    [TestMethod]
     public async Task StepTimeoutIsRecordedAsAFailedStep()
     {
         var connectionString = RequireConnectionString();

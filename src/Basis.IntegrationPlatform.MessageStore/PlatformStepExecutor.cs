@@ -15,7 +15,32 @@ public interface IPlatformStepExecutor
         string? targetRef,
         Func<CancellationToken, Task> operation,
         CancellationToken cancellationToken);
+
+    /// <summary>
+    /// As <c>ExecuteAsync</c>, but the operation receives the step's stable
+    /// idempotency key before the external call. A separate name, not an
+    /// overload, so no call that compiled against <c>ExecuteAsync</c> becomes
+    /// ambiguous.
+    /// </summary>
+    Task<PlatformStepExecutionResult> ExecuteWithContextAsync(
+        PlatformMessage message,
+        string stepId,
+        string endpointUri,
+        string? targetRef,
+        Func<PlatformStepExecutionContext, CancellationToken, Task> operation,
+        CancellationToken cancellationToken)
+    {
+        // Keep implementations of the original interface source and binary
+        // compatible. Their original overload still owns execution semantics.
+        ArgumentNullException.ThrowIfNull(message);
+        ArgumentException.ThrowIfNullOrWhiteSpace(stepId);
+        ArgumentNullException.ThrowIfNull(operation);
+        var context = new PlatformStepExecutionContext(PlatformStepExecutor.IdempotencyKey(message.MessageId, stepId), stepId);
+        return ExecuteAsync(message, stepId, endpointUri, targetRef, ct => operation(context, ct), cancellationToken);
+    }
 }
+
+public sealed record PlatformStepExecutionContext(string IdempotencyKey, string StepId);
 
 public sealed record PlatformStepExecutionResult(
     string IdempotencyKey,
@@ -106,6 +131,18 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
         Func<CancellationToken, Task> operation,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(operation);
+        return await ExecuteWithContextAsync(message, stepId, endpointUri, targetRef, (_, ct) => operation(ct), cancellationToken);
+    }
+
+    public async Task<PlatformStepExecutionResult> ExecuteWithContextAsync(
+        PlatformMessage message,
+        string stepId,
+        string endpointUri,
+        string? targetRef,
+        Func<PlatformStepExecutionContext, CancellationToken, Task> operation,
+        CancellationToken cancellationToken)
+    {
         ArgumentNullException.ThrowIfNull(message);
         ArgumentException.ThrowIfNullOrWhiteSpace(stepId);
         ArgumentException.ThrowIfNullOrWhiteSpace(endpointUri);
@@ -124,7 +161,7 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
 
         try
         {
-            await operation(cancellationToken);
+            await operation(new PlatformStepExecutionContext(idempotencyKey, stepId), cancellationToken);
             await RecordAsync(message.MessageId, idempotencyKey, stepId, Delivered, recordedUri, targetRef, null, cancellationToken);
             Observe(message.MessageId, stepId, Delivered, idempotencyKey, recordedUri, targetRef, null);
             return new PlatformStepExecutionResult(idempotencyKey, stepId, Delivered, false);

@@ -99,4 +99,60 @@ public sealed class PlatformStepExecutorTests
 
         Assert.AreEqual("xxxxxx", PlatformStepExecutor.MaskEndpointUri(pathological));
     }
+
+    [TestMethod]
+    public async Task ContextApiWorksWithAnExistingInterfaceImplementation()
+    {
+        IPlatformStepExecutor steps = new LegacyExecutor();
+        var message = new PlatformMessage("message-1", "correlation-1", "app", "test", "demo", "source", "target",
+            "application/json", [], new Dictionary<string, string>());
+        var calls = 0;
+        var result = await steps.ExecuteWithContextAsync(message, "deliver", "https://target.example/orders", null,
+            (context, ct) =>
+            {
+                Assert.AreEqual("message-1:deliver", context.IdempotencyKey);
+                Assert.AreEqual("deliver", context.StepId);
+                Assert.AreEqual(CancellationToken.None, ct);
+                calls++;
+                return Task.CompletedTask;
+            }, CancellationToken.None);
+        Assert.AreEqual(1, calls);
+        Assert.AreEqual("message-1:deliver", result.IdempotencyKey);
+    }
+
+    // Compile-time check: every call shape that compiled against ExecuteAsync
+    // still binds to it. The calls are never run.
+    [TestMethod]
+    public void ExistingExecuteAsyncCallShapesStillCompile()
+    {
+        IPlatformStepExecutor steps = new LegacyExecutor();
+        var message = new PlatformMessage("message-1", "correlation-1", "app", "test", "demo", "source", "target",
+            "application/json", [], new Dictionary<string, string>());
+        Func<CancellationToken, Task> typed = _ => Task.CompletedTask;
+        Func<Task>[] calls =
+        [
+            () => steps.ExecuteAsync(message, "s", "https://target.example/a", null, ct => Task.CompletedTask, CancellationToken.None),
+            () => steps.ExecuteAsync(message, "s", "https://target.example/a", null, async ct => await Task.Delay(0, ct), CancellationToken.None),
+            () => steps.ExecuteAsync(message, "s", "https://target.example/a", null, delegate { return Task.CompletedTask; }, CancellationToken.None),
+            () => steps.ExecuteAsync(message, "s", "https://target.example/a", null, SendAsync, CancellationToken.None),
+            () => steps.ExecuteAsync(message, "s", "https://target.example/a", null, typed, CancellationToken.None),
+            () => steps.ExecuteAsync(message, "s", "https://target.example/a", targetRef: null, operation: _ => Task.CompletedTask, cancellationToken: CancellationToken.None),
+            () => steps.ExecuteAsync(message, "s", "https://target.example/a", null, null!, CancellationToken.None),
+        ];
+
+        Assert.AreEqual(7, calls.Length);
+
+        static Task SendAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+    }
+
+    private sealed class LegacyExecutor : IPlatformStepExecutor
+    {
+        public async Task<PlatformStepExecutionResult> ExecuteAsync(PlatformMessage message, string stepId,
+            string endpointUri, string? targetRef, Func<CancellationToken, Task> operation, CancellationToken cancellationToken)
+        {
+            await operation(cancellationToken);
+            return new PlatformStepExecutionResult($"{message.MessageId}:{stepId}", stepId, "DELIVERED", false);
+        }
+    }
+
 }
