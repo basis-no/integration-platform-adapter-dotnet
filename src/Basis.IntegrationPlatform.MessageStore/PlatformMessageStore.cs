@@ -196,6 +196,21 @@ public sealed class PlatformMessageStore
                 ErrorCode: MessageReplayErrorCodes.NotReplayable);
         }
 
+        if (!options.UsesStepLedger && request.RedoSteps?.Any(step => !string.IsNullOrWhiteSpace(step)) == true)
+        {
+            // With the noop step store every step runs on every replay, so a
+            // redo request would promise a protection that does not exist.
+            // Refused before any audit row or produce, as the Camel adapter does.
+            return new MessageReplayResult(
+                "FAILED",
+                messageId,
+                stored.Integration,
+                targetTopic,
+                nextAttempt,
+                Error: "redoSteps needs the postgres step outcome store; with BASIS_MESSAGE_STORE_STEP_OUTCOME_STORE=noop every step runs on every replay. Resend without redoSteps.",
+                ErrorCode: MessageReplayErrorCodes.NotReplayable);
+        }
+
         // Audit ordering: commit the REQUESTED audit row on its own
         // connection/transaction BEFORE the Kafka produce. No database lock or
         // open transaction spans the produce call.
