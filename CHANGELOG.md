@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Startup refuses a Message Store that lacks a table or column the adapter
+  writes or reads, naming each one. The contract major check alone let such a
+  store through: every message then failed to record and was consumed again
+  without end, or, with a column missing from `bip_step_outcome`, its step ran
+  once per handler attempt before the message was parked.
+
 - A late, older attempt no longer overwrites the message summary. When attempt
   1 was consumed again after its replay, attempt 2, had been recorded,
   `bip_message_log` took attempt 1's status, error, payload and expiry while

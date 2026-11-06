@@ -48,9 +48,12 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         options.Validate();
-        // Startup gate: verify the store schema major in bip_contract before
-        // consuming anything. Wrong major fails fast; missing table warns.
+        // Startup gate: verify the store schema major in bip_contract, then
+        // that the store has every table and column the adapter writes, before
+        // consuming anything. Wrong major or a missing column fails fast; a
+        // missing bip_contract table warns.
         await store.VerifyContractAsync(stoppingToken);
+        await store.VerifyStoreColumnsAsync(stoppingToken);
         var config = new ConsumerConfig(options.CreateKafkaClientConfig())
         {
             GroupId = options.ConsumerGroupId,

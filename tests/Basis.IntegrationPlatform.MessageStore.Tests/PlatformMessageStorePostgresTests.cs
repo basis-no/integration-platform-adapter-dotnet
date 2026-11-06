@@ -855,6 +855,68 @@ public sealed class PlatformMessageStorePostgresTests
     }
 
     [TestMethod]
+    public async Task StoreColumnCheckAcceptsTheFixtureSchema()
+    {
+        var options = CreateOptions(RequireConnectionString());
+        await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+        var (store, _, _, _) = CreateStore(dataSource, options);
+
+        await store.VerifyStoreColumnsAsync(CancellationToken.None);
+    }
+
+    [TestMethod]
+    public async Task StartupRefusesAStoreThatLacksATableOrColumnTheAdapterWrites()
+    {
+        var connectionString = RequireConnectionString();
+        var schemaName = $"bip_shape_{Guid.NewGuid():N}";
+        await using var admin = NpgsqlDataSource.Create(connectionString);
+        await using (var connection = await admin.OpenConnectionAsync())
+        {
+            // A store that declares major 1 but lacks a column in two tables
+            // and the whole replay audit table.
+            await using var create = new NpgsqlCommand(
+                $"""
+                create schema "{schemaName}";
+                create table "{schemaName}".bip_contract (like public.bip_contract including all);
+                insert into "{schemaName}".bip_contract select * from public.bip_contract;
+                create table "{schemaName}".bip_message_log (like public.bip_message_log including all);
+                create table "{schemaName}".bip_message_attempt (like public.bip_message_attempt including all);
+                create table "{schemaName}".bip_step_outcome (like public.bip_step_outcome including all);
+                alter table "{schemaName}".bip_message_log drop column payload_deleted_at;
+                alter table "{schemaName}".bip_step_outcome drop column target_ref;
+                """,
+                connection);
+            await create.ExecuteNonQueryAsync();
+        }
+
+        try
+        {
+            var options = CreateOptions(new NpgsqlConnectionStringBuilder(connectionString) { SearchPath = schemaName }.ConnectionString);
+            options.ContractGateMaxAttempts = 1;
+            await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+            var (store, _, observations, _) = CreateStore(dataSource, options);
+            var handler = new DelegateHandler((_, _) => Task.FromResult(PlatformMessageResult.Completed()));
+            using var service = CreateConsumerService(handler, store, observations, new FakeProducer(), options);
+
+            await service.StartAsync(CancellationToken.None);
+            var error = await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => service.ExecuteTask!);
+
+            StringAssert.Contains(error.Message, "bip_message_log.payload_deleted_at");
+            StringAssert.Contains(error.Message, "bip_step_outcome.target_ref");
+            StringAssert.Contains(error.Message, "bip_message_replay_audit (table)");
+            StringAssert.Contains(error.Message, "Refusing to start");
+            Assert.IsFalse(error.Message.Contains("bip_message_attempt", StringComparison.Ordinal), error.Message);
+            Assert.AreEqual(0, handler.Calls.Count, "Nothing is consumed.");
+        }
+        finally
+        {
+            await using var connection = await admin.OpenConnectionAsync();
+            await using var drop = new NpgsqlCommand($"drop schema \"{schemaName}\" cascade", connection);
+            await drop.ExecuteNonQueryAsync();
+        }
+    }
+
+    [TestMethod]
     public async Task VerifyContractWarnsAndContinuesWhenTableMissing()
     {
         var connectionString = RequireConnectionString();
