@@ -16,6 +16,35 @@ public sealed class PlatformMessageStore
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
+    // Every column that consuming a message writes or reads, per table, in
+    // this file and in PlatformStepExecutor.cs; keep them in step. A store
+    // that declares the right major but lacks one of them would fail each
+    // message at that write instead of refusing to start. What only a resend
+    // uses (bip_message_replay_audit, bip_message_log.payload_deleted_at) is
+    // not required to consume and is left to the resend itself.
+    internal static readonly IReadOnlyDictionary<string, string[]> StoreColumns = new Dictionary<string, string[]>(StringComparer.Ordinal)
+    {
+        ["bip_message_log"] =
+        [
+            "message_id", "correlation_id", "integration", "schema_version", "status", "last_attempt", "occurred_at",
+            "updated_at", "source_system", "target_system", "content_type", "payload_storage", "payload_size_bytes",
+            "payload_bytes", "payload_expires_at", "replayable", "replay_disabled_reason",
+            "auto_redelivered", "auto_redelivery_count", "auto_redelivery_max", "error",
+        ],
+        ["bip_message_attempt"] =
+        [
+            "message_id", "attempt", "schema_version", "correlation_id", "integration", "route_id", "status",
+            "occurred_at", "source_system", "target_system", "content_type", "payload_size_bytes", "payload_storage",
+            "payload_bytes", "payload_expires_at", "replayable", "replay_disabled_reason", "auto_redelivered",
+            "auto_redelivery_count", "auto_redelivery_max", "steps_json", "error",
+        ],
+        ["bip_step_outcome"] =
+        [
+            "idempotency_key", "message_id", "step_id", "status", "endpoint_uri", "target_ref", "error", "occurred_at",
+            "updated_at",
+        ],
+    };
+
     private readonly NpgsqlDataSource dataSource;
     private readonly PlatformStepObservationCollector stepObservations;
     private readonly PlatformMessageStoreOptions options;
@@ -110,6 +139,80 @@ public sealed class PlatformMessageStore
         }
 
         logger.LogInformation("Message-store contract major {ContractMajor} verified against bip_contract.", contractMajor);
+    }
+
+    /// <summary>
+    /// Startup check after the contract major: every table and column that
+    /// consuming a message writes or reads resolves through the connection's
+    /// search_path, as the adapter's statements resolve them. Anything that
+    /// does not fails startup, naming it; a failure to read gets the gate's
+    /// bounded retries.
+    /// </summary>
+    internal async Task VerifyStoreColumnsAsync(CancellationToken cancellationToken)
+    {
+        var present = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                present.Clear();
+                await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
+                await using var command = new NpgsqlCommand(
+                    """
+                    select t.name, a.attname
+                    from unnest(@tables) as t(name)
+                    join pg_attribute a on a.attrelid = to_regclass(t.name) and a.attnum > 0 and not a.attisdropped
+                    """,
+                    connection);
+                command.Parameters.Add("tables", NpgsqlDbType.Array | NpgsqlDbType.Text).Value = StoreColumns.Keys.ToArray();
+                await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+                while (await reader.ReadAsync(cancellationToken))
+                {
+                    var table = reader.GetString(0);
+                    if (!present.TryGetValue(table, out var columns))
+                    {
+                        present[table] = columns = new HashSet<string>(StringComparer.Ordinal);
+                    }
+
+                    columns.Add(reader.GetString(1));
+                }
+
+                break;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                if (attempt >= options.ContractGateMaxAttempts)
+                {
+                    throw new InvalidOperationException(
+                        $"Message Store column check could not read the store's tables after {attempt} attempts ({ex.Message}). " +
+                        "Refusing to start: fix grants/connectivity.",
+                        ex);
+                }
+
+                logger.LogInformation(
+                    "Message Store column check attempt {Attempt}/{MaxAttempts} failed ({Message}); retrying in {DelayMs} ms.",
+                    attempt,
+                    options.ContractGateMaxAttempts,
+                    ex.Message,
+                    options.ContractGateRetryDelayMs);
+                await Task.Delay(TimeSpan.FromMilliseconds(options.ContractGateRetryDelayMs), cancellationToken);
+            }
+        }
+
+        var missing = StoreColumns
+            .SelectMany(table => present.TryGetValue(table.Key, out var columns)
+                ? table.Value.Where(column => !columns.Contains(column)).Select(column => $"{table.Key}.{column}")
+                : [$"{table.Key} (table)"])
+            .ToList();
+        if (missing.Count > 0)
+        {
+            throw new InvalidOperationException(
+                $"Message Store tables or columns that consuming writes or reads could not be resolved: {string.Join(", ", missing)}. " +
+                "Refusing to start: each message would fail to record. Check that the store schema for contract major " +
+                $"{SupportedContractMajor} is provisioned completely, and the connection's search_path and its schema USAGE grant.");
+        }
+
+        logger.LogInformation("Message Store tables and columns verified.");
     }
 
     public Task RecordAttemptAsync(PlatformMessage message, string routeId, string status, string? error, CancellationToken cancellationToken)
