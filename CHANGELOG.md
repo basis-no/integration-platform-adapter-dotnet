@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- A late, older attempt no longer overwrites the message summary. When attempt
+  1 was consumed again after its replay, attempt 2, had been recorded,
+  `bip_message_log` took attempt 1's status, error, payload and expiry while
+  `last_attempt` still said 2, and a resend read the older payload. The attempt
+  row is now written first and the summary only when the attempt is at least as
+  new as the recorded one, as the Camel adapter does; the older attempt still
+  updates its own `bip_message_attempt` row, and a redelivery of the latest
+  attempt still updates the summary. All 0.3.x releases are affected.
+
 - The DLQ record no longer repeats credentials from the consumed message in
   clear text. It carries every consumed header, so an `Authorization`, cookie,
   client secret or API/subscription key a producer put on the input topic

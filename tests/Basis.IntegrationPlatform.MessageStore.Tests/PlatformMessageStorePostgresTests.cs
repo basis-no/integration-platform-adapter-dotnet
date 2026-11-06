@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.Json;
 using Confluent.Kafka;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -329,6 +330,92 @@ public sealed class PlatformMessageStorePostgresTests
         Assert.AreEqual("COMPLETED", reader.GetString(3));
         Assert.AreEqual(3, reader.GetInt32(4));
         Assert.AreEqual("COMPLETED", reader.GetString(5));
+    }
+
+    [TestMethod]
+    public async Task OlderAttemptCannotOverwriteAnySummaryColumnButLatestRedeliveryCan()
+    {
+        var options = CreateOptions(RequireConnectionString());
+        await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+        var (store, _, _, _) = CreateStore(dataSource, options);
+        var first = CreateMessage($"dotnet-test-{Guid.NewGuid():N}", options, payload: "first"u8.ToArray());
+        await store.RecordAttemptAsync(first, "first-route", "FAILED", "first error", CancellationToken.None);
+        var latest = first with
+        {
+            Headers = new Dictionary<string, string> { ["x-bip-attempt"] = "2" },
+            Payload = "latest payload"u8.ToArray(),
+            SchemaVersion = 2,
+        };
+        var latestMetadata = new PlatformMessageAttemptMetadata("latest-route", true, 2, 3);
+        await store.RecordAttemptAsync(latest, latestMetadata, "DLQ", "latest error", CancellationToken.None);
+
+        await using var connection = await dataSource.OpenConnectionAsync();
+        await using var summary = new NpgsqlCommand(
+            "select to_jsonb(l)::text from bip_message_log l where message_id = @id", connection);
+        summary.Parameters.AddWithValue("id", first.MessageId);
+        var before = (string)(await summary.ExecuteScalarAsync())!;
+        using var snapshot = JsonDocument.Parse(before);
+        Assert.AreEqual(2, snapshot.RootElement.GetProperty("last_attempt").GetInt32());
+        Assert.AreEqual("DLQ", snapshot.RootElement.GetProperty("status").GetString());
+        Assert.AreEqual("latest error", snapshot.RootElement.GetProperty("error").GetString());
+        Assert.AreEqual("\\x" + Convert.ToHexString(latest.Payload).ToLowerInvariant(),
+            snapshot.RootElement.GetProperty("payload_bytes").GetString());
+        Assert.AreEqual(JsonValueKind.String, snapshot.RootElement.GetProperty("payload_expires_at").ValueKind);
+
+        // Even a delivery with a different capture policy must leave EVERY
+        // summary column, including updated_at and replay state, untouched.
+        options.PayloadMode = PlatformMessageStoreOptions.PayloadModeMetadataOnly;
+        await store.RecordAttemptAsync(first with { SchemaVersion = 3 }, "late-route", "COMPLETED", null, CancellationToken.None);
+        Assert.AreEqual(before, await summary.ExecuteScalarAsync());
+        await using (var attempts = new NpgsqlCommand(
+            """
+            select attempt, status, route_id, schema_version, payload_storage, error
+            from bip_message_attempt where message_id = @id order by attempt
+            """, connection))
+        {
+            attempts.Parameters.AddWithValue("id", first.MessageId);
+            await using var reader = await attempts.ExecuteReaderAsync();
+            Assert.IsTrue(await reader.ReadAsync());
+            Assert.AreEqual(1, reader.GetInt32(0));
+            Assert.AreEqual("COMPLETED", reader.GetString(1));
+            Assert.AreEqual("late-route", reader.GetString(2));
+            Assert.AreEqual(3, reader.GetInt32(3));
+            Assert.AreEqual("metadata_only", reader.GetString(4));
+            Assert.IsTrue(reader.IsDBNull(5));
+            Assert.IsTrue(await reader.ReadAsync());
+            Assert.AreEqual(2, reader.GetInt32(0));
+            Assert.AreEqual("DLQ", reader.GetString(1));
+            Assert.AreEqual("latest-route", reader.GetString(2));
+            Assert.IsFalse(await reader.ReadAsync());
+        }
+
+        options.PayloadMode = PlatformMessageStoreOptions.PayloadModePostgresInline;
+        await store.RecordAttemptAsync(latest with { Payload = "redelivered"u8.ToArray(), SchemaVersion = 4 },
+            "latest-route", "COMPLETED", null, CancellationToken.None);
+        await using var updated = new NpgsqlCommand(
+            """
+            select last_attempt, l.status, l.error, l.schema_version, l.payload_bytes,
+                   l.payload_size_bytes, l.replayable, l.replay_disabled_reason,
+                   l.auto_redelivered, l.auto_redelivery_count, l.auto_redelivery_max,
+                   l.payload_expires_at = a.payload_expires_at
+            from bip_message_log l join bip_message_attempt a using (message_id)
+            where message_id = @id and a.attempt = 2
+            """, connection);
+        updated.Parameters.AddWithValue("id", first.MessageId);
+        await using var updatedReader = await updated.ExecuteReaderAsync();
+        Assert.IsTrue(await updatedReader.ReadAsync());
+        Assert.AreEqual(2, updatedReader.GetInt32(0));
+        Assert.AreEqual("COMPLETED", updatedReader.GetString(1));
+        Assert.IsTrue(updatedReader.IsDBNull(2));
+        Assert.AreEqual(4, updatedReader.GetInt32(3));
+        CollectionAssert.AreEqual("redelivered"u8.ToArray(), (byte[])updatedReader[4]);
+        Assert.AreEqual(11L, updatedReader.GetInt64(5));
+        Assert.IsTrue(updatedReader.GetBoolean(6));
+        Assert.IsTrue(updatedReader.IsDBNull(7));
+        Assert.IsFalse(updatedReader.GetBoolean(8));
+        Assert.IsTrue(updatedReader.IsDBNull(9));
+        Assert.IsTrue(updatedReader.IsDBNull(10));
+        Assert.IsTrue(updatedReader.GetBoolean(11));
     }
 
     [TestMethod]

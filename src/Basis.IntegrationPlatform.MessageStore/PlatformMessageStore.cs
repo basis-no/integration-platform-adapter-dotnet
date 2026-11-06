@@ -137,8 +137,8 @@ public sealed class PlatformMessageStore
 
         await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
         await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
-        await UpsertLogAsync(connection, transaction, message, status, attempt, payload, error, metadata, cancellationToken);
         await UpsertAttemptAsync(connection, transaction, message, metadata, status, attempt, payload, error, stepsJson, cancellationToken);
+        await UpsertLogAsync(connection, transaction, message, status, attempt, payload, error, metadata, cancellationToken);
         await transaction.CommitAsync(cancellationToken);
         stepObservations.Clear(message.MessageId);
     }
@@ -392,7 +392,7 @@ public sealed class PlatformMessageStore
             on conflict (message_id) do update set
               schema_version = excluded.schema_version,
               status = excluded.status,
-              last_attempt = greatest(bip_message_log.last_attempt, excluded.last_attempt),
+              last_attempt = excluded.last_attempt,
               updated_at = now(),
               payload_storage = excluded.payload_storage,
               payload_size_bytes = excluded.payload_size_bytes,
@@ -404,6 +404,7 @@ public sealed class PlatformMessageStore
               auto_redelivery_count = excluded.auto_redelivery_count,
               auto_redelivery_max = excluded.auto_redelivery_max,
               error = excluded.error
+            where excluded.last_attempt >= bip_message_log.last_attempt
             """,
             connection,
             transaction);
