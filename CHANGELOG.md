@@ -30,11 +30,13 @@
   releases are affected.
 
 - Step endpoint URIs are recorded without credentials. `bip_step_outcome` and
-  `steps_json` kept the URI given to the step executor as is. Its user info
-  and the values of credential-like query parameters, such as `code`, `sig`,
-  `api_key` or `access_token`, are now masked as `xxxxxx`; only the recorded
-  copy is masked. Rows written earlier are unchanged. The Camel adapter masks
-  step endpoint URIs too. All 0.3.x releases are affected.
+  `steps_json` kept the URI given to the step executor as is. They are now
+  masked first by the Camel adapter's rule, so both adapters record the same
+  value for every credential that adapter masks, including the user name,
+  login and client id parameters it treats as sensitive. This adapter also
+  masks the whole user info and the values of further credential-like query
+  parameters, such as `code` and `sig`, as `xxxxxx`; only the recorded copy is
+  masked. Rows written earlier are unchanged. All 0.3.x releases are affected.
 
 - Resend refuses a message journaled by another integration. On a shared
   Message Store, `POST /admin/messages/{messageId}/resend` replayed any stored

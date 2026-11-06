@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
 using Npgsql;
 
@@ -38,6 +39,43 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
     [
         "passphrase", "passcode", "privatekey", "accesskey", "accountkey", "connectionstring",
     ];
+
+    // The option names Camel 4.18 treats as sensitive (SensitiveUtils). The
+    // Camel adapter records a step's endpoint as URISupport.sanitizeUri masks
+    // it, which masks a query parameter whose name contains any of them.
+    private static readonly string[] CamelSensitiveKeys =
+    [
+        "accesskey", "accesstoken", "accesstokensecret", "accountkey", "accountsid", "acltoken", "api_key",
+        "api_secret", "apikey", "apipassword", "apiuser", "apiusername", "authenticationtoken", "authkey",
+        "authorizationtoken", "authtoken", "azureclientid", "azureclientsecret", "blobaccesskey",
+        "blobstoragesharedkeycredential", "certresourcepassword", "clientid", "clientsecret",
+        "clientsecretcredential", "connectionstring", "consumerkey", "consumersecret", "emailaddress",
+        "httpproxypassword", "kerberosauthticket", "keypassword", "keystorepassword", "login", "oauthclientid",
+        "oauthclientsecret", "oauthtoken", "oauthtokenurl", "p12filename", "passcode", "passphrase", "password",
+        "personalaccesstoken", "privatekey", "privatekeyfile", "privatekeyname", "privatekeypassword",
+        "proxyauthpassword", "proxyauthusername", "proxypassword", "proxyuser", "proxyusername", "publickeyid",
+        "publishkey", "queueownerawsaccountid", "realm", "refreshtoken", "sascredential", "sasljaasconfig",
+        "saslpassword", "sassignature", "secret", "secretkey", "securerandom", "serviceinstanceid",
+        "sessiontoken", "sharedaccesskey", "sourceblobaccesskey", "sslkeypassword", "sslkeystorepassword",
+        "sslpassword", "ssltruststorepassword", "subscribekey", "systemid", "token", "tokencredential",
+        "truststorepassword", "user", "userauthenticationcredentials", "username", "userpassword",
+        "verificationcode", "webhookverifytoken", "zookeeperpassword",
+    ];
+
+    // A bound on the two patterns below: a pathological URI must not stall the
+    // step. On timeout nothing of the URI is recorded.
+    private static readonly TimeSpan MaskTimeout = TimeSpan.FromSeconds(1);
+
+    // URISupport.sanitizeUri's two patterns, unchanged, so both adapters mask
+    // these values the same way: the value of such a parameter up to the next
+    // '&', or its whole RAW(...) or RAW{...} form, and the password in the
+    // user info, keeping the user name.
+    private static readonly Regex CamelSecretParameter = new(
+        "([?&][^=]*(?:" + string.Join('|', CamelSensitiveKeys) + ")[^=]*)=(RAW(([{][^}]*[}])|([(][^)]*[)]))|[^&]*)",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant,
+        MaskTimeout);
+
+    private static readonly Regex CamelUserInfoPassword = new("(.*://.*?:)(.*)(@)", RegexOptions.None, MaskTimeout);
 
     private readonly NpgsqlDataSource dataSource;
     private readonly PlatformStepObservationCollector observations;
@@ -98,11 +136,28 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
 
     /// <summary>
     /// Masks what bip_step_outcome and steps_json would otherwise keep in clear
-    /// text: the user info, and the values of query parameters whose names are
+    /// text. The Camel adapter's rule comes first, so every value it masks is
+    /// recorded the same way by both adapters. This adapter then also masks the
+    /// whole user info, and the values of query parameters whose names are
     /// credential-like by the DLQ header rule or one of the URI names above.
-    /// The Camel adapter masks step endpoint URIs too.
     /// </summary>
     internal static string MaskEndpointUri(string endpointUri)
+    {
+        string camelMasked;
+        try
+        {
+            camelMasked = CamelSecretParameter.Replace(endpointUri, "${1}=" + PlatformMessageConsumerService.MaskedHeaderValue);
+            camelMasked = CamelUserInfoPassword.Replace(camelMasked, "${1}" + PlatformMessageConsumerService.MaskedHeaderValue + "${3}", 1);
+        }
+        catch (RegexMatchTimeoutException)
+        {
+            return PlatformMessageConsumerService.MaskedHeaderValue;
+        }
+
+        return MaskUserInfoAndQuery(camelMasked);
+    }
+
+    private static string MaskUserInfoAndQuery(string endpointUri)
     {
         var queryOrFragment = endpointUri.IndexOfAny(['?', '#']);
         var hierarchy = queryOrFragment < 0 ? endpointUri : endpointUri[..queryOrFragment];
