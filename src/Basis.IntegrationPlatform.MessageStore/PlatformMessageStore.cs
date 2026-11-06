@@ -21,6 +21,8 @@ public sealed class PlatformMessageStore
     private readonly PlatformMessageStoreOptions options;
     private readonly ILogger<PlatformMessageStore> logger;
 
+    internal TimeProvider Clock { get; init; } = TimeProvider.System;
+
     public PlatformMessageStore(
         NpgsqlDataSource dataSource,
         PlatformStepObservationCollector stepObservations,
@@ -137,6 +139,7 @@ public sealed class PlatformMessageStore
 
         await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
         await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        payload = await CapPayloadExpiryAsync(connection, transaction, message.MessageId, payload, cancellationToken);
         await UpsertAttemptAsync(connection, transaction, message, metadata, status, attempt, payload, error, stepsJson, cancellationToken);
         await UpsertLogAsync(connection, transaction, message, status, attempt, payload, error, metadata, cancellationToken);
         await transaction.CommitAsync(cancellationToken);
@@ -273,7 +276,39 @@ public sealed class PlatformMessageStore
             return PayloadCapture.MetadataOnly(sizeBytes, "payload exceeds max inline size");
         }
 
-        return PayloadCapture.Inline(message.Payload, sizeBytes, DateTimeOffset.UtcNow.AddDays(options.PayloadRetentionDays));
+        return PayloadCapture.Inline(message.Payload, sizeBytes, Clock.GetUtcNow().AddDays(options.PayloadRetentionDays));
+    }
+
+    private async Task<PayloadCapture> CapPayloadExpiryAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        string messageId,
+        PayloadCapture payload,
+        CancellationToken cancellationToken)
+    {
+        if (payload.ExpiresAt is not { } requested)
+        {
+            return payload;
+        }
+
+        // Read before rewriting this attempt: the oldest recorded receipt for
+        // this integration bounds every replay at twice the retention window.
+        await using var command = new NpgsqlCommand(
+            """
+            select min(occurred_at) from bip_message_attempt
+            where message_id = @message_id and integration = @integration
+            """, connection, transaction);
+        command.Parameters.AddWithValue("message_id", messageId);
+        command.Parameters.AddWithValue("integration", options.ApplicationName);
+        await using var reader = await command.ExecuteReaderAsync(CommandBehavior.SingleRow, cancellationToken);
+        await reader.ReadAsync(cancellationToken);
+        var firstReceipt = requested.AddDays(-options.PayloadRetentionDays);
+        if (!reader.IsDBNull(0) && reader.GetFieldValue<DateTimeOffset>(0) < firstReceipt)
+        {
+            firstReceipt = reader.GetFieldValue<DateTimeOffset>(0);
+        }
+        var cap = firstReceipt.AddDays(2.0 * options.PayloadRetentionDays);
+        return payload with { ExpiresAt = requested < cap ? requested : cap };
     }
 
     internal static Headers CreateReplayHeaders(ReplayableStoredMessage message, MessageReplayRequest request, int nextAttempt)

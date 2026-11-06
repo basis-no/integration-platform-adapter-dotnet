@@ -1026,7 +1026,7 @@ public sealed class PlatformMessageStorePostgresTests
     }
 
     [TestMethod]
-    public async Task FanOutThroughOneStepIdSkipsLaterItemsAndWarns()
+    public async Task FanOutThroughOneStepIdSkipsLaterItemsAndLogsAnError()
     {
         var connectionString = RequireConnectionString();
         var options = CreateOptions(connectionString);
@@ -1047,7 +1047,14 @@ public sealed class PlatformMessageStorePostgresTests
         }
 
         CollectionAssert.AreEqual(new[] { "line-1" }, sent);
-        Assert.AreEqual(2, logs.Warnings.Count(w => w.Contains("distinct step id per item", StringComparison.Ordinal)));
+        Assert.AreEqual(2, logs.Errors.Count, "One ERROR per skipped call.");
+        Assert.IsTrue(logs.Errors.All(error => error.Contains("Step post-line already ran in this handler invocation", StringComparison.Ordinal)
+            && error.Contains($"messageId={message.MessageId}", StringComparison.Ordinal)
+            && error.Contains("distinct step id per item", StringComparison.Ordinal)));
+        Assert.AreEqual(0, logs.Warnings.Count);
+        CollectionAssert.AreEqual(
+            new[] { "DELIVERED", "SKIPPED", "SKIPPED" },
+            observations.Snapshot(message.MessageId).Select(observation => observation.Status).ToArray());
 
         // A step id per item delivers every item.
         sent.Clear();
@@ -1081,6 +1088,65 @@ public sealed class PlatformMessageStorePostgresTests
 
         Assert.IsTrue(retried.Skipped);
         Assert.AreEqual(0, logs.Warnings.Count);
+        Assert.AreEqual(0, logs.Errors.Count);
+    }
+
+    [TestMethod]
+    public async Task ReplaySkippingAStepAnEarlierAttemptDeliveredLogsNoError()
+    {
+        var connectionString = RequireConnectionString();
+        var options = CreateOptions(connectionString);
+        await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+        var (store, steps, _, _) = CreateStore(dataSource, options);
+        var message = CreateMessage($"dotnet-test-{Guid.NewGuid():N}", options);
+        await steps.ExecuteAsync(message, "deliver", "https://target.example/orders", "target",
+            _ => Task.CompletedTask, CancellationToken.None);
+        await store.RecordAttemptAsync(message, "dotnet-handler", "COMPLETED", null, CancellationToken.None);
+
+        var observations = new PlatformStepObservationCollector();
+        var logs = new LogRecorder();
+        var replaySteps = new PlatformStepExecutor(dataSource, observations, logs.For<PlatformStepExecutor>());
+        var replay = message with { Headers = new Dictionary<string, string> { ["x-bip-attempt"] = "2", ["x-bip-replay"] = "true" } };
+        observations.BeginHandlerInvocation(replay.MessageId);
+        var skipped = await replaySteps.ExecuteAsync(replay, "deliver", "https://target.example/orders", "target",
+            _ => Task.CompletedTask, CancellationToken.None);
+
+        Assert.IsTrue(skipped.Skipped);
+        Assert.AreEqual(0, logs.Errors.Count);
+        Assert.AreEqual(0, logs.Warnings.Count);
+
+        // A handler that repeats the key in the replay: which item the earlier
+        // attempt sent is unknown, so each repeat keeps the warning.
+        for (var call = 0; call < 2; call++)
+        {
+            Assert.IsTrue((await replaySteps.ExecuteAsync(replay, "deliver", "https://target.example/orders", "target",
+                _ => Task.CompletedTask, CancellationToken.None)).Skipped);
+        }
+
+        Assert.AreEqual(0, logs.Errors.Count);
+        Assert.AreEqual(2, logs.Warnings.Count);
+    }
+
+    [TestMethod]
+    public async Task RepeatedKeyWithoutAHandlerInvocationKeepsTheWarning()
+    {
+        var connectionString = RequireConnectionString();
+        var options = CreateOptions(connectionString);
+        await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+        var observations = new PlatformStepObservationCollector();
+        var logs = new LogRecorder();
+        var steps = new PlatformStepExecutor(dataSource, observations, logs.For<PlatformStepExecutor>());
+        var message = CreateMessage($"dotnet-test-{Guid.NewGuid():N}", options);
+
+        // Called outside the consumer, so no handler invocation is known.
+        await steps.ExecuteAsync(message, "deliver", "https://target.example/orders", "target",
+            _ => Task.CompletedTask, CancellationToken.None);
+        var repeated = await steps.ExecuteAsync(message, "deliver", "https://target.example/orders", "target",
+            _ => Task.CompletedTask, CancellationToken.None);
+
+        Assert.IsTrue(repeated.Skipped);
+        Assert.AreEqual(0, logs.Errors.Count);
+        Assert.AreEqual(1, logs.Warnings.Count);
     }
 
     [TestMethod]
@@ -1177,40 +1243,109 @@ public sealed class PlatformMessageStorePostgresTests
     }
 
     [TestMethod]
-    public async Task ReplayRecordsANewInlinePayloadExpiry()
+    public async Task ReplayRefreshesInlineExpiryUntilFirstReceiptCap()
     {
-        // Pins current behaviour: the upserts write
-        // payload_expires_at = excluded.payload_expires_at, so each processed
-        // replay sets the expiry from its own processing time.
-        var connectionString = RequireConnectionString();
-        var options = CreateOptions(connectionString);
-        var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+        var options = CreateOptions(RequireConnectionString());
         await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
-        var (store, _, _, _) = CreateStore(dataSource, options);
-
-        await store.RecordAttemptAsync(CreateMessage(messageId, options), "dotnet-handler", "COMPLETED", null, CancellationToken.None);
-        await using (var connection = await dataSource.OpenConnectionAsync())
+        var firstReceipt = new DateTimeOffset(2020, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var clock = new CaptureClock { Now = firstReceipt };
+        var store = new PlatformMessageStore(dataSource, new PlatformStepObservationCollector(),
+            Options.Create(options), NullLogger<PlatformMessageStore>.Instance) { Clock = clock };
+        var message = CreateMessage($"dotnet-test-{Guid.NewGuid():N}", options);
+        await store.RecordAttemptAsync(message, "dotnet-handler", "COMPLETED", null, CancellationToken.None);
+        await using var connection = await dataSource.OpenConnectionAsync();
+        await using (var age = new NpgsqlCommand(
+            "update bip_message_attempt set occurred_at = @first where message_id = @id", connection))
         {
-            await using var age = new NpgsqlCommand(
-                "update bip_message_log set payload_expires_at = now() + interval '1 day' where message_id = @message_id",
-                connection);
-            age.Parameters.AddWithValue("message_id", messageId);
+            age.Parameters.AddWithValue("first", firstReceipt);
+            age.Parameters.AddWithValue("id", message.MessageId);
             await age.ExecuteNonQueryAsync();
         }
 
-        var replay = CreateMessage(messageId, options, new Dictionary<string, string>
+        // Just before expiry, at the renewal boundary, near the cap, at the cap,
+        // and even a delayed delivery beyond it: no processing extends the cap.
+        var attempt = 1;
+        foreach (var days in new[] { 29, 30, 31, 59, 60, 61 })
         {
-            ["x-bip-attempt"] = "2",
-            ["x-bip-replay"] = "true",
-        });
-        await store.RecordAttemptAsync(replay, "dotnet-handler", "COMPLETED", null, CancellationToken.None);
+            clock.Now = firstReceipt.AddDays(days);
+            var replay = message with
+            {
+                Headers = new Dictionary<string, string>
+                {
+                    ["x-bip-attempt"] = (++attempt).ToString(System.Globalization.CultureInfo.InvariantCulture),
+                    ["x-bip-replay"] = "true",
+                },
+            };
+            await store.RecordAttemptAsync(replay, "dotnet-handler", "COMPLETED", null, CancellationToken.None);
+            await using var read = new NpgsqlCommand(
+                """
+                select l.payload_expires_at, a.payload_expires_at,
+                       (select payload_expires_at from bip_message_attempt where message_id = @id and attempt = 1)
+                from bip_message_log l join bip_message_attempt a using (message_id)
+                where message_id = @id and a.attempt = @attempt
+                """, connection);
+            read.Parameters.AddWithValue("id", message.MessageId);
+            read.Parameters.AddWithValue("attempt", attempt);
+            await using var reader = await read.ExecuteReaderAsync();
+            Assert.IsTrue(await reader.ReadAsync());
+            var expected = firstReceipt.AddDays(Math.Min(days + 30, 60));
+            Assert.AreEqual(expected, reader.GetFieldValue<DateTimeOffset>(0), $"Replay on day {days}");
+            Assert.AreEqual(expected, reader.GetFieldValue<DateTimeOffset>(1));
+            Assert.AreEqual(firstReceipt.AddDays(30), reader.GetFieldValue<DateTimeOffset>(2),
+                "Replaying must not extend historical payload expiry.");
+        }
+    }
 
-        await using var read = await dataSource.OpenConnectionAsync();
-        await using var command = new NpgsqlCommand(
-            "select payload_expires_at > now() + interval '29 days' from bip_message_log where message_id = @message_id",
-            read);
-        command.Parameters.AddWithValue("message_id", messageId);
-        Assert.AreEqual(true, await command.ExecuteScalarAsync(), "A replay currently extends the inline payload expiry.");
+    [TestMethod]
+    [DataRow(0)]
+    [DataRow(30)]
+    public async Task InlineExpiryUsesOnlyThisIntegrationsHistoryAndHandlesZeroRetention(int retentionDays)
+    {
+        var options = CreateOptions(RequireConnectionString());
+        options.PayloadRetentionDays = retentionDays;
+        await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+        var firstReceipt = new DateTimeOffset(2020, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var clock = new CaptureClock { Now = firstReceipt };
+        var message = CreateMessage($"dotnet-test-{Guid.NewGuid():N}", options);
+        var other = CreateOptions(options.PostgresConnectionString);
+        other.ApplicationName = "integration-other";
+        var (otherStore, _, _, _) = CreateStore(dataSource, other);
+        await otherStore.RecordAttemptAsync(message, "other-handler", "COMPLETED", null, CancellationToken.None);
+        await using var connection = await dataSource.OpenConnectionAsync();
+        await using var age = new NpgsqlCommand(
+            "update bip_message_attempt set occurred_at = @first where message_id = @id and attempt = @attempt", connection);
+        age.Parameters.AddWithValue("first", firstReceipt.AddYears(-1));
+        age.Parameters.AddWithValue("id", message.MessageId);
+        age.Parameters.AddWithValue("attempt", 1);
+        await age.ExecuteNonQueryAsync();
+
+        var store = new PlatformMessageStore(dataSource, new PlatformStepObservationCollector(),
+            Options.Create(options), NullLogger<PlatformMessageStore>.Instance) { Clock = clock };
+        await store.RecordAttemptAsync(message with
+        {
+            Headers = new Dictionary<string, string> { ["x-bip-attempt"] = "2" },
+        }, "dotnet-handler", "COMPLETED", null, CancellationToken.None);
+        await using var read = new NpgsqlCommand(
+            "select payload_expires_at from bip_message_log where message_id = @id", connection);
+        read.Parameters.AddWithValue("id", message.MessageId);
+        Assert.AreEqual(firstReceipt.AddDays(retentionDays).UtcDateTime, await read.ExecuteScalarAsync(),
+            "Without this integration's history, capture time anchors the expiry.");
+
+        age.Parameters["first"].Value = firstReceipt;
+        age.Parameters["attempt"].Value = 2;
+        await age.ExecuteNonQueryAsync();
+        clock.Now = firstReceipt.AddDays(90);
+        await store.RecordAttemptAsync(message with
+        {
+            Headers = new Dictionary<string, string> { ["x-bip-attempt"] = "3", ["x-bip-replay"] = "true" },
+        }, "dotnet-handler", "COMPLETED", null, CancellationToken.None);
+        Assert.AreEqual(firstReceipt.AddDays(2 * retentionDays).UtcDateTime, await read.ExecuteScalarAsync());
+    }
+
+    private sealed class CaptureClock : TimeProvider
+    {
+        public DateTimeOffset Now { get; set; }
+        public override DateTimeOffset GetUtcNow() => Now;
     }
 
     [TestMethod]
@@ -1613,6 +1748,8 @@ public sealed class PlatformMessageStorePostgresTests
     {
         public List<string> Warnings { get; } = [];
 
+        public List<string> Errors { get; } = [];
+
         public ILogger<T> For<T>() => new Recorder<T>(this);
 
         private sealed class Recorder<T>(LogRecorder parent) : ILogger<T>
@@ -1626,6 +1763,10 @@ public sealed class PlatformMessageStorePostgresTests
                 if (logLevel == LogLevel.Warning)
                 {
                     parent.Warnings.Add(formatter(state, exception));
+                }
+                else if (logLevel == LogLevel.Error)
+                {
+                    parent.Errors.Add(formatter(state, exception));
                 }
             }
         }
