@@ -104,6 +104,150 @@ public sealed class PlatformMessageStorePostgresTests
         Assert.AreEqual("COMPLETED", await command.ExecuteScalarAsync());
     }
 
+    [TestMethod]
+    public void RegisteringTheAdapterAddsNothingToTheHttpClientPipeline()
+    {
+        static string[] HttpClientRegistrations(bool withAdapter)
+        {
+            var services = new ServiceCollection();
+            services.AddLogging();
+            services.AddHttpClient("target-system");
+            if (withAdapter)
+            {
+                services.AddBasisMessageStoreAdapter<SyntheticHandler>(options => options.KafkaBootstrapServers = "unused:9092");
+            }
+
+            return services
+                .Where(service => service.ServiceType == typeof(Microsoft.Extensions.Http.IHttpMessageHandlerBuilderFilter)
+                    || service.ServiceType == typeof(IConfigureOptions<Microsoft.Extensions.Http.HttpClientFactoryOptions>)
+                    || service.ServiceType == typeof(IPostConfigureOptions<Microsoft.Extensions.Http.HttpClientFactoryOptions>)
+                    || service.ServiceType == typeof(DelegatingHandler))
+                .Select(service => $"{service.ServiceType.Name} {service.ImplementationType?.FullName ?? service.ImplementationInstance?.GetType().FullName ?? "factory"}")
+                .ToArray();
+        }
+
+        CollectionAssert.AreEqual(HttpClientRegistrations(withAdapter: false), HttpClientRegistrations(withAdapter: true));
+    }
+
+    [TestMethod]
+    public async Task ConsumedCredentialHeadersReachNoHttpReceiver()
+    {
+        var connectionString = RequireConnectionString();
+        var receiver = new RecordingReceiver();
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddHttpClient("target-system", client => client.BaseAddress = new Uri("https://target.example/"))
+            .ConfigurePrimaryHttpMessageHandler(() => receiver);
+        services.AddBasisMessageStoreAdapter<ReadmePatternHandler>(options =>
+        {
+            options.PostgresConnectionString = connectionString;
+            options.KafkaBootstrapServers = "unused:9092";
+            options.ApplicationName = "integration-e2e-dotnet";
+            options.InputTopic = "bip.integration-e2e-dotnet.in";
+        });
+        await using var provider = services.BuildServiceProvider();
+        var consumer = provider.GetServices<Microsoft.Extensions.Hosting.IHostedService>().OfType<PlatformMessageConsumerService>().Single();
+        var options = provider.GetRequiredService<IOptions<PlatformMessageStoreOptions>>().Value;
+        var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+        var consumed = new Message<string, byte[]>
+        {
+            Key = messageId,
+            Value = "{}"u8.ToArray(),
+            Headers = new Headers
+            {
+                { "x-bip-message-id", Encoding.UTF8.GetBytes(messageId) },
+                { "Authorization", Encoding.UTF8.GetBytes("Bearer synthetic-consumed-token") },
+                { "x-api-key", Encoding.UTF8.GetBytes("synthetic-consumed-key") },
+                { "Cookie", Encoding.UTF8.GetBytes("session=synthetic-consumed-session") },
+                { "x-custom-trace", Encoding.UTF8.GetBytes("synthetic-consumed-trace") },
+            },
+        };
+
+        await consumer.ProcessAsync(PlatformMessageConsumerService.ToPlatformMessage(consumed, options), () => { }, CancellationToken.None);
+
+        var request = receiver.Requests.Single();
+        var consumedNames = consumed.Headers.Select(header => header.Key).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        Assert.IsFalse(request.Headers.Any(header => consumedNames.Contains(header.Name)), string.Join(", ", request.Headers.Select(header => header.Name)));
+        Assert.IsFalse(request.Headers.Any(header => header.Value.Contains("synthetic-consumed", StringComparison.Ordinal)));
+        Assert.IsFalse(request.Uri.Contains("synthetic-consumed", StringComparison.Ordinal));
+        Assert.AreEqual("COMPLETED", await LogStatusAsync(provider.GetRequiredKeyedService<NpgsqlDataSource>(PlatformMessageStoreExtensions.MessageStoreDataSourceKey), messageId));
+    }
+
+    [TestMethod]
+    public async Task ReplayRecordCarriesOnlyTheEnvelopeHeaders()
+    {
+        var connectionString = RequireConnectionString();
+        var options = CreateOptions(connectionString);
+        var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+        await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+        var (store, _, _, _) = CreateStore(dataSource, options);
+        var consumed = new Message<string, byte[]>
+        {
+            Key = messageId,
+            Value = "{}"u8.ToArray(),
+            Headers = new Headers
+            {
+                { "x-bip-message-id", Encoding.UTF8.GetBytes(messageId) },
+                { "x-bip-correlation-id", Encoding.UTF8.GetBytes(messageId) },
+                { "Authorization", Encoding.UTF8.GetBytes("Bearer synthetic-consumed-token") },
+                { "x-api-key", Encoding.UTF8.GetBytes("synthetic-consumed-key") },
+                { "x-custom-trace", Encoding.UTF8.GetBytes("synthetic-consumed-trace") },
+                { "x-bip-unknown", Encoding.UTF8.GetBytes("synthetic-consumed-envelope") },
+            },
+        };
+        await store.RecordAttemptAsync(PlatformMessageConsumerService.ToPlatformMessage(consumed, options), "dotnet-handler", "COMPLETED", null, CancellationToken.None);
+        var producer = new FakeProducer();
+
+        var replay = await store.ReplayAsync(messageId, new MessageReplayRequest("operator", "resend"), producer, CancellationToken.None);
+
+        Assert.AreEqual("PUBLISHED", replay.Status);
+        var headers = producer.Produced.Single().Message.Headers;
+        CollectionAssert.AreEquivalent(
+            new[]
+            {
+                "x-bip-message-id", "x-bip-correlation-id", "x-bip-schema-version", "x-bip-content-type", "content-type",
+                "x-bip-source-system", "x-bip-target-system", "x-bip-replay", "x-bip-attempt", "x-bip-redo-steps",
+            },
+            headers.Select(header => header.Key).ToArray());
+        Assert.IsFalse(headers.Any(header => Encoding.UTF8.GetString(header.GetValueBytes()).Contains("synthetic-consumed", StringComparison.Ordinal)));
+    }
+
+    /// <summary>The README's handler: one step around a named client's call.</summary>
+    private sealed class ReadmePatternHandler(IPlatformStepExecutor steps, IHttpClientFactory httpClients) : IPlatformMessageHandler
+    {
+        public async Task<PlatformMessageResult> HandleAsync(PlatformMessage message, CancellationToken cancellationToken)
+        {
+            await steps.ExecuteAsync(
+                message,
+                stepId: "target-system",
+                endpointUri: "https://target.example/api/orders",
+                targetRef: message.TargetSystem,
+                operation: async ct =>
+                {
+                    using var content = new ByteArrayContent(message.Payload);
+                    content.Headers.ContentType = System.Net.Http.Headers.MediaTypeHeaderValue.Parse(message.ContentType);
+                    using var response = await httpClients.CreateClient("target-system").PostAsync("api/orders", content, ct);
+                    response.EnsureSuccessStatusCode();
+                },
+                cancellationToken);
+            return PlatformMessageResult.Completed();
+        }
+    }
+
+    private sealed class RecordingReceiver : HttpMessageHandler
+    {
+        public List<(string Uri, List<(string Name, string Value)> Headers)> Requests { get; } = [];
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            var headers = request.Headers.Concat(request.Content?.Headers ?? Enumerable.Empty<KeyValuePair<string, IEnumerable<string>>>())
+                .SelectMany(header => header.Value.Select(value => (header.Key, value)))
+                .ToList();
+            Requests.Add((request.RequestUri!.ToString(), headers));
+            return Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.OK));
+        }
+    }
+
     private sealed class SyntheticHandler : IPlatformMessageHandler
     {
         public Task<PlatformMessageResult> HandleAsync(PlatformMessage message, CancellationToken cancellationToken)
