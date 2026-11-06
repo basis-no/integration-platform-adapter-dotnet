@@ -59,6 +59,7 @@ The adapter owns the message-store mechanics of a .NET integration:
 ## Integration Usage
 
 ```csharp
+builder.Services.AddHttpClient("target-system", client => client.BaseAddress = new Uri("https://target.example/"));
 builder.Services.AddBasisMessageStoreAdapter<MyMessageHandler>();
 
 app.MapBasisMessageStoreAdminEndpoints();
@@ -70,10 +71,12 @@ Application code implements:
 public sealed class MyMessageHandler : IPlatformMessageHandler
 {
     private readonly IPlatformStepExecutor steps;
+    private readonly IHttpClientFactory httpClients;
 
-    public MyMessageHandler(IPlatformStepExecutor steps)
+    public MyMessageHandler(IPlatformStepExecutor steps, IHttpClientFactory httpClients)
     {
         this.steps = steps;
+        this.httpClients = httpClients;
     }
 
     public async Task<PlatformMessageResult> HandleAsync(
@@ -87,7 +90,12 @@ public sealed class MyMessageHandler : IPlatformMessageHandler
             targetRef: message.TargetSystem,
             operation: async ct =>
             {
-                await SendToTargetSystem(message, ct);
+                using var content = new ByteArrayContent(message.Payload);
+                content.Headers.ContentType = MediaTypeHeaderValue.Parse(message.ContentType);
+                using var response = await httpClients.CreateClient("target-system")
+                    .PostAsync("api/orders", content, ct);
+                // HttpClient returns a 4xx or 5xx response without throwing.
+                response.EnsureSuccessStatusCode();
             },
             cancellationToken);
 
@@ -95,6 +103,18 @@ public sealed class MyMessageHandler : IPlatformMessageHandler
     }
 }
 ```
+
+The step is recorded `DELIVERED` when its operation returns and `FAILED` when
+it throws, so the operation must throw when the send fails. `HttpClient` does
+not throw on a 4xx or 5xx response by itself: without
+`EnsureSuccessStatusCode()`, or a status check that throws, a 500 is recorded
+`DELIVERED`, the message completes, and a resend skips the step, so the
+receiver never gets the message. The same happens when the operation catches
+its own failure, and with any client that reports a failed send in its result
+instead of throwing. To park the message on a failed send, let the exception
+leave the operation: the handler can catch it and return
+`PlatformMessageResult.Failed`, or let it propagate, and the adapter retries
+the handler and then parks the message.
 
 The step key is `<message-id>:<step-id>`, and a step whose key is already
 `DELIVERED` in `bip_step_outcome` is skipped, unless the message's
