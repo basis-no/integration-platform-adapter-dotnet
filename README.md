@@ -178,6 +178,15 @@ The same semantics as the Camel Quarkus adapter:
 | `BASIS_MESSAGE_STORE_PAYLOAD_MAX_BYTES` | `1048576` | Payloads larger than this degrade to `metadata_only` with a `replay_disabled_reason` |
 | `BASIS_MESSAGE_STORE_PAYLOAD_RETENTION_DAYS` | `30` | Sets `payload_expires_at` on captured payloads |
 
+Inline capture sets expiry to the earlier of capture time plus retention and
+first receipt plus twice retention, matching the Camel adapter. First receipt
+is the earliest `occurred_at` in this integration's attempt history, or capture
+time when there is none. A replay shortly before expiry can renew it up to
+that cap; repeated replays never extend it beyond the cap. The summary and
+new attempt store the same expiry, and earlier attempts keep theirs. Consuming
+attempt 1 again rewrites its `occurred_at`, so the cap can move when that row
+was the earliest receipt; replays write new attempts and do not move it.
+
 `metadata_only` rows store no `payload_bytes` and are `replayable=false` with
 a reason. Replayability is a property of payload availability, never of the
 message outcome: `COMPLETED` messages are resendable as long as the payload
