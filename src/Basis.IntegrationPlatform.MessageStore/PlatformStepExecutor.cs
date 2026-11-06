@@ -143,90 +143,164 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
 
     /// <summary>
     /// Masks what bip_step_outcome and steps_json would otherwise keep in clear
-    /// text. The Camel adapter's rule comes first, so every value it masks is
-    /// recorded the same way by both adapters. This adapter then also masks the
-    /// whole user info, and the values of query parameters whose names are
-    /// credential-like by the DLQ header rule or one of the URI names above.
+    /// text. The result is the Camel adapter's value for the URI, so both
+    /// adapters record the same value, except that every character this
+    /// adapter's own rule masks in the URI is masked too: the whole user info,
+    /// and the values of query parameters whose names are credential-like by
+    /// the DLQ header rule or one of the URI names above. Both rules read the
+    /// URI as given, so one rule's replacement cannot hide a value from the
+    /// other.
     /// </summary>
     internal static string MaskEndpointUri(string endpointUri)
     {
-        string camelMasked;
+        List<(char Character, int Source)> camel;
         try
         {
-            camelMasked = CamelSecretParameter.Replace(endpointUri, "${1}=" + PlatformMessageConsumerService.MaskedHeaderValue);
-            camelMasked = CamelUserInfoPassword.Replace(camelMasked, "${1}" + PlatformMessageConsumerService.MaskedHeaderValue + "${3}", 1);
+            camel = CamelSanitizedCharacters(endpointUri);
         }
         catch (RegexMatchTimeoutException)
         {
             return PlatformMessageConsumerService.MaskedHeaderValue;
         }
 
-        return MaskUserInfoAndQuery(camelMasked);
-    }
-
-    private static string MaskUserInfoAndQuery(string endpointUri)
-    {
-        var queryOrFragment = endpointUri.IndexOfAny(['?', '#']);
-        var hierarchy = queryOrFragment < 0 ? endpointUri : endpointUri[..queryOrFragment];
-        var masked = new StringBuilder(MaskUserInfo(hierarchy));
-        if (queryOrFragment < 0)
+        var adapterMasked = AdapterMaskedCharacters(endpointUri);
+        bool IsMasked(int index) => camel[index].Source < 0 || adapterMasked[camel[index].Source];
+        var masked = new StringBuilder(endpointUri.Length);
+        for (var index = 0; index < camel.Count;)
         {
-            return masked.ToString();
-        }
-
-        var fragment = endpointUri.IndexOf('#', queryOrFragment);
-        var queryEnd = fragment < 0 ? endpointUri.Length : fragment;
-        if (endpointUri[queryOrFragment] == '?')
-        {
-            var parameters = endpointUri[(queryOrFragment + 1)..queryEnd].Split('&');
-            masked.Append('?').AppendJoin('&', parameters.Select(MaskQueryParameter));
-        }
-
-        return masked.Append(endpointUri, queryEnd, endpointUri.Length - queryEnd).ToString();
-    }
-
-    private static string MaskUserInfo(string hierarchy)
-    {
-        // The authority follows "scheme://" or, in a network-path reference
-        // such as "//host/path", the leading "//".
-        int authorityStart;
-        if (hierarchy.StartsWith("//", StringComparison.Ordinal))
-        {
-            authorityStart = 2;
-        }
-        else
-        {
-            var scheme = hierarchy.IndexOf("://", StringComparison.Ordinal);
-            if (scheme < 0)
+            if (!IsMasked(index))
             {
-                return hierarchy;
+                masked.Append(camel[index++].Character);
+                continue;
             }
 
-            authorityStart = scheme + 3;
+            // A run of Camel's masks and characters this adapter masks becomes
+            // one mask; a run of Camel's masks alone stays as Camel wrote it.
+            var run = index;
+            var adds = false;
+            for (; index < camel.Count && IsMasked(index); index++)
+            {
+                adds |= camel[index].Source >= 0;
+            }
+
+            if (adds)
+            {
+                masked.Append(PlatformMessageConsumerService.MaskedHeaderValue);
+            }
+            else
+            {
+                for (; run < index; run++)
+                {
+                    masked.Append(camel[run].Character);
+                }
+            }
         }
 
-        var authorityEnd = hierarchy.IndexOf('/', authorityStart);
-        var authority = hierarchy.AsSpan(authorityStart, (authorityEnd < 0 ? hierarchy.Length : authorityEnd) - authorityStart);
-        var at = authority.LastIndexOf('@');
-        return at < 0
-            ? hierarchy
-            : string.Concat(hierarchy.AsSpan(0, authorityStart), PlatformMessageConsumerService.MaskedHeaderValue, hierarchy.AsSpan(authorityStart + at));
+        return masked.ToString();
     }
 
-    private static string MaskQueryParameter(string parameter)
+    /// <summary>
+    /// Camel's URISupport.sanitizeUri: the parameter pattern replaced
+    /// everywhere, then the user info pattern once on that result. Each
+    /// character of the result keeps the index it had in the URI, or -1 for a
+    /// mask Camel wrote.
+    /// </summary>
+    private static List<(char Character, int Source)> CamelSanitizedCharacters(string uri)
     {
-        var equals = parameter.IndexOf('=');
-        if (equals < 0)
+        var parameters = new List<(char Character, int Source)>(uri.Length);
+        var position = 0;
+        foreach (Match match in CamelSecretParameter.Matches(uri))
         {
-            return parameter;
+            // "$1=xxxxxx": the name and '=' stay, the value becomes the mask.
+            var value = match.Groups[2];
+            AppendSource(parameters, uri, position, value.Index);
+            AppendMask(parameters);
+            position = value.Index + value.Length;
         }
 
-        var name = Uri.UnescapeDataString(parameter[..equals]);
+        AppendSource(parameters, uri, position, uri.Length);
+        var userInfo = CamelUserInfoPassword.Match(new string(parameters.Select(character => character.Character).ToArray()));
+        if (!userInfo.Success)
+        {
+            return parameters;
+        }
+
+        // "$1xxxxxx$3": the password becomes the mask.
+        var password = userInfo.Groups[2];
+        var sanitized = parameters.GetRange(0, password.Index);
+        AppendMask(sanitized);
+        sanitized.AddRange(parameters.Skip(password.Index + password.Length));
+        return sanitized;
+    }
+
+    private static void AppendSource(List<(char Character, int Source)> characters, string uri, int start, int end)
+    {
+        for (var index = start; index < end; index++)
+        {
+            characters.Add((uri[index], index));
+        }
+    }
+
+    private static void AppendMask(List<(char Character, int Source)> characters)
+    {
+        foreach (var character in PlatformMessageConsumerService.MaskedHeaderValue)
+        {
+            characters.Add((character, -1));
+        }
+    }
+
+    /// <summary>
+    /// The characters of the URI this adapter's own rule masks: the user info
+    /// of the authority, and the value of each query parameter with a
+    /// credential-like name.
+    /// </summary>
+    private static bool[] AdapterMaskedCharacters(string uri)
+    {
+        var masked = new bool[uri.Length];
+        var queryOrFragment = uri.IndexOfAny(['?', '#']);
+        var hierarchyEnd = queryOrFragment < 0 ? uri.Length : queryOrFragment;
+        // The authority follows "scheme://" or, in a network-path reference
+        // such as "//host/path", the leading "//".
+        var scheme = uri.StartsWith("//", StringComparison.Ordinal) ? -1 : uri.IndexOf("://", 0, hierarchyEnd, StringComparison.Ordinal);
+        if (uri.StartsWith("//", StringComparison.Ordinal) || scheme >= 0)
+        {
+            var authorityStart = scheme < 0 ? 2 : scheme + 3;
+            var slash = uri.IndexOf('/', authorityStart, hierarchyEnd - authorityStart);
+            var authorityEnd = slash < 0 ? hierarchyEnd : slash;
+            var at = uri.LastIndexOf('@', authorityEnd - 1, authorityEnd - authorityStart);
+            Array.Fill(masked, true, authorityStart, Math.Max(0, at - authorityStart));
+        }
+
+        if (queryOrFragment < 0 || uri[queryOrFragment] != '?')
+        {
+            return masked;
+        }
+
+        var fragment = uri.IndexOf('#', queryOrFragment);
+        var queryEnd = fragment < 0 ? uri.Length : fragment;
+        for (var parameterStart = queryOrFragment + 1; parameterStart <= queryEnd;)
+        {
+            var ampersand = uri.IndexOf('&', parameterStart, queryEnd - parameterStart);
+            var parameterEnd = ampersand < 0 ? queryEnd : ampersand;
+            var equals = uri.IndexOf('=', parameterStart, parameterEnd - parameterStart);
+            if (equals >= 0 && IsCredentialParameter(uri[parameterStart..equals]))
+            {
+                Array.Fill(masked, true, equals + 1, parameterEnd - equals - 1);
+            }
+
+            parameterStart = parameterEnd + 1;
+        }
+
+        return masked;
+    }
+
+    private static bool IsCredentialParameter(string encodedName)
+    {
+        var name = Uri.UnescapeDataString(encodedName);
         var lower = name.ToLowerInvariant();
-        var credential = PlatformMessageConsumerService.IsCredentialHeader(name)
+        return PlatformMessageConsumerService.IsCredentialHeader(name)
             || UriCredentialNames.Contains(lower)
             || UriCredentialNameParts.Any(part => lower.Contains(part, StringComparison.Ordinal));
-        return credential ? parameter[..(equals + 1)] + PlatformMessageConsumerService.MaskedHeaderValue : parameter;
     }
 
     /// <summary>

@@ -29,6 +29,7 @@ public sealed class PlatformStepExecutorTests
     [DataRow("https://target.example/a?userId=42&page=2", "https://target.example/a?userId=xxxxxx&page=2")]
     [DataRow("https://target.example/a?apikey=k&api_key=k2&page=2", "https://target.example/a?apikey=xxxxxx&api_key=xxxxxx&page=2")]
     [DataRow("https://target.example/a?page=2&passphrase=p", "https://target.example/a?page=2&passphrase=xxxxxx")]
+    [DataRow("https://target.example/a?token=&page=2", "https://target.example/a?token=xxxxxx&page=2")]
     [DataRow(
         "http://target.example/cb?redirect=https://svc:pw@other.example/x",
         "http://target.example/cb?redirect=https://svc:xxxxxx@other.example/x")]
@@ -74,6 +75,17 @@ public sealed class PlatformStepExecutorTests
         "https://target.example/a?sig=s&sv=2024&page=2",
         "https://target.example/a?sig=xxxxxx&sv=2024&page=2",
         "https://target.example/a?sig=s&sv=2024&page=2")]
+    // Camel's user info pattern can reach past '?'; each rule still reads the
+    // URI as given, so neither replacement hides a value from the other.
+    [DataRow(
+        "https://a:pw?x=y@h&code=synthetic-secret",
+        "https://a:xxxxxx@h&code=xxxxxx",
+        "https://a:xxxxxx@h&code=synthetic-secret")]
+    [DataRow("https://a:b@h/x?u=c:d@e", "https://xxxxxx@e", "https://a:xxxxxx@e")]
+    [DataRow(
+        "https://u:p@h/cb?r=https://x:y@z",
+        "https://xxxxxx@h/cb?r=https://x:xxxxxx@z",
+        "https://u:p@h/cb?r=https://x:xxxxxx@z")]
     public void MaskEndpointUriAlsoMasksUserInfoAndTheAdapterCredentialNames(string endpointUri, string expected, string camelRecords)
     {
         Assert.AreEqual(expected, PlatformStepExecutor.MaskEndpointUri(endpointUri));
