@@ -32,6 +32,12 @@ public sealed class PlatformStepExecutorTests
     [DataRow(
         "http://target.example/cb?redirect=https://svc:pw@other.example/x",
         "http://target.example/cb?redirect=https://svc:xxxxxx@other.example/x")]
+    // Java's '.' stops at each of these line terminators.
+    [DataRow("https://target.example/a?redirect=https://a:secret@h\rhttps://b:pw@h", "https://target.example/a?redirect=https://a:xxxxxx@h\rhttps://b:pw@h")]
+    [DataRow("https://target.example/a?redirect=https://a:secret@h\nhttps://b:pw@h", "https://target.example/a?redirect=https://a:xxxxxx@h\nhttps://b:pw@h")]
+    [DataRow("https://target.example/a?redirect=https://a:secret@h\u0085https://b:pw@h", "https://target.example/a?redirect=https://a:xxxxxx@h\u0085https://b:pw@h")]
+    [DataRow("https://target.example/a?redirect=https://a:secret@h\u2028https://b:pw@h", "https://target.example/a?redirect=https://a:xxxxxx@h\u2028https://b:pw@h")]
+    [DataRow("https://target.example/a?redirect=https://a:secret@h\u2029https://b:pw@h", "https://target.example/a?redirect=https://a:xxxxxx@h\u2029https://b:pw@h")]
     public void MaskEndpointUriRecordsWhatTheCamelAdapterRecords(string endpointUri, string expected)
     {
         Assert.AreEqual(expected, PlatformStepExecutor.MaskEndpointUri(endpointUri));

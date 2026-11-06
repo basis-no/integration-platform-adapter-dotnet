@@ -66,6 +66,10 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
     // step. On timeout nothing of the URI is recorded.
     private static readonly TimeSpan MaskTimeout = TimeSpan.FromSeconds(1);
 
+    // Java's '.' does not match these line terminators; .NET's matches all
+    // but '\n'. The user info pattern spells it out to match as Camel does.
+    private const string JavaDot = "[^\n\r\u0085\u2028\u2029]";
+
     // URISupport.sanitizeUri's two patterns, unchanged, so both adapters mask
     // these values the same way: the value of such a parameter up to the next
     // '&', or its whole RAW(...) or RAW{...} form, and the password in the
@@ -75,7 +79,10 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant,
         MaskTimeout);
 
-    private static readonly Regex CamelUserInfoPassword = new("(.*://.*?:)(.*)(@)", RegexOptions.None, MaskTimeout);
+    private static readonly Regex CamelUserInfoPassword = new(
+        $"({JavaDot}*://{JavaDot}*?:)({JavaDot}*)(@)",
+        RegexOptions.None,
+        MaskTimeout);
 
     private readonly NpgsqlDataSource dataSource;
     private readonly PlatformStepObservationCollector observations;
