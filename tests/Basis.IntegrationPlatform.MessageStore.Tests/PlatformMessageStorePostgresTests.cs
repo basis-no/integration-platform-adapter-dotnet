@@ -907,7 +907,7 @@ public sealed class PlatformMessageStorePostgresTests
     }
 
     [TestMethod]
-    public async Task FanOutThroughOneStepIdSkipsLaterItemsAndWarns()
+    public async Task FanOutThroughOneStepIdSkipsLaterItemsAndLogsAnError()
     {
         var connectionString = RequireConnectionString();
         var options = CreateOptions(connectionString);
@@ -928,7 +928,14 @@ public sealed class PlatformMessageStorePostgresTests
         }
 
         CollectionAssert.AreEqual(new[] { "line-1" }, sent);
-        Assert.AreEqual(2, logs.Warnings.Count(w => w.Contains("distinct step id per item", StringComparison.Ordinal)));
+        Assert.AreEqual(2, logs.Errors.Count, "One ERROR per skipped call.");
+        Assert.IsTrue(logs.Errors.All(error => error.Contains("Step post-line already ran in this handler invocation", StringComparison.Ordinal)
+            && error.Contains($"messageId={message.MessageId}", StringComparison.Ordinal)
+            && error.Contains("distinct step id per item", StringComparison.Ordinal)));
+        Assert.AreEqual(0, logs.Warnings.Count);
+        CollectionAssert.AreEqual(
+            new[] { "DELIVERED", "SKIPPED", "SKIPPED" },
+            observations.Snapshot(message.MessageId).Select(observation => observation.Status).ToArray());
 
         // A step id per item delivers every item.
         sent.Clear();
@@ -962,6 +969,65 @@ public sealed class PlatformMessageStorePostgresTests
 
         Assert.IsTrue(retried.Skipped);
         Assert.AreEqual(0, logs.Warnings.Count);
+        Assert.AreEqual(0, logs.Errors.Count);
+    }
+
+    [TestMethod]
+    public async Task ReplaySkippingAStepAnEarlierAttemptDeliveredLogsNoError()
+    {
+        var connectionString = RequireConnectionString();
+        var options = CreateOptions(connectionString);
+        await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+        var (store, steps, _, _) = CreateStore(dataSource, options);
+        var message = CreateMessage($"dotnet-test-{Guid.NewGuid():N}", options);
+        await steps.ExecuteAsync(message, "deliver", "https://target.example/orders", "target",
+            _ => Task.CompletedTask, CancellationToken.None);
+        await store.RecordAttemptAsync(message, "dotnet-handler", "COMPLETED", null, CancellationToken.None);
+
+        var observations = new PlatformStepObservationCollector();
+        var logs = new LogRecorder();
+        var replaySteps = new PlatformStepExecutor(dataSource, observations, logs.For<PlatformStepExecutor>());
+        var replay = message with { Headers = new Dictionary<string, string> { ["x-bip-attempt"] = "2", ["x-bip-replay"] = "true" } };
+        observations.BeginHandlerInvocation(replay.MessageId);
+        var skipped = await replaySteps.ExecuteAsync(replay, "deliver", "https://target.example/orders", "target",
+            _ => Task.CompletedTask, CancellationToken.None);
+
+        Assert.IsTrue(skipped.Skipped);
+        Assert.AreEqual(0, logs.Errors.Count);
+        Assert.AreEqual(0, logs.Warnings.Count);
+
+        // A handler that repeats the key in the replay: which item the earlier
+        // attempt sent is unknown, so each repeat keeps the warning.
+        for (var call = 0; call < 2; call++)
+        {
+            Assert.IsTrue((await replaySteps.ExecuteAsync(replay, "deliver", "https://target.example/orders", "target",
+                _ => Task.CompletedTask, CancellationToken.None)).Skipped);
+        }
+
+        Assert.AreEqual(0, logs.Errors.Count);
+        Assert.AreEqual(2, logs.Warnings.Count);
+    }
+
+    [TestMethod]
+    public async Task RepeatedKeyWithoutAHandlerInvocationKeepsTheWarning()
+    {
+        var connectionString = RequireConnectionString();
+        var options = CreateOptions(connectionString);
+        await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+        var observations = new PlatformStepObservationCollector();
+        var logs = new LogRecorder();
+        var steps = new PlatformStepExecutor(dataSource, observations, logs.For<PlatformStepExecutor>());
+        var message = CreateMessage($"dotnet-test-{Guid.NewGuid():N}", options);
+
+        // Called outside the consumer, so no handler invocation is known.
+        await steps.ExecuteAsync(message, "deliver", "https://target.example/orders", "target",
+            _ => Task.CompletedTask, CancellationToken.None);
+        var repeated = await steps.ExecuteAsync(message, "deliver", "https://target.example/orders", "target",
+            _ => Task.CompletedTask, CancellationToken.None);
+
+        Assert.IsTrue(repeated.Skipped);
+        Assert.AreEqual(0, logs.Errors.Count);
+        Assert.AreEqual(1, logs.Warnings.Count);
     }
 
     [TestMethod]
@@ -1563,6 +1629,8 @@ public sealed class PlatformMessageStorePostgresTests
     {
         public List<string> Warnings { get; } = [];
 
+        public List<string> Errors { get; } = [];
+
         public ILogger<T> For<T>() => new Recorder<T>(this);
 
         private sealed class Recorder<T>(LogRecorder parent) : ILogger<T>
@@ -1576,6 +1644,10 @@ public sealed class PlatformMessageStorePostgresTests
                 if (logLevel == LogLevel.Warning)
                 {
                     parent.Warnings.Add(formatter(state, exception));
+                }
+                else if (logLevel == LogLevel.Error)
+                {
+                    parent.Errors.Add(formatter(state, exception));
                 }
             }
         }

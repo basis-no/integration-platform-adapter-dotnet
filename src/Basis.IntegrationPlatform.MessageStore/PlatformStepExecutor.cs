@@ -170,7 +170,7 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
     /// <summary>
     /// The key is <c>messageId:stepId</c> and bip_step_outcome has no
     /// integration column, so a DELIVERED row may not be this call's own
-    /// delivery. Warn on the two ways that happens; the skip itself is unchanged.
+    /// delivery. Log the two ways that happens; the skip itself is unchanged.
     /// </summary>
     private async Task WarnAboutSharedStepKeyAsync(
         PlatformMessage message,
@@ -178,13 +178,26 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
         string idempotencyKey,
         CancellationToken cancellationToken)
     {
-        if (observations.CompletedInCurrentInvocation(message.MessageId, idempotencyKey))
+        switch (observations.ReuseInCurrentInvocation(message.MessageId, idempotencyKey))
         {
-            logger.LogWarning(
-                "Step {StepId} already ran in this handler invocation and is skipped messageId={MessageId}. "
-                + "The step key is <message-id>:<step-id>; a handler that sends several items through one step needs a distinct step id per item.",
-                stepId,
-                message.MessageId);
+            case StepKeyReuse.AfterDeliveryInThisInvocation:
+                // This invocation delivered the key, so this call's item is
+                // never sent although the message completes: lost data.
+                logger.LogError(
+                    "Step {StepId} already ran in this handler invocation and is skipped messageId={MessageId}; this call is not sent. "
+                    + "The step key is <message-id>:<step-id>; a handler that sends several items through one step needs a distinct step id per item.",
+                    stepId,
+                    message.MessageId);
+                break;
+            case StepKeyReuse.Repeated:
+                // An earlier attempt delivered the key; which item it sent is
+                // unknown, so the reuse stays a warning.
+                logger.LogWarning(
+                    "Step {StepId} already ran in this handler invocation and is skipped messageId={MessageId}. "
+                    + "The step key is <message-id>:<step-id>; a handler that sends several items through one step needs a distinct step id per item.",
+                    stepId,
+                    message.MessageId);
+                break;
         }
 
         string? journaledBy;
