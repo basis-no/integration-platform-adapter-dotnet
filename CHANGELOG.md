@@ -10,10 +10,11 @@
   header names, `x-bip-*` and `Idempotency-Key` are kept. The rule matches the
   Camel adapter. Version 0.3.1 forwards them unmasked.
 
-- Warn when the step executor skips a step for a reason the integration
-  probably did not intend: the same handler invocation already ran that step id
-  (several items sent through one step id deliver only the first), or the
-  message id is journaled by another integration. Step keys are
+- Log when the step executor skips a step for a reason the integration
+  probably did not intend. When the same handler invocation already ran that
+  step id (several items sent through one step id deliver only the first), each
+  skipped call logs an ERROR, as the Camel adapter does; when the message id is
+  journaled by another integration, a warning. Step keys are
   `<message-id>:<step-id>` and `bip_step_outcome` has no integration column, so
   a message id shared with another integration that uses an equal step id skips
   the delivery. The skip is unchanged; the README describes how to choose step

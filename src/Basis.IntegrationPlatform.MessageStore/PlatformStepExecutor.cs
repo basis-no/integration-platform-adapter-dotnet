@@ -170,7 +170,7 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
     /// <summary>
     /// The key is <c>messageId:stepId</c> and bip_step_outcome has no
     /// integration column, so a DELIVERED row may not be this call's own
-    /// delivery. Warn on the two ways that happens; the skip itself is unchanged.
+    /// delivery. Log the two ways that happens; the skip itself is unchanged.
     /// </summary>
     private async Task WarnAboutSharedStepKeyAsync(
         PlatformMessage message,
@@ -180,8 +180,12 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
     {
         if (observations.CompletedInCurrentInvocation(message.MessageId, idempotencyKey))
         {
-            logger.LogWarning(
-                "Step {StepId} already ran in this handler invocation and is skipped messageId={MessageId}. "
+            // The same invocation used this key before, so this call's item is
+            // never sent although the message completes: lost data, so ERROR.
+            // A skip of a key an earlier attempt delivered cannot tell which
+            // item that attempt sent, and is not logged here.
+            logger.LogError(
+                "Step {StepId} already ran in this handler invocation and is skipped messageId={MessageId}; this call is not sent. "
                 + "The step key is <message-id>:<step-id>; a handler that sends several items through one step needs a distinct step id per item.",
                 stepId,
                 message.MessageId);

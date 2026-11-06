@@ -132,9 +132,12 @@ Choose step ids with that in mind:
   when one integration produces for another, give the new message its own
   `x-bip-message-id` and carry continuity in `x-bip-correlation-id`.
 
-The adapter logs a warning when it skips a step that the same handler invocation
-already ran, and when the skipped message id is journaled by another integration.
-The second warning reads `bip_message_log`. Where row-level security limits
+When the step executor skips a step that the same handler invocation already
+ran, it logs an ERROR, once per skipped call, with the step id and the message
+id: that call is not sent, yet the message completes. A skip of a step that an
+earlier attempt delivered, on a redelivery or a replay, logs no error. When the
+skipped message id is journaled by another integration, the adapter logs a
+warning. That warning reads `bip_message_log`. Where row-level security limits
 each integration to its own rows, the other integration's row is hidden, so that
 warning never fires there.
 If the read fails, the step is still skipped and the check is logged at debug.
