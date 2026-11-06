@@ -194,23 +194,28 @@ is captured, unexpired, and undeleted.
 
 ## Replay order
 
-A resend publishes a new record at the end of the input topic; it never returns
-to the original offset. The record's Kafka key is the message's correlation id:
+A resend publishes a new record to the replay topic; it never returns to the
+original offset. The replay topic is
+`BASIS_MESSAGE_STORE_REPLAY_INPUT_TOPIC_PATTERN` with `%s` replaced by the
+integration name (default `bip.%s.in`), so it is the input topic when the two
+agree. The record's Kafka key is the message's correlation id:
 `x-bip-correlation-id`, else the original record's key, else the message id.
-Kafka keeps order only per key within one partition, so:
+Kafka orders records only within a partition, so:
 
 - records for the same key that were published after the original may already
   have been processed. Replaying an old failure after a newer update for the
   same entity can restore stale data at the receiver;
-- resending several messages has no overall order. Resend per key, oldest
-  first, and do not resend a failure that a newer message for the same key has
+- resending several messages has no overall order. Resend one key's messages
+  oldest first, one request at a time, waiting for each response before the
+  next, and do not resend a failure that a newer message for the same key has
   superseded;
-- a replay lands on the original's partition only when its key is the
-  original record's key and both producers partition keys the same way. Keep
-  `x-bip-correlation-id` equal to the record key, or leave it out. This
-  adapter's producer uses the Kafka client's default partitioner
-  (`consistent_random`), which places a key differently from the Java client's
-  default (`murmur2`).
+- a replay reliably lands on the original's partition only when it goes to the
+  same topic, the partition count is unchanged, the original record had the
+  same non-empty key and no explicit partition, and both producers hash keys
+  the same way. Keep `x-bip-correlation-id` equal to the record key, or leave
+  it out. This adapter's producer uses the .NET Kafka client's default
+  partitioner (`consistent_random`, CRC32), which can place a key on a
+  different partition than the Java client's default (`murmur2`).
 
 ## Publish
 
