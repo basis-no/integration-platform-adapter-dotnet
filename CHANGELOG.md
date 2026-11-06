@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Export Kafka activity through `System.Diagnostics.Metrics`, with the same
+  metric names and signal labels as the Camel adapter. `record_admitted` is on
+  by default; `record_published` needs explicit selection and a list of topics.
+  A signal that is not selected or cannot be counted reports `supported=0`.
+  No metrics endpoint, exporter dependency, schema change or message data in
+  labels.
+
 - A late, older attempt no longer overwrites the message summary. When attempt
   1 was consumed again after its replay, attempt 2, had been recorded,
   `bip_message_log` took attempt 1's status, error, payload and expiry while
