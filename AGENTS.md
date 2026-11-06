@@ -88,7 +88,9 @@ auto-commit off. Each message goes to the application's `IPlatformMessageHandler
 in-process retry; the attempt number comes from the `x-bip-attempt` header. Success upserts
 `bip_message_log` and `bip_message_attempt` in one transaction and commits; give-up parks the
 message as above. `IPlatformStepExecutor.ExecuteAsync` wraps each external call: a step already
-`DELIVERED` in `bip_step_outcome` is skipped unless the replay names it in `x-bip-redo-steps`.
+`DELIVERED` in `bip_step_outcome` is skipped unless the replay names it in `x-bip-redo-steps`;
+otherwise it runs the operation and records the step `DELIVERED` when the operation returns and
+`FAILED` when it throws, so an operation must throw when its call fails.
 `MapBasisMessageStoreAdminEndpoints()` maps `POST /admin/messages/{messageId}/resend`, which
 republishes the stored payload to the input topic with the next attempt number.
 
