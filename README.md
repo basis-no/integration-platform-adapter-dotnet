@@ -55,9 +55,11 @@ The adapter owns the message-store mechanics of a .NET integration:
 - verifies the store schema major in `bip_contract` at startup and refuses
   to start on a mismatch (a missing or empty table logs a loud warning and
   the adapter assumes major 1). It then checks that `bip_message_log`,
-  `bip_message_attempt`, `bip_step_outcome` and `bip_message_replay_audit`
-  have every column it writes or reads, and refuses to start, naming each
-  missing table and column, instead of failing every message
+  `bip_message_attempt` and `bip_step_outcome` resolve through the
+  connection's `search_path` with every column that consuming a message
+  writes or reads, and refuses to start, naming each table and column it
+  cannot resolve, instead of failing every message. What only a resend uses
+  (`bip_message_replay_audit`, `payload_deleted_at`) is not checked
 
 ## Integration Usage
 

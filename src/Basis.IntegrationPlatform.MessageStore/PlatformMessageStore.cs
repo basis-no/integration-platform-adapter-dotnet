@@ -16,17 +16,19 @@ public sealed class PlatformMessageStore
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
-    // Every column the adapter's statements write or read, per table, in this
-    // file and in PlatformStepExecutor.cs; keep them in step. A store that
-    // declares the right major but lacks one of them would fail each message
-    // at that write instead of refusing to start.
+    // Every column that consuming a message writes or reads, per table, in
+    // this file and in PlatformStepExecutor.cs; keep them in step. A store
+    // that declares the right major but lacks one of them would fail each
+    // message at that write instead of refusing to start. What only a resend
+    // uses (bip_message_replay_audit, bip_message_log.payload_deleted_at) is
+    // not required to consume and is left to the resend itself.
     internal static readonly IReadOnlyDictionary<string, string[]> StoreColumns = new Dictionary<string, string[]>(StringComparer.Ordinal)
     {
         ["bip_message_log"] =
         [
             "message_id", "correlation_id", "integration", "schema_version", "status", "last_attempt", "occurred_at",
             "updated_at", "source_system", "target_system", "content_type", "payload_storage", "payload_size_bytes",
-            "payload_bytes", "payload_expires_at", "payload_deleted_at", "replayable", "replay_disabled_reason",
+            "payload_bytes", "payload_expires_at", "replayable", "replay_disabled_reason",
             "auto_redelivered", "auto_redelivery_count", "auto_redelivery_max", "error",
         ],
         ["bip_message_attempt"] =
@@ -40,11 +42,6 @@ public sealed class PlatformMessageStore
         [
             "idempotency_key", "message_id", "step_id", "status", "endpoint_uri", "target_ref", "error", "occurred_at",
             "updated_at",
-        ],
-        ["bip_message_replay_audit"] =
-        [
-            "replay_id", "message_id", "integration", "replay_attempt", "requested_by", "reason", "redo_steps",
-            "target_topic", "status", "requested_at", "published_at", "error",
         ],
     };
 
@@ -145,11 +142,11 @@ public sealed class PlatformMessageStore
     }
 
     /// <summary>
-    /// Startup check after the contract major: every table and column the
-    /// adapter writes or reads exists, resolved through the connection's
-    /// search_path as the adapter's statements resolve them. Anything missing
-    /// fails startup, naming it; a failure to read gets the gate's bounded
-    /// retries.
+    /// Startup check after the contract major: every table and column that
+    /// consuming a message writes or reads resolves through the connection's
+    /// search_path, as the adapter's statements resolve them. Anything that
+    /// does not fails startup, naming it; a failure to read gets the gate's
+    /// bounded retries.
     /// </summary>
     internal async Task VerifyStoreColumnsAsync(CancellationToken cancellationToken)
     {
@@ -210,8 +207,9 @@ public sealed class PlatformMessageStore
         if (missing.Count > 0)
         {
             throw new InvalidOperationException(
-                $"The Message Store lacks what this adapter writes: {string.Join(", ", missing)}. " +
-                $"Refusing to start: every message would fail to record. Provision the store schema for contract major {SupportedContractMajor} completely.");
+                $"Message Store tables or columns that consuming writes or reads could not be resolved: {string.Join(", ", missing)}. " +
+                "Refusing to start: each message would fail to record. Check that the store schema for contract major " +
+                $"{SupportedContractMajor} is provisioned completely, and the connection's search_path and its schema USAGE grant.");
         }
 
         logger.LogInformation("Message Store tables and columns verified.");
