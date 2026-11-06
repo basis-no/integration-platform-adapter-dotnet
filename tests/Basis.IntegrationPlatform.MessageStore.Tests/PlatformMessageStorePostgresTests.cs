@@ -153,6 +153,13 @@ public sealed class PlatformMessageStorePostgresTests
         Assert.AreEqual(1, runs);
         Assert.AreEqual("DELIVERED", await StepStatusAsync(dataSource, $"{messageId}:post-order"));
         Assert.AreEqual("FAILED", observations.Snapshot(messageId).Single().Status);
+
+        // A failure on a key with no row writes none either.
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => noopSteps.ExecuteAsync(
+            message, "post-invoice", "https://target.example/invoices", "target",
+            _ => throw new InvalidOperationException("synthetic receiver failure"),
+            CancellationToken.None));
+        Assert.IsNull(await StepStatusAsync(dataSource, $"{messageId}:post-invoice"));
     }
 
     [TestMethod]
