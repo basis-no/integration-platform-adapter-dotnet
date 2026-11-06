@@ -129,6 +129,33 @@ public sealed class PlatformMessageStorePostgresTests
     }
 
     [TestMethod]
+    public async Task NoopStepStoreNeitherReadsNorWritesAnExistingLedgerRow()
+    {
+        var connectionString = RequireConnectionString();
+        var postgres = CreateOptions(connectionString);
+        var noop = CreateOptions(connectionString);
+        noop.StepOutcomeStore = PlatformMessageStoreOptions.StepOutcomeStoreNoop;
+        var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+        await using var dataSource = NpgsqlDataSource.Create(connectionString);
+        var (_, postgresSteps, _, _) = CreateStore(dataSource, postgres);
+        var message = CreateMessage(messageId, postgres);
+        await postgresSteps.ExecuteAsync(message, "post-order", "https://target.example/orders", "target", _ => Task.CompletedTask, CancellationToken.None);
+        var (_, noopSteps, observations, _) = CreateStore(dataSource, noop);
+        var runs = 0;
+
+        // DELIVERED is in the ledger, yet noop runs the step; its failure is
+        // observed but not written over the row.
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => noopSteps.ExecuteAsync(
+            message, "post-order", "https://target.example/orders", "target",
+            _ => { runs++; throw new InvalidOperationException("synthetic receiver failure"); },
+            CancellationToken.None));
+
+        Assert.AreEqual(1, runs);
+        Assert.AreEqual("DELIVERED", await StepStatusAsync(dataSource, $"{messageId}:post-order"));
+        Assert.AreEqual("FAILED", observations.Snapshot(messageId).Single().Status);
+    }
+
+    [TestMethod]
     public async Task NoopStepStoreRefusesARedoRequestBeforeAnyAuditRowOrProduce()
     {
         var connectionString = RequireConnectionString();
