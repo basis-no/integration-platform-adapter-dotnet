@@ -67,15 +67,37 @@ public sealed class PlatformStepObservationCollector
     }
 
     /// <summary>
-    /// True when the current handler invocation already delivered or skipped
-    /// this idempotency key, so a further call with it is skipped as well.
+    /// How the current handler invocation already used this idempotency key,
+    /// so a further call with it is skipped. Without a known invocation start,
+    /// every observation of the message counts, and none proves a delivery by
+    /// the same invocation.
     /// </summary>
-    internal bool CompletedInCurrentInvocation(string messageId, string idempotencyKey)
+    internal StepKeyReuse ReuseInCurrentInvocation(string messageId, string idempotencyKey)
     {
-        var start = invocationStarts.TryGetValue(messageId, out var index) ? index : 0;
-        return Snapshot(messageId)
-            .Skip(start)
-            .Any(observation => string.Equals(observation.IdempotencyKey, idempotencyKey, StringComparison.Ordinal)
-                && observation.Status is "DELIVERED" or "SKIPPED");
+        var bounded = invocationStarts.TryGetValue(messageId, out var start);
+        var earlier = Snapshot(messageId)
+            .Skip(bounded ? start : 0)
+            .Where(observation => string.Equals(observation.IdempotencyKey, idempotencyKey, StringComparison.Ordinal)
+                && observation.Status is "DELIVERED" or "SKIPPED")
+            .ToList();
+        if (earlier.Count == 0)
+        {
+            return StepKeyReuse.None;
+        }
+
+        return bounded && earlier.Any(observation => observation.Status == "DELIVERED")
+            ? StepKeyReuse.AfterDeliveryInThisInvocation
+            : StepKeyReuse.Repeated;
     }
+}
+
+internal enum StepKeyReuse
+{
+    None,
+
+    /// <summary>Used before, but this invocation delivered nothing with it, as on a replay.</summary>
+    Repeated,
+
+    /// <summary>This handler invocation delivered the key, so this call's item is not sent.</summary>
+    AfterDeliveryInThisInvocation,
 }

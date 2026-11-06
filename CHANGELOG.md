@@ -26,10 +26,12 @@
   header names, `x-bip-*` and `Idempotency-Key` are kept. The rule matches the
   Camel adapter. Version 0.3.1 forwards them unmasked.
 
-- Warn when the step executor skips a step for a reason the integration
-  probably did not intend: the same handler invocation already ran that step id
-  (several items sent through one step id deliver only the first), or the
-  message id is journaled by another integration. Step keys are
+- Log when the step executor skips a step for a reason the integration
+  probably did not intend. When the same handler invocation already delivered
+  that step id (several items sent through one step id deliver only the first),
+  each skipped call logs an ERROR, as the Camel adapter does. A repeat of a step
+  id an earlier attempt delivered, and a message id journaled by another
+  integration, log a warning. Step keys are
   `<message-id>:<step-id>` and `bip_step_outcome` has no integration column, so
   a message id shared with another integration that uses an equal step id skips
   the delivery. The skip is unchanged; the README describes how to choose step
@@ -46,11 +48,13 @@
   releases are affected.
 
 - Step endpoint URIs are recorded without credentials. `bip_step_outcome` and
-  `steps_json` kept the URI given to the step executor as is. Its user info
-  and the values of credential-like query parameters, such as `code`, `sig`,
-  `api_key` or `access_token`, are now masked as `xxxxxx`; only the recorded
-  copy is masked. Rows written earlier are unchanged. The Camel adapter masks
-  step endpoint URIs too. All 0.3.x releases are affected.
+  `steps_json` kept the URI given to the step executor as is. They are now
+  masked first by the Camel adapter's rule, so both adapters record the same
+  value for every credential that adapter masks, including the user name,
+  login and client id parameters it treats as sensitive. This adapter also
+  masks the whole user info and the values of further credential-like query
+  parameters, such as `code` and `sig`, as `xxxxxx`; only the recorded copy is
+  masked. Rows written earlier are unchanged. All 0.3.x releases are affected.
 
 - Resend refuses a message journaled by another integration. On a shared
   Message Store, `POST /admin/messages/{messageId}/resend` replayed any stored
@@ -59,9 +63,11 @@
   before any audit row or produce, as the Camel adapter does. All 0.3.x
   releases are affected.
 
-- A replay records a new inline payload expiry, so each replay extends payload
-  retention from the time it was processed. This is current behaviour, now
-  pinned by a test.
+- Replay renews inline payload expiry only up to first receipt plus twice the
+  configured retention, matching the Camel adapter. Both the summary and new
+  attempt use the cap; earlier attempts keep their expiry. First receipt is
+  the earliest attempt recorded by this integration. Re-consuming that earliest
+  attempt rewrites its receipt time and can move the cap; replay cannot.
 
 ## 0.3.0
 
