@@ -1149,6 +1149,67 @@ public sealed class PlatformMessageStorePostgresTests
     }
 
     [TestMethod]
+    public async Task StepFailureCaughtOutsideTheStepStaysFailedAndRunsAgainOnResend()
+    {
+        var connectionString = RequireConnectionString();
+        var options = CreateOptions(connectionString);
+        options.MaxHandlerAttempts = 2;
+        options.HandlerRetryDelayMs = 0;
+        var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+        await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+        var (store, steps, observations, _) = CreateStore(dataSource, options);
+        var producer = new FakeProducer();
+        var receiverFails = true;
+        var sends = 0;
+
+        // A helper that is not itself a step catches the failed send, and the
+        // handler parks the message. The step recorded its own failure before
+        // the catch, so it stays FAILED and a resend sends again.
+        async Task<string?> PostOrderAsync(PlatformMessage message, CancellationToken cancellationToken)
+        {
+            try
+            {
+                await steps.ExecuteAsync(message, "post-order", "https://target.example/orders", "target", _ =>
+                {
+                    sends++;
+                    return receiverFails
+                        ? throw new HttpRequestException("Response status code does not indicate success: 500 (Internal Server Error).")
+                        : Task.CompletedTask;
+                }, cancellationToken);
+                return null;
+            }
+            catch (HttpRequestException ex)
+            {
+                return ex.Message;
+            }
+        }
+
+        var handler = new DelegateHandler(async (message, cancellationToken) =>
+            await PostOrderAsync(message, cancellationToken) is { } error
+                ? PlatformMessageResult.Failed(error)
+                : PlatformMessageResult.Completed());
+        var service = CreateConsumerService(handler, store, observations, producer, options);
+
+        await service.ProcessAsync(CreateMessage(messageId, options), () => { }, CancellationToken.None);
+
+        Assert.AreEqual(2, sends, "The in-process retry sends again.");
+        Assert.AreEqual("DLQ", await LogStatusAsync(dataSource, messageId));
+        Assert.AreEqual("FAILED", await StepStatusAsync(dataSource, $"{messageId}:post-order"));
+        CollectionAssert.AreEqual(new[] { "post-order FAILED", "post-order FAILED" }, await ObservedStepsAsync(dataSource, messageId, 1));
+
+        var replay = await store.ReplayAsync(messageId, new MessageReplayRequest("operator", "resend"), producer, CancellationToken.None);
+        Assert.AreEqual("PUBLISHED", replay.Status);
+        receiverFails = false;
+        var resent = producer.Produced.Single(produced => produced.Topic == options.InputTopic).Message;
+        await service.ProcessAsync(PlatformMessageConsumerService.ToPlatformMessage(resent, options), () => { }, CancellationToken.None);
+
+        Assert.AreEqual(3, sends, "The resend runs the failed step again.");
+        Assert.AreEqual("COMPLETED", await LogStatusAsync(dataSource, messageId));
+        Assert.AreEqual("DELIVERED", await StepStatusAsync(dataSource, $"{messageId}:post-order"));
+        CollectionAssert.AreEqual(new[] { "post-order DELIVERED" }, await ObservedStepsAsync(dataSource, messageId, 2));
+    }
+
+    [TestMethod]
     public async Task StepEndpointCredentialsAreMaskedInTheLedgerAndTheAttempt()
     {
         const string endpoint =
@@ -1285,6 +1346,39 @@ public sealed class PlatformMessageStorePostgresTests
         await using var command = new NpgsqlCommand("select status from bip_message_log where message_id = @message_id", connection);
         command.Parameters.AddWithValue("message_id", messageId);
         return await command.ExecuteScalarAsync() as string;
+    }
+
+    private static async Task<string?> StepStatusAsync(NpgsqlDataSource dataSource, string idempotencyKey)
+    {
+        await using var connection = await dataSource.OpenConnectionAsync();
+        await using var command = new NpgsqlCommand("select status from bip_step_outcome where idempotency_key = @idempotency_key", connection);
+        command.Parameters.AddWithValue("idempotency_key", idempotencyKey);
+        return await command.ExecuteScalarAsync() as string;
+    }
+
+    /// <summary>The steps_json entries of one attempt, in order, as "step status".</summary>
+    private static async Task<string[]> ObservedStepsAsync(NpgsqlDataSource dataSource, string messageId, int attempt)
+    {
+        await using var connection = await dataSource.OpenConnectionAsync();
+        await using var command = new NpgsqlCommand(
+            """
+            select (observed.step ->> 'step') || ' ' || (observed.step ->> 'status')
+            from bip_message_attempt,
+                 jsonb_array_elements(steps_json) with ordinality as observed(step, position)
+            where message_id = @message_id and attempt = @attempt
+            order by observed.position
+            """,
+            connection);
+        command.Parameters.AddWithValue("message_id", messageId);
+        command.Parameters.AddWithValue("attempt", attempt);
+        var steps = new List<string>();
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            steps.Add(reader.GetString(0));
+        }
+
+        return [.. steps];
     }
 
     private sealed class DelegateHandler(Func<PlatformMessage, CancellationToken, Task<PlatformMessageResult>> handle) : IPlatformMessageHandler
