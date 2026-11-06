@@ -26,9 +26,9 @@ The adapter owns the message-store mechanics of a .NET integration:
   in `bip_message_attempt.steps_json`
 - records idempotent external step outcomes in `bip_step_outcome`. The
   recorded endpoint URI, there and in `steps_json`, has its user info and the
-  values of credential-like query parameters masked as `xxxxxx` (the DLQ
-  header rule below, plus `key`, `code`, `sig`, `pwd`, passphrase, passcode
-  and private, access or account key). Only the recorded copy is masked
+  values of credential-like query parameters masked as `xxxxxx`, at least as
+  the Camel adapter masks it (see the step section below). Only the recorded
+  copy is masked
 - stores replayable payload bytes in Postgres under the payload policy
   (`replayable` = payload captured, not expired, not deleted — independent
   of message status)
@@ -143,6 +143,24 @@ That warning reads `bip_message_log`. Where row-level security limits
 each integration to its own rows, the other integration's row is hidden, so that
 warning never fires there.
 If the read fails, the step is still skipped and the check is logged at debug.
+
+The endpoint URI a step records is masked first the way the Camel adapter
+masks it, so both adapters record the same value for every credential that
+adapter masks:
+
+- the password in the user info (`https://user:xxxxxx@host`);
+- the value of a query parameter whose name contains, in any case, one of the
+  option names Camel 4.18 treats as sensitive, such as `password`,
+  `passphrase`, `secret`, `token`, `user`, `login`, `clientid`, `apikey`,
+  `api_key` or `privatekey`. The value is masked up to the next `&`, a
+  fragment included, and a `RAW(...)` or `RAW{...}` value as a whole.
+
+This adapter then masks more: the whole user info (`https://xxxxxx@host`, also
+when it holds only a token), and the values of query parameters named by the
+DLQ header rule above, named `key`, `code`, `sig` or `pwd`, or containing
+passphrase, passcode, privatekey, accesskey, accountkey or connectionstring.
+A URI the patterns cannot mask within a second is recorded as `xxxxxx`. The
+operation calls the URI it was given; rows written earlier are unchanged.
 
 ## Required Runtime Environment
 
