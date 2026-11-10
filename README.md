@@ -207,8 +207,8 @@ Camel adapter, whose library default is `noop`; this adapter's default stays
 `postgres`.
 
 Switching from `noop` back to `postgres` keeps the rows written before the
-`noop` period: a step delivered then is skipped on a later replay, even if it
-ran again and failed under `noop`. Name such a step in `redoSteps` to run it.
+`noop` period: a step delivered before the `noop` period is skipped on a later
+replay, even if it ran again and failed under `noop`. Name such a step in `redoSteps` to run it.
 
 ## Payload policy
 
