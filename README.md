@@ -61,8 +61,11 @@ The adapter owns the message-store mechanics of a .NET integration:
   `bip_step_outcome` with the `postgres` step outcome store, and
   `bip_message_replay_audit` when the application maps the resend endpoint.
   Otherwise it refuses to start, instead of failing every message, and names
-  each missing table and column with the statement that adds it. It does not
-  compare types, defaults or check constraints
+  each missing table and column with the statements that add it: a missing
+  table with its indexes, and a column that must have a value in two steps,
+  so it can be added to a table with rows. Check the `search_path` and the
+  schema's `USAGE` grant first, so the statements don't create a second set
+  of tables. It does not compare types, defaults or check constraints
 
 ## Integration Usage
 
@@ -91,17 +94,23 @@ public sealed class MyMessageHandler : IPlatformMessageHandler
         PlatformMessage message,
         CancellationToken cancellationToken)
     {
-        await steps.ExecuteAsync(
+        await steps.ExecuteWithContextAsync(
             message,
             stepId: "target-system",
             endpointUri: "https://target.example/api/orders",
             targetRef: message.TargetSystem,
-            operation: async ct =>
+            operation: async (step, ct) =>
             {
-                using var content = new ByteArrayContent(message.Payload);
-                content.Headers.ContentType = MediaTypeHeaderValue.Parse(message.ContentType);
-                using var response = await httpClients.CreateClient("target-system")
-                    .PostAsync("api/orders", content, ct);
+                using var request = new HttpRequestMessage(HttpMethod.Post, "api/orders")
+                {
+                    Content = new ByteArrayContent(message.Payload),
+                };
+                request.Content.Headers.ContentType = MediaTypeHeaderValue.Parse(message.ContentType);
+                // The step's stable key lets the receiver deduplicate. The
+                // Camel adapter sends it under both names.
+                request.Headers.Add("Idempotency-Key", step.IdempotencyKey);
+                request.Headers.Add("x-bip-idempotency-key", step.IdempotencyKey);
+                using var response = await httpClients.CreateClient("target-system").SendAsync(request, ct);
                 // HttpClient returns a 4xx or 5xx response without throwing.
                 response.EnsureSuccessStatusCode();
             },
@@ -127,6 +136,14 @@ the handler and then parks the message.
 The step key is `<message-id>:<step-id>`, and a step whose key is already
 `DELIVERED` in `bip_step_outcome` is skipped, unless the message's
 `x-bip-redo-steps` header (a JSON array of step ids or step keys) names it.
+`ExecuteWithContextAsync` passes the operation a `PlatformStepExecutionContext`
+before the call, with `StepId` and `IdempotencyKey`, the key
+`bip_step_outcome` records. The key is stable across redelivery, replay and
+explicit redo. Send it to the receiver, as in the example, so the receiver can
+deduplicate a call it already applied: after a crash between the call and the
+ledger write, and on a redo, which sends the same key. `ExecuteAsync`, whose
+operation receives only the cancellation token, works as before.
+
 Choose step ids with that in mind:
 
 - Give every external call its own step id. A handler that sends several items
@@ -271,6 +288,50 @@ within a partition, so:
   it out. This adapter's producer uses the .NET Kafka client's default
   partitioner (`consistent_random`, CRC32), which can place a key on a
   different partition than the Java client's default (`murmur2`).
+
+## Kafka activity metrics
+
+From 0.4, admission activity is enabled by default. The adapter exports through
+`System.Diagnostics.Metrics` under the meter name
+`Basis.IntegrationPlatform.MessageStore`. Subscribe to that meter in the
+application's exporter (for example OpenTelemetry); the adapter adds no metrics
+endpoint or exporter dependency.
+
+| Metric | Labels | Meaning |
+| --- | --- | --- |
+| `integration_traffic_events_total` | `signal` | Process-local count for `record_admitted` or `record_published` while supported |
+| `integration_traffic_signal_supported` | `signal` | `1` for a selected, supported signal; `0` means unknown coverage |
+| `integration_traffic_process_start_time_seconds` | none | Process start time as Unix seconds |
+
+`record_admitted` counts every input record handed to processing, including
+Kafka redeliveries, once per consumed delivery. In-process handler retries do
+not add admissions. This measures Kafka activity, not business completion or
+unique messages.
+
+`BASIS_TRAFFIC_SIGNALS` is a comma-separated selection of `record_admitted` and
+`record_published`; its default is `record_admitted`. Set it to an empty string
+to disable both; the adapter then registers no instruments. Publication is
+opt-in: select `record_published` and set `BASIS_TRAFFIC_INPUT_TOPICS` to the
+exact, comma-separated destination topics that count (no wildcards). Only
+broker-acknowledged records sent through the adapter's registered
+`IProducer<string, byte[]>` count, including callback-based sends. Failed and
+unacknowledged sends add nothing. Application-owned producers are outside this
+coverage, and so is a producer built from the registered producer's `Handle`
+(`DependentProducerBuilder`); replacing the registered producer leaves
+publication unsupported. DLQ and replay sends count only if their destination
+is listed.
+
+Unselected signals, invalid signal names or topic lists, a missing producer or
+consumer boundary, and ambiguous acknowledgement metadata report `supported=0`.
+Transactional sends and cancellation before an observed ACK also make
+publication coverage unknown, and so does admission of a record from a topic
+other than `APP_KAFKA_INPUT_TOPIC` (as with a regex subscription). Coverage
+that becomes unknown stays unknown until the process restarts, and the adapter
+logs a warning naming the signal the first time. Unknown coverage and absent
+metrics must never be interpreted as zero traffic. Counters reset when the
+process restarts; no topic, message, integration, payload or header values
+become metric labels. Options `TrafficSignals` and `TrafficInputTopics` can
+also be set in registration.
 
 ## Publish
 

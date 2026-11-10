@@ -14,6 +14,25 @@
   version must be brought up to date before upgrading; while the new version
   refuses to start, a rolling update keeps the previous one running.
 
+- Export Kafka activity through `System.Diagnostics.Metrics` (meter
+  `Basis.IntegrationPlatform.MessageStore`), with the same metric names and
+  signal labels as the Camel adapter. `BASIS_TRAFFIC_SIGNALS` selects the
+  signals: `record_admitted` is on by default, an empty value turns export
+  off, and `record_published` also needs `BASIS_TRAFFIC_INPUT_TOPICS`. A
+  signal that is not selected or cannot be counted reports `supported=0`, and
+  the adapter logs once when coverage becomes unknown. The registered
+  `IProducer<string, byte[]>` is now a wrapper that forwards every call to the
+  Kafka producer and observes acknowledgements. No metrics endpoint, exporter
+  dependency, schema change or message data in labels.
+
+- `IPlatformStepExecutor.ExecuteWithContextAsync` passes the operation a
+  `PlatformStepExecutionContext` with the step's idempotency key and step id
+  before the call. Send the key as `Idempotency-Key` and
+  `x-bip-idempotency-key`, as the Camel adapter does, so the receiver can
+  deduplicate a redelivery, a replay or a redo of a call it already applied.
+  `ExecuteAsync`, and implementations of `IPlatformStepExecutor` written
+  against it, keep working unchanged.
+
 - `BASIS_MESSAGE_STORE_STEP_OUTCOME_STORE` selects the step outcome store, as
   in the Camel adapter: `postgres` (the default, as before) or `noop`. With
   `noop`, every step runs on every delivery and replay, nothing is read from

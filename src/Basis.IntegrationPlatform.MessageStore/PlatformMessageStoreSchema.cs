@@ -52,27 +52,27 @@ internal static partial class PlatformMessageStoreSchema
     }
 
     /// <summary>
-    /// The statement that adds a missing column. A column that must have a
-    /// value but has no default can't be added to a table with rows in one
-    /// step, so it is added without the requirement, to be filled in before
-    /// the requirement is set.
+    /// The statement that adds a missing column, and the follow-up statement
+    /// to run once existing rows have a value. A column that must have a value
+    /// but has no default can't be added to a table with rows in one step, so
+    /// it is added without the requirement, which the follow-up sets.
     /// </summary>
-    internal static string AddColumnStatement(string table, string definition)
+    internal static (string Statement, string? FollowUp) AddColumnStatement(string table, string definition)
     {
         var column = definition.Split(' ', 2)[0];
         if (PrimaryKey().IsMatch(definition))
         {
-            return $"alter table {table} add column if not exists {PrimaryKey().Replace(definition, string.Empty, 1)}; " +
-                   $"then give existing rows unique values and run: alter table {table} add primary key ({column})";
+            return ($"alter table {table} add column if not exists {PrimaryKey().Replace(definition, string.Empty, 1)}",
+                $"alter table {table} add primary key ({column})");
         }
 
         if (!NotNull().IsMatch(definition) || Default().IsMatch(definition))
         {
-            return $"alter table {table} add column if not exists {definition}";
+            return ($"alter table {table} add column if not exists {definition}", null);
         }
 
-        return $"alter table {table} add column if not exists {NotNull().Replace(definition, string.Empty, 1)}; " +
-               $"then give existing rows a value and run: alter table {table} alter column {column} set not null";
+        return ($"alter table {table} add column if not exists {NotNull().Replace(definition, string.Empty, 1)}",
+            $"alter table {table} alter column {column} set not null");
     }
 
     /// <summary>Column name to its definition, per table, from the create table statements.</summary>
@@ -107,7 +107,15 @@ internal static partial class PlatformMessageStoreSchema
             }
 
             var tableName = create.Groups[1].Value.ToLowerInvariant();
-            tables[tableName] = new ShippedTable(tableName, columns, Whitespace().Replace(text[create.Index..end].Trim(), " "));
+            tables[tableName] = new ShippedTable(tableName, columns, Whitespace().Replace(text[create.Index..end].Trim(), " "), []);
+        }
+
+        foreach (Match index in CreateIndex().Matches(text))
+        {
+            if (tables.TryGetValue(index.Groups[1].Value.ToLowerInvariant(), out var table))
+            {
+                tables[table.Name] = table with { IndexStatements = [.. table.IndexStatements, Whitespace().Replace(index.Value.Trim(), " ")] };
+            }
         }
 
         return tables;
@@ -148,6 +156,9 @@ internal static partial class PlatformMessageStoreSchema
     [GeneratedRegex(@"create\s+table\s+(?:if\s+not\s+exists\s+)?([a-z_][a-z0-9_]*)\s*\(", RegexOptions.IgnoreCase)]
     private static partial Regex CreateTable();
 
+    [GeneratedRegex(@"create\s+(?:unique\s+)?index\s+(?:if\s+not\s+exists\s+)?[a-z_][a-z0-9_]*\s+on\s+([a-z_][a-z0-9_]*)\s*\([^;]*\)", RegexOptions.IgnoreCase)]
+    private static partial Regex CreateIndex();
+
     [GeneratedRegex(@"--[^\n]*")]
     private static partial Regex LineComment();
 
@@ -164,5 +175,9 @@ internal static partial class PlatformMessageStoreSchema
     private static partial Regex Default();
 }
 
-/// <summary>A table of the shipped store schema: its columns in order, with their definitions, and its create statement.</summary>
-internal sealed record ShippedTable(string Name, IReadOnlyList<KeyValuePair<string, string>> Columns, string CreateStatement);
+/// <summary>A table of the shipped store schema: its columns in order, with their definitions, and its create and index statements.</summary>
+internal sealed record ShippedTable(
+    string Name,
+    IReadOnlyList<KeyValuePair<string, string>> Columns,
+    string CreateStatement,
+    IReadOnlyList<string> IndexStatements);

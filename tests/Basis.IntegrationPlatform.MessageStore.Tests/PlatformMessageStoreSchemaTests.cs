@@ -85,19 +85,34 @@ public sealed class PlatformMessageStoreSchemaTests
     public void AddColumnStatementDefersARequirementExistingRowsCannotMeet()
     {
         Assert.AreEqual(
-            "alter table bip_message_log add column if not exists payload_deleted_at timestamptz",
+            ("alter table bip_message_log add column if not exists payload_deleted_at timestamptz", (string?)null),
             PlatformMessageStoreSchema.AddColumnStatement("bip_message_log", "payload_deleted_at timestamptz"));
         Assert.AreEqual(
-            "alter table bip_message_log add column if not exists replayable boolean not null default false",
+            ("alter table bip_message_log add column if not exists replayable boolean not null default false", (string?)null),
             PlatformMessageStoreSchema.AddColumnStatement("bip_message_log", "replayable boolean not null default false"));
         Assert.AreEqual(
-            "alter table bip_message_log add column if not exists last_attempt integer; " +
-            "then give existing rows a value and run: alter table bip_message_log alter column last_attempt set not null",
+            ("alter table bip_message_log add column if not exists last_attempt integer",
+                (string?)"alter table bip_message_log alter column last_attempt set not null"),
             PlatformMessageStoreSchema.AddColumnStatement("bip_message_log", "last_attempt integer not null"));
         Assert.AreEqual(
-            "alter table bip_message_log add column if not exists message_id text; " +
-            "then give existing rows unique values and run: alter table bip_message_log add primary key (message_id)",
+            ("alter table bip_message_log add column if not exists message_id text",
+                (string?)"alter table bip_message_log add primary key (message_id)"),
             PlatformMessageStoreSchema.AddColumnStatement("bip_message_log", "message_id text primary key"));
+    }
+
+    [TestMethod]
+    public void EachShippedTableKeepsItsIndexes()
+    {
+        CollectionAssert.AreEqual(
+            new[]
+            {
+                "create index if not exists bip_message_attempt_message_id_idx on bip_message_attempt (message_id)",
+                "create index if not exists bip_message_attempt_integration_status_idx on bip_message_attempt (integration, status)",
+            },
+            PlatformMessageStoreSchema.Tables[PlatformMessageStoreSchema.MessageAttemptTable].IndexStatements.ToArray());
+        Assert.AreEqual(4, PlatformMessageStoreSchema.Tables[PlatformMessageStoreSchema.MessageLogTable].IndexStatements.Count);
+        Assert.AreEqual(2, PlatformMessageStoreSchema.Tables[PlatformMessageStoreSchema.ReplayAuditTable].IndexStatements.Count);
+        Assert.AreEqual(2, PlatformMessageStoreSchema.Tables[PlatformMessageStoreSchema.StepOutcomeTable].IndexStatements.Count);
     }
 
     [TestMethod]

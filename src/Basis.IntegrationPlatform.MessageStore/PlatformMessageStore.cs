@@ -180,19 +180,26 @@ public sealed class PlatformMessageStore
 
         var missing = new List<string>();
         var statements = new List<string>();
+        var followUps = new List<string>();
         foreach (var table in required)
         {
             if (!present.TryGetValue(table.Name, out var columns))
             {
                 missing.Add($"table {table.Name}");
                 statements.Add(table.CreateStatement);
+                statements.AddRange(table.IndexStatements);
                 continue;
             }
 
             foreach (var (column, definition) in table.Columns.Where(column => !columns.Contains(column.Key)))
             {
                 missing.Add($"{table.Name}.{column}");
-                statements.Add(PlatformMessageStoreSchema.AddColumnStatement(table.Name, definition));
+                var (statement, followUp) = PlatformMessageStoreSchema.AddColumnStatement(table.Name, definition);
+                statements.Add(statement);
+                if (followUp is not null)
+                {
+                    followUps.Add(followUp);
+                }
             }
         }
 
@@ -201,8 +208,12 @@ public sealed class PlatformMessageStore
             throw new InvalidOperationException(
                 $"The Message Store lacks {string.Join(", ", missing)}, which this adapter uses. Refusing to start: " +
                 "each message would fail to record and be consumed again. The store was provisioned for an earlier " +
-                $"adapter version, or the connection's search_path or schema USAGE grant hides it. Bring it to the " +
-                $"store schema for contract major {SupportedContractMajor} before starting: {string.Join("; ", statements)}.");
+                "adapter version, or the connection's search_path or schema USAGE grant hides it; check those first, " +
+                "so the statements below don't create a second set of tables in another schema. Bring the store to the " +
+                $"store schema for contract major {SupportedContractMajor} before starting: {string.Join("; ", statements)}." +
+                (followUps.Count > 0
+                    ? $" Then give existing rows a value in each added column and run: {string.Join("; ", followUps)}."
+                    : string.Empty));
         }
 
         logger.LogInformation("Message Store tables and columns verified.");

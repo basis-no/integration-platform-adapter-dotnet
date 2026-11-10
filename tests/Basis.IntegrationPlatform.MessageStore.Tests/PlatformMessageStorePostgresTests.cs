@@ -297,6 +297,9 @@ public sealed class PlatformMessageStorePostgresTests
         Assert.IsFalse(request.Headers.Any(header => consumedNames.Contains(header.Name)), string.Join(", ", request.Headers.Select(header => header.Name)));
         Assert.IsFalse(request.Headers.Any(header => header.Value.Contains("synthetic-consumed", StringComparison.Ordinal)));
         Assert.IsFalse(request.Uri.Contains("synthetic-consumed", StringComparison.Ordinal));
+        CollectionAssert.IsSubsetOf(
+            new[] { ("Idempotency-Key", $"{messageId}:target-system"), ("x-bip-idempotency-key", $"{messageId}:target-system") },
+            request.Headers.ToArray());
         Assert.AreEqual("COMPLETED", await LogStatusAsync(provider.GetRequiredKeyedService<NpgsqlDataSource>(PlatformMessageStoreExtensions.MessageStoreDataSourceKey), messageId));
     }
 
@@ -339,21 +342,26 @@ public sealed class PlatformMessageStorePostgresTests
         Assert.IsFalse(headers.Any(header => Encoding.UTF8.GetString(header.GetValueBytes()).Contains("synthetic-consumed", StringComparison.Ordinal)));
     }
 
-    /// <summary>The README's handler: one step around a named client's call.</summary>
+    /// <summary>The README's handler: one step around a named client's call, keyed by the step.</summary>
     private sealed class ReadmePatternHandler(IPlatformStepExecutor steps, IHttpClientFactory httpClients) : IPlatformMessageHandler
     {
         public async Task<PlatformMessageResult> HandleAsync(PlatformMessage message, CancellationToken cancellationToken)
         {
-            await steps.ExecuteAsync(
+            await steps.ExecuteWithContextAsync(
                 message,
                 stepId: "target-system",
                 endpointUri: "https://target.example/api/orders",
                 targetRef: message.TargetSystem,
-                operation: async ct =>
+                operation: async (step, ct) =>
                 {
-                    using var content = new ByteArrayContent(message.Payload);
-                    content.Headers.ContentType = System.Net.Http.Headers.MediaTypeHeaderValue.Parse(message.ContentType);
-                    using var response = await httpClients.CreateClient("target-system").PostAsync("api/orders", content, ct);
+                    using var request = new HttpRequestMessage(HttpMethod.Post, "api/orders")
+                    {
+                        Content = new ByteArrayContent(message.Payload),
+                    };
+                    request.Content.Headers.ContentType = System.Net.Http.Headers.MediaTypeHeaderValue.Parse(message.ContentType);
+                    request.Headers.Add("Idempotency-Key", step.IdempotencyKey);
+                    request.Headers.Add("x-bip-idempotency-key", step.IdempotencyKey);
+                    using var response = await httpClients.CreateClient("target-system").SendAsync(request, ct);
                     response.EnsureSuccessStatusCode();
                 },
                 cancellationToken);
@@ -1195,7 +1203,54 @@ public sealed class PlatformMessageStorePostgresTests
                     () => store.VerifyStoreColumnsAsync(replay: true, CancellationToken.None));
                 StringAssert.Contains(error.Message, "lacks table bip_message_replay_audit,");
                 StringAssert.Contains(error.Message, "create table if not exists bip_message_replay_audit ( replay_id uuid primary key,");
+                StringAssert.Contains(error.Message, "create index if not exists bip_message_replay_audit_message_id_idx on bip_message_replay_audit (message_id);");
             });
+    }
+
+    [TestMethod]
+    public async Task StartupChecksTheReplayTablesForAnEndpointMappedWhileTheHostStarts()
+    {
+        // A Startup class maps its endpoints while the web host starts, after
+        // the consumer has started; the check waits for the host to start.
+        await WithStoreSchemaAsync(
+            """
+            create table {0}.bip_contract (like public.bip_contract including all);
+            insert into {0}.bip_contract select * from public.bip_contract;
+            create table {0}.bip_message_log (like public.bip_message_log including all);
+            create table {0}.bip_message_attempt (like public.bip_message_attempt including all);
+            create table {0}.bip_step_outcome (like public.bip_step_outcome including all);
+            """,
+            async connectionString =>
+            {
+                var options = CreateOptions(connectionString);
+                options.ContractGateMaxAttempts = 1;
+                await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+                var (store, _, observations, _) = CreateStore(dataSource, options);
+                var replayEndpoints = new PlatformReplayEndpoints();
+                var lifetime = new StartingLifetime();
+                using var service = new PlatformMessageConsumerService(
+                    new SyntheticHandler(), store, observations, new FakeProducer(), Options.Create(options),
+                    NullLogger<PlatformMessageConsumerService>.Instance, null, replayEndpoints, lifetime);
+
+                await service.StartAsync(CancellationToken.None);
+                await Task.Delay(200);
+                Assert.IsFalse(service.ExecuteTask!.IsCompleted, "The check waits for the host to start.");
+                replayEndpoints.Mapped = true;
+                lifetime.Started();
+
+                var error = await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => service.ExecuteTask!);
+                StringAssert.Contains(error.Message, "lacks table bip_message_replay_audit,");
+            });
+    }
+
+    private sealed class StartingLifetime : Microsoft.Extensions.Hosting.IHostApplicationLifetime
+    {
+        private readonly CancellationTokenSource started = new();
+        public CancellationToken ApplicationStarted => started.Token;
+        public CancellationToken ApplicationStopping => CancellationToken.None;
+        public CancellationToken ApplicationStopped => CancellationToken.None;
+        public void StopApplication() { }
+        public void Started() => started.Cancel();
     }
 
     [TestMethod]
@@ -1235,7 +1290,10 @@ public sealed class PlatformMessageStorePostgresTests
             create table {0}.bip_step_outcome (like public.bip_step_outcome including all);
             alter table {0}.bip_message_log drop column replay_disabled_reason;
             alter table {0}.bip_message_log drop column payload_deleted_at;
+            alter table {0}.bip_message_log drop column integration;
             alter table {0}.bip_step_outcome drop column target_ref;
+            insert into {0}.bip_message_log (message_id, schema_version, status, last_attempt, occurred_at)
+                values ('synthetic-existing-row', 1, 'COMPLETED', 1, now());
             """,
             async connectionString =>
             {
@@ -1251,23 +1309,37 @@ public sealed class PlatformMessageStorePostgresTests
 
                 StringAssert.Contains(
                     error.Message,
-                    "lacks bip_message_log.payload_deleted_at, bip_message_log.replay_disabled_reason, table bip_message_attempt, " +
+                    "lacks bip_message_log.payload_deleted_at, bip_message_log.replay_disabled_reason, bip_message_log.integration, " +
+                    "table bip_message_attempt, " +
                     "bip_step_outcome.target_ref, which this adapter uses. Refusing to start");
                 StringAssert.Contains(error.Message, "alter table bip_message_log add column if not exists replay_disabled_reason text");
                 StringAssert.Contains(error.Message, "alter table bip_step_outcome add column if not exists target_ref text");
                 Assert.IsFalse(error.Message.Contains("bip_message_replay_audit", StringComparison.Ordinal), error.Message);
                 Assert.AreEqual(0, handler.Calls.Count, "Nothing is consumed.");
 
-                // The printed statements bring the store to the shipped schema.
-                var marker = "before starting: ";
-                var statements = error.Message[(error.Message.IndexOf(marker, StringComparison.Ordinal) + marker.Length)..^1];
+                // The printed statements, then the follow-ups once the existing
+                // row has a value, bring the store to the shipped schema.
+                const string statementsMarker = "before starting: ";
+                const string followUpMarker = ". Then give existing rows a value in each added column and run: ";
+                var start = error.Message.IndexOf(statementsMarker, StringComparison.Ordinal) + statementsMarker.Length;
+                var followUpAt = error.Message.IndexOf(followUpMarker, StringComparison.Ordinal);
+                Assert.IsTrue(followUpAt > start, error.Message);
+                var statements = error.Message[start..followUpAt].Split("; ");
+                var followUps = error.Message[(followUpAt + followUpMarker.Length)..^1].Split("; ");
+                CollectionAssert.AreEqual(new[] { "alter table bip_message_log alter column integration set not null" }, followUps);
                 await using (var connection = await dataSource.OpenConnectionAsync())
                 {
-                    foreach (var statement in statements.Split("; "))
+                    foreach (var statement in statements
+                        .Append("update bip_message_log set integration = 'integration-e2e-dotnet' where integration is null")
+                        .Concat(followUps))
                     {
                         await using var apply = new NpgsqlCommand(statement, connection);
                         await apply.ExecuteNonQueryAsync();
                     }
+
+                    await using var indexes = new NpgsqlCommand(
+                        "select count(*) from pg_indexes where schemaname = current_schema() and tablename = 'bip_message_attempt'", connection);
+                    Assert.AreEqual(3L, await indexes.ExecuteScalarAsync(), "The primary key and both shipped indexes.");
                 }
 
                 await store.VerifyStoreColumnsAsync(replay: false, CancellationToken.None);
@@ -1789,6 +1861,118 @@ public sealed class PlatformMessageStorePostgresTests
 
         await Assert.ThrowsExactlyAsync<ConsumeException>(() => service.ConsumeAsync(consumer, stopping.Token));
         Assert.AreEqual(0, handler.Calls.Count);
+    }
+
+    [TestMethod]
+    public async Task ActivityCountsEachConsumedRedeliveryButNotInProcessRetries()
+    {
+        var options = CreateOptions(RequireConnectionString());
+        options.TrafficSignals = "record_admitted";
+        options.HandlerRetryDelayMs = 0;
+        var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+        await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+        var (store, _, observations, _) = CreateStore(dataSource, options);
+        using var capture = new TrafficCapture();
+        using var metrics = new PlatformTrafficMetrics(options);
+        var calls = 0;
+        var handler = new DelegateHandler((_, _) =>
+        {
+            capture.Collect();
+            Assert.AreEqual(calls < 3 ? 1 : 2, capture.Value("integration_traffic_events_total", "record_admitted"));
+            Assert.AreEqual(1, capture.Value("integration_traffic_signal_supported", "record_admitted"));
+            calls++;
+            return Task.FromResult(PlatformMessageResult.Failed("synthetic handler failure"));
+        });
+        var publications = 0;
+        var producer = new FakeProducer((_, _) =>
+        {
+            if (++publications == 1) throw new InvalidOperationException("synthetic DLQ failure forces redelivery");
+            return Task.CompletedTask;
+        });
+        var service = new PlatformMessageConsumerService(handler, store, observations, producer, Options.Create(options),
+            NullLogger<PlatformMessageConsumerService>.Instance, metrics) { FailureBackoff = TimeSpan.Zero };
+        using var stopping = new CancellationTokenSource();
+        var consumer = new FakeConsumer(stopping, ConsumeResultFor(messageId, 0, options), ConsumeResultFor(messageId, 0, options));
+        await service.ConsumeAsync(consumer, stopping.Token).WaitAsync(TimeSpan.FromSeconds(30));
+        capture.Collect();
+        Assert.AreEqual(2, capture.Value("integration_traffic_events_total", "record_admitted"));
+        Assert.AreEqual(0, capture.Value("integration_traffic_signal_supported", "record_admitted"), "A stopped consumer has unknown coverage.");
+        Assert.AreEqual(6, calls);
+        CollectionAssert.AreEqual(new long[] { 0 }, consumer.Seeks);
+        CollectionAssert.AreEqual(new long[] { 0 }, consumer.Commits);
+    }
+
+    [TestMethod]
+    public async Task StepContextSuppliesReceiverKeyBeforeCallAcrossRedeliveryReplayAndRedo()
+    {
+        var options = CreateOptions(RequireConnectionString());
+        await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+        var (_, executor, _, _) = CreateStore(dataSource, options);
+        IPlatformStepExecutor steps = executor;
+        var message = CreateMessage($"dotnet-test-{Guid.NewGuid():N}", options);
+        using var receiver = new IdempotentReceiver();
+        using var client = new HttpClient(receiver);
+        using var cancellation = new CancellationTokenSource();
+        var expectedKey = $"{message.MessageId}:deliver";
+        async Task Send(PlatformStepExecutionContext context, CancellationToken ct)
+        {
+            Assert.AreEqual("deliver", context.StepId);
+            Assert.AreEqual(expectedKey, context.IdempotencyKey);
+            Assert.AreEqual(cancellation.Token, ct);
+            using var request = new HttpRequestMessage(HttpMethod.Post, "https://target.example/orders");
+            request.Headers.Add("Idempotency-Key", context.IdempotencyKey);
+            using var response = await client.SendAsync(request, ct);
+            response.EnsureSuccessStatusCode();
+        }
+
+        // The receiver applied the first call, then the attempt failed.
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => steps.ExecuteWithContextAsync(
+            message, "deliver", "https://target.example/orders", "target", async (context, ct) =>
+            {
+                await Send(context, ct);
+                throw new InvalidOperationException("synthetic failure after receiver applied call");
+            }, cancellation.Token));
+        CollectionAssert.AreEqual(new[] { expectedKey }, receiver.Keys);
+        var delivered = await steps.ExecuteWithContextAsync(message, "deliver", "https://target.example/orders", "target", Send, cancellation.Token);
+        var replay = message with { Headers = new Dictionary<string, string> { ["x-bip-attempt"] = "2", ["x-bip-replay"] = "true" } };
+        var skipped = await steps.ExecuteWithContextAsync(replay, "deliver", "https://target.example/orders", "target", Send, cancellation.Token);
+        var redo = replay with { Headers = new Dictionary<string, string> { ["x-bip-attempt"] = "2", ["x-bip-replay"] = "true", ["x-bip-redo-steps"] = "[\"deliver\"]" } };
+        var redone = await steps.ExecuteWithContextAsync(redo, "deliver", "https://target.example/orders", "target", Send, cancellation.Token);
+        Assert.IsTrue(skipped.Skipped);
+        Assert.IsFalse(redone.Skipped);
+        Assert.AreEqual(expectedKey, delivered.IdempotencyKey);
+        Assert.AreEqual(expectedKey, skipped.IdempotencyKey);
+        Assert.AreEqual(expectedKey, redone.IdempotencyKey);
+        CollectionAssert.AreEqual(new[] { expectedKey, expectedKey, expectedKey }, receiver.Keys);
+        Assert.AreEqual(1, receiver.Applications, "A receiver can deduplicate retries and explicit redo with the stable key.");
+        await using var connection = await dataSource.OpenConnectionAsync();
+        await using var read = new NpgsqlCommand(
+            "select idempotency_key, step_id, status from bip_step_outcome where message_id = @id", connection);
+        read.Parameters.AddWithValue("id", message.MessageId);
+        await using var reader = await read.ExecuteReaderAsync();
+        Assert.IsTrue(await reader.ReadAsync());
+        Assert.AreEqual(receiver.Keys[0], reader.GetString(0));
+        Assert.AreEqual("deliver", reader.GetString(1));
+        Assert.AreEqual("DELIVERED", reader.GetString(2));
+        Assert.IsFalse(await reader.ReadAsync());
+    }
+
+    private sealed class IdempotentReceiver : HttpMessageHandler
+    {
+        public List<string> Keys { get; } = [];
+        public int Applications { get; private set; }
+        private readonly HashSet<string> applied = new(StringComparer.Ordinal);
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            var key = request.Headers.GetValues("Idempotency-Key").Single();
+            Keys.Add(key);
+            if (applied.Add(key))
+            {
+                Applications++;
+            }
+
+            return Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.OK));
+        }
     }
 
     [TestMethod]
