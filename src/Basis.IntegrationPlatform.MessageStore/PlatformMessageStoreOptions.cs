@@ -134,7 +134,7 @@ public sealed class PlatformMessageStoreOptions
     /// The registered producer's configuration. It partitions a keyed record
     /// with murmur2, as Java Kafka clients do, so a replay or a DLQ record
     /// with the same key lands where a Java producer puts that key; the
-    /// client's own default (consistent_random, CRC32) places it elsewhere.
+    /// client's own default (consistent_random, CRC32) can place it elsewhere.
     /// </summary>
     internal ProducerConfig CreateProducerConfig()
     {

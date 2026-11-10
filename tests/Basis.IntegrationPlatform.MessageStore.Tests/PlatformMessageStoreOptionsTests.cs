@@ -150,11 +150,9 @@ public sealed class PlatformMessageStoreOptionsTests
         // place a producer is constructed.
         var registration = File.ReadAllText(Path.Combine(RepositoryRoot(), "src", "Basis.IntegrationPlatform.MessageStore", "PlatformMessageStoreExtensions.cs"));
         StringAssert.Contains(registration, "options.BuildProducer()");
-        Assert.IsFalse(
-            Directory.GetFiles(Path.Combine(RepositoryRoot(), "src"), "*.cs", SearchOption.AllDirectories)
-                .Any(file => !file.EndsWith("PlatformMessageStoreOptions.cs", StringComparison.Ordinal)
-                    && File.ReadAllText(file).Contains("new ProducerBuilder", StringComparison.Ordinal)),
-            "Only PlatformMessageStoreOptions.BuildProducer constructs a producer.");
+        var builders = Directory.GetFiles(Path.Combine(RepositoryRoot(), "src"), "*.cs", SearchOption.AllDirectories)
+            .Sum(file => System.Text.RegularExpressions.Regex.Matches(File.ReadAllText(file), "ProducerBuilder<").Count);
+        Assert.AreEqual(1, builders, "Only PlatformMessageStoreOptions.BuildProducer builds a producer.");
     }
 
     private static string RepositoryRoot()

@@ -275,8 +275,8 @@ within a partition, so:
   same non-empty key and no explicit partition, and both producers hash keys
   the same way. Keep `x-bip-correlation-id` equal to the record key, or leave
   it out. The adapter's registered producer partitions a keyed record with
-  `murmur2_random` (murmur2 for a key, also an empty one; random for a null
-  key), as Java Kafka clients do, so a replay lands where a Java producer puts
+  `murmur2_random` (murmur2 for a key, also an empty one; a null key is spread
+  across partitions), as Java Kafka clients do, so a replay lands where a Java producer puts
   the same key, for a key that is UTF-8 text (the adapter reads keys as text).
   A topic written by .NET producers with the client's default
   (`consistent_random`, CRC32) places keys differently, and a producer that
