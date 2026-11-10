@@ -1943,7 +1943,8 @@ public sealed class PlatformMessageStorePostgresTests
     [TestMethod]
     public async Task DeliveredWriteThatKeepsFailingNeverRecordsFailed()
     {
-        await WithFailingLedgerAsync(failures: 100, async (dataSource, options) =>
+        // Every DELIVERED attempt fails; a further write would succeed and show.
+        await WithFailingLedgerAsync(failures: 3, async (dataSource, options) =>
         {
             var observations = new PlatformStepObservationCollector();
             var steps = LedgerTestExecutor(dataSource, observations);
@@ -2045,10 +2046,93 @@ public sealed class PlatformMessageStorePostgresTests
         });
     }
 
-    private static PlatformStepExecutor LedgerTestExecutor(NpgsqlDataSource dataSource, PlatformStepObservationCollector observations) =>
+    [TestMethod]
+    [DataRow("delivered-write")]
+    [DataRow("failed-write")]
+    [DataRow("handler-timeout")]
+    public async Task HandlerThatSwallowsALedgerWriteFailureIsNotRecordedCompleted(string path)
+    {
+        await WithFailingLedgerAsync(failures: path == "delivered-write" ? 3 : 100, async (dataSource, options) =>
+        {
+            var observations = new PlatformStepObservationCollector();
+            var store = new PlatformMessageStore(dataSource, observations, Options.Create(options), NullLogger<PlatformMessageStore>.Instance);
+            // The handler's own timeout ends the in-place retry of the DELIVERED write.
+            var steps = LedgerTestExecutor(dataSource, observations, path == "handler-timeout" ? TimeSpan.FromSeconds(5) : TimeSpan.Zero);
+            var sends = 0;
+            var handler = new DelegateHandler(async (message, ct) =>
+            {
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                timeout.CancelAfter(TimeSpan.FromMilliseconds(300));
+                try
+                {
+                    await steps.ExecuteAsync(message, "deliver", "https://target.example/orders", "target", _ =>
+                    {
+                        sends++;
+                        return path == "failed-write" ? throw new HttpRequestException("synthetic receiver failure") : Task.CompletedTask;
+                    }, path == "handler-timeout" ? timeout.Token : ct);
+                }
+                catch (Exception)
+                {
+                    // A generic catch, as the handler sees an optional step.
+                }
+
+                return PlatformMessageResult.Completed();
+            });
+            var producer = new FakeProducer();
+            using var service = CreateConsumerService(handler, store, observations, producer, options);
+            var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+            var committed = false;
+
+            await Assert.ThrowsExactlyAsync<InvalidOperationException>(
+                () => service.ProcessAsync(CreateMessage(messageId, options), () => committed = true, CancellationToken.None));
+
+            Assert.AreEqual(1, sends);
+            Assert.IsFalse(committed);
+            Assert.IsNull(await LogStatusAsync(dataSource, messageId), "Nothing is recorded COMPLETED.");
+            Assert.IsNull(await StepStatusAsync(dataSource, $"{messageId}:deliver"));
+            Assert.AreEqual(0, producer.Produced.Count, "Nothing is parked.");
+        });
+    }
+
+    [TestMethod]
+    public async Task HandlerThatSwallowsAFailedOperationStillCompletes()
+    {
+        await WithFailingLedgerAsync(failures: 0, async (dataSource, options) =>
+        {
+            var observations = new PlatformStepObservationCollector();
+            var store = new PlatformMessageStore(dataSource, observations, Options.Create(options), NullLogger<PlatformMessageStore>.Instance);
+            var steps = LedgerTestExecutor(dataSource, observations);
+            var handler = new DelegateHandler(async (message, ct) =>
+            {
+                try
+                {
+                    await steps.ExecuteAsync(message, "optional", "https://target.example/orders", "target",
+                        _ => throw new HttpRequestException("synthetic receiver failure"), ct);
+                }
+                catch (HttpRequestException)
+                {
+                    // The step is optional for this handler.
+                }
+
+                return PlatformMessageResult.Completed();
+            });
+            using var service = CreateConsumerService(handler, store, observations, new FakeProducer(), options);
+            var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+            var committed = false;
+
+            await service.ProcessAsync(CreateMessage(messageId, options), () => committed = true, CancellationToken.None);
+
+            Assert.IsTrue(committed);
+            Assert.AreEqual("COMPLETED", await LogStatusAsync(dataSource, messageId));
+            Assert.AreEqual("FAILED", await StepStatusAsync(dataSource, $"{messageId}:optional"));
+        });
+    }
+
+    private static PlatformStepExecutor LedgerTestExecutor(
+        NpgsqlDataSource dataSource, PlatformStepObservationCollector observations, TimeSpan? retryDelay = null) =>
         new(dataSource, observations, NullLogger<PlatformStepExecutor>.Instance)
         {
-            DeliveredWriteRetryDelay = TimeSpan.Zero,
+            DeliveredWriteRetryDelay = retryDelay ?? TimeSpan.Zero,
         };
 
     // Runs the test against a store in its own schema whose first `failures`

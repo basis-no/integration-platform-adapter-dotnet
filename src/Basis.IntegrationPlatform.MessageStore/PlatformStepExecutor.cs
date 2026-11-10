@@ -167,8 +167,10 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
                 && !ShouldRedo(message, stepId, idempotencyKey, logger)
                 && await WasDeliveredAsync(idempotencyKey, cancellationToken);
         }
-        catch (Exception ex) when (!IsCallerCancellation(ex, cancellationToken))
+        catch (Exception)
         {
+            // Also a cancellation: the token may be the handler's own timeout,
+            // and a handler that swallows it must not complete the message.
             NoteStoreFailure(message.MessageId);
             throw;
         }
@@ -188,20 +190,20 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
         {
             // A cancellation the caller did not request, such as an HttpClient
             // timeout, is a failed step like any other.
+            Observe(message.MessageId, stepId, Failed, idempotencyKey, recordedUri, targetRef, ex.Message);
             if (UsesStepLedger)
             {
                 try
                 {
                     await RecordAsync(message.MessageId, idempotencyKey, stepId, Failed, recordedUri, targetRef, ex.Message, cancellationToken);
                 }
-                catch (Exception recordFailure) when (!IsCallerCancellation(recordFailure, cancellationToken))
+                catch (Exception)
                 {
                     NoteStoreFailure(message.MessageId);
                     throw;
                 }
             }
 
-            Observe(message.MessageId, stepId, Failed, idempotencyKey, recordedUri, targetRef, ex.Message);
             throw;
         }
 
@@ -217,7 +219,11 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
         return new PlatformStepExecutionResult(idempotencyKey, stepId, Delivered, false);
     }
 
-    /// <summary>Attempts of the DELIVERED write before the store failure is thrown.</summary>
+    /// <summary>
+    /// Attempts of the DELIVERED write before the store failure is thrown.
+    /// With a hung store each attempt costs a command timeout, so this stays
+    /// small against the consumer's poll interval.
+    /// </summary>
     internal int DeliveredWriteAttempts { get; init; } = 3;
 
     /// <summary>Delay before the second DELIVERED write attempt; it grows with each attempt.</summary>
@@ -238,7 +244,13 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
                 await RecordAsync(messageId, idempotencyKey, stepId, Delivered, recordedUri, targetRef, null, cancellationToken);
                 return;
             }
-            catch (Exception ex) when (!IsCallerCancellation(ex, cancellationToken))
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                // Not recorded either; the handler's token may be its own timeout.
+                NoteStoreFailure(messageId);
+                throw;
+            }
+            catch (Exception ex)
             {
                 if (attempt >= Math.Max(1, DeliveredWriteAttempts))
                 {
@@ -260,7 +272,15 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
                     messageId,
                     stepId,
                     attempt);
-                await Task.Delay(DeliveredWriteRetryDelay * attempt, cancellationToken);
+                try
+                {
+                    await Task.Delay(DeliveredWriteRetryDelay * attempt, cancellationToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    NoteStoreFailure(messageId);
+                    throw;
+                }
             }
         }
     }
