@@ -49,9 +49,8 @@ The adapter owns the message-store mechanics of a .NET integration:
   integration journaled. A message of another integration on the same
   Message Store is refused with `409 NOT_REPLAYABLE` before any audit row or
   produce
-- republishes replay payloads back to the integration input topic
-  (`bip.<integration>.in`), committing the `REQUESTED` audit row before the
-  Kafka produce
+- republishes replay payloads to the replay topic (see Replay order),
+  committing the `REQUESTED` audit row before the Kafka produce
 - verifies the store schema major in `bip_contract` at startup and refuses
   to start on a mismatch (a missing or empty table logs a loud warning and
   the adapter assumes major 1). It then checks that every table it uses
@@ -171,8 +170,8 @@ Choose step ids with that in mind:
   skipped as already delivered. Use step ids unique across integrations, and
   when one integration produces for another, give the new message its own
   `x-bip-message-id` and carry continuity in `x-bip-correlation-id`, which
-  then also has to be the record key if replays should keep its partition
-  (see Replay order).
+  then also has to be the record key if a replay should land on the original
+  record's partition (see Replay order).
 
 When the step executor skips a step that the same handler invocation already
 delivered, it logs an ERROR, once per skipped call, with the step id and the
@@ -280,12 +279,13 @@ is captured, unexpired, and undeleted.
 
 A resend publishes a new record to the replay topic; it never returns to the
 original offset. The replay topic is
-`BASIS_MESSAGE_STORE_REPLAY_INPUT_TOPIC_PATTERN` with `%s` replaced by the
-integration name (default `bip.%s.in`). If `APP_KAFKA_INPUT_TOPIC` names
+`BASIS_MESSAGE_STORE_REPLAY_INPUT_TOPIC_PATTERN` with `%s` replaced by
+`APP_NAME` (default `bip.%s.in`). If `APP_KAFKA_INPUT_TOPIC` names
 another topic, set the pattern to match, or the replay is published to a topic
 this integration does not consume. The record's Kafka key is the message's
-correlation id: `x-bip-correlation-id`, else the original record's key when it
-has one (an empty key is kept as is), else the message id. A replay is
+correlation id: `x-bip-correlation-id` when it is not blank, else the key of
+the first recorded delivery when it has one (an empty key is kept as is), else
+the message id. A replay is
 appended after everything already published, and Kafka orders records only
 within a partition, so:
 
@@ -300,9 +300,13 @@ within a partition, so:
   same topic, the partition count is unchanged, the original record had the
   same non-empty key and no explicit partition, and both producers hash keys
   the same way. Keep `x-bip-correlation-id` equal to the record key, or leave
-  it out. This adapter's producer uses the .NET Kafka client's default
-  partitioner (`consistent_random`, CRC32), which can place a key on a
-  different partition than the Java client's default (`murmur2`).
+  it out. The adapter's registered producer partitions a keyed record with
+  `murmur2_random` (murmur2 for a key, also an empty one; a null key is spread
+  across partitions), as Java Kafka clients do, so a replay lands where a Java producer puts
+  the same key, for a key that is UTF-8 text (the adapter reads keys as text).
+  A topic written by .NET producers with the client's default
+  (`consistent_random`, CRC32) places keys differently, and a producer that
+  replaces the registered one partitions as it is configured.
 
 ## Kafka activity metrics
 
