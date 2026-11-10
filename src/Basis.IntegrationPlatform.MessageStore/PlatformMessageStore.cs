@@ -112,6 +112,113 @@ public sealed class PlatformMessageStore
         logger.LogInformation("Message-store contract major {ContractMajor} verified against bip_contract.", contractMajor);
     }
 
+    /// <summary>
+    /// Startup check after the contract major: every table of the shipped store
+    /// schema that this configuration uses, with every column, resolves
+    /// through the connection's search_path, as the adapter's statements
+    /// resolve them. The message tables are always required, bip_step_outcome
+    /// with the Postgres step outcome store and bip_message_replay_audit when
+    /// the resend endpoint is mapped. Anything missing fails startup, naming it
+    /// with the statement that adds it; a failure to read gets the gate's
+    /// bounded retries.
+    /// </summary>
+    internal async Task VerifyStoreColumnsAsync(bool replay, CancellationToken cancellationToken)
+    {
+        var required = PlatformMessageStoreSchema.Required(options.UsesStepLedger, replay);
+        var present = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                present.Clear();
+                await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
+                // pg_attribute lists every column of a table the search_path
+                // resolves, also one the role has no privilege on; to_regclass
+                // gives null for a table that does not resolve.
+                await using var command = new NpgsqlCommand(
+                    """
+                    select t.name, a.attname
+                    from unnest(@tables) as t(name)
+                    join pg_attribute a on a.attrelid = to_regclass(t.name) and a.attnum > 0 and not a.attisdropped
+                    """,
+                    connection);
+                command.Parameters.Add("tables", NpgsqlDbType.Array | NpgsqlDbType.Text).Value =
+                    required.Select(table => table.Name).ToArray();
+                await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+                while (await reader.ReadAsync(cancellationToken))
+                {
+                    var table = reader.GetString(0);
+                    if (!present.TryGetValue(table, out var columns))
+                    {
+                        present[table] = columns = new HashSet<string>(StringComparer.Ordinal);
+                    }
+
+                    columns.Add(reader.GetString(1));
+                }
+
+                break;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                if (attempt >= options.ContractGateMaxAttempts)
+                {
+                    throw new InvalidOperationException(
+                        $"Message Store column check could not read the store's tables after {attempt} attempts ({ex.Message}). " +
+                        "Refusing to start: fix grants/connectivity.",
+                        ex);
+                }
+
+                logger.LogInformation(
+                    "Message Store column check attempt {Attempt}/{MaxAttempts} failed ({Message}); retrying in {DelayMs} ms.",
+                    attempt,
+                    options.ContractGateMaxAttempts,
+                    ex.Message,
+                    options.ContractGateRetryDelayMs);
+                await Task.Delay(TimeSpan.FromMilliseconds(options.ContractGateRetryDelayMs), cancellationToken);
+            }
+        }
+
+        var missing = new List<string>();
+        var statements = new List<string>();
+        var followUps = new List<string>();
+        foreach (var table in required)
+        {
+            if (!present.TryGetValue(table.Name, out var columns))
+            {
+                missing.Add($"table {table.Name}");
+                statements.Add(table.CreateStatement);
+                statements.AddRange(table.IndexStatements);
+                continue;
+            }
+
+            foreach (var (column, definition) in table.Columns.Where(column => !columns.Contains(column.Key)))
+            {
+                missing.Add($"{table.Name}.{column}");
+                var (statement, followUp) = PlatformMessageStoreSchema.AddColumnStatement(table.Name, definition);
+                statements.Add(statement);
+                if (followUp is not null)
+                {
+                    followUps.Add(followUp);
+                }
+            }
+        }
+
+        if (missing.Count > 0)
+        {
+            throw new InvalidOperationException(
+                $"The Message Store lacks {string.Join(", ", missing)}, which this adapter uses. Refusing to start: " +
+                "each message would fail to record and be consumed again. The store was provisioned for an earlier " +
+                "adapter version, or the connection's search_path or schema USAGE grant hides it; check those first, " +
+                "so the statements below don't create a second set of tables in another schema. Bring the store to the " +
+                $"store schema for contract major {SupportedContractMajor} before starting: {string.Join("; ", statements)}." +
+                (followUps.Count > 0
+                    ? $" Then give existing rows a value in each added column and run: {string.Join("; ", followUps)}."
+                    : string.Empty));
+        }
+
+        logger.LogInformation("Message Store tables and columns verified.");
+    }
+
     public Task RecordAttemptAsync(PlatformMessage message, string routeId, string status, string? error, CancellationToken cancellationToken)
     {
         return RecordAttemptAsync(
