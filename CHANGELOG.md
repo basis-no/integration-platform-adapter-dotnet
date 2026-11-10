@@ -9,6 +9,14 @@
   `bip_step_outcome`, its step ran once per handler attempt before the message
   was parked. What only a resend uses is not checked.
 
+- `BASIS_MESSAGE_STORE_STEP_OUTCOME_STORE` selects the step outcome store, as
+  in the Camel adapter: `postgres` (the default, as before) or `noop`. With
+  `noop`, every step runs on every delivery and replay, nothing is read from
+  or written to `bip_step_outcome`, and a resend with `redoSteps` is refused
+  with `409 NOT_REPLAYABLE`. Earlier versions ignored the variable and always
+  used `bip_step_outcome`; a deployment that sets it to `noop` now gets the
+  `noop` behaviour, and an unknown value fails startup.
+
 - A late, older attempt no longer overwrites the message summary. When attempt
   1 was consumed again after its replay, attempt 2, had been recorded,
   `bip_message_log` took attempt 1's status, error, payload and expiry while

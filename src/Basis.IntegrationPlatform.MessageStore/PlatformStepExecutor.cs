@@ -98,6 +98,12 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
         this.logger = logger;
     }
 
+    /// <summary>
+    /// False with the noop step outcome store: nothing is read from or written
+    /// to bip_step_outcome, so every step runs. steps_json still records it.
+    /// </summary>
+    internal bool UsesStepLedger { get; init; } = true;
+
     public async Task<PlatformStepExecutionResult> ExecuteAsync(
         PlatformMessage message,
         string stepId,
@@ -115,7 +121,9 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
         // The operation calls the real destination; only the recorded copy of
         // the URI is masked.
         var recordedUri = MaskEndpointUri(endpointUri);
-        if (!ShouldRedo(message, stepId, idempotencyKey, logger) && await WasDeliveredAsync(idempotencyKey, cancellationToken))
+        if (UsesStepLedger
+            && !ShouldRedo(message, stepId, idempotencyKey, logger)
+            && await WasDeliveredAsync(idempotencyKey, cancellationToken))
         {
             await WarnAboutSharedStepKeyAsync(message, stepId, idempotencyKey, cancellationToken);
             Observe(message.MessageId, stepId, SkippedStatus, idempotencyKey, recordedUri, targetRef, null);
@@ -125,7 +133,11 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
         try
         {
             await operation(cancellationToken);
-            await RecordAsync(message.MessageId, idempotencyKey, stepId, Delivered, recordedUri, targetRef, null, cancellationToken);
+            if (UsesStepLedger)
+            {
+                await RecordAsync(message.MessageId, idempotencyKey, stepId, Delivered, recordedUri, targetRef, null, cancellationToken);
+            }
+
             Observe(message.MessageId, stepId, Delivered, idempotencyKey, recordedUri, targetRef, null);
             return new PlatformStepExecutionResult(idempotencyKey, stepId, Delivered, false);
         }
@@ -133,7 +145,11 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
         {
             // A cancellation the caller did not request, such as an HttpClient
             // timeout, is a failed step like any other.
-            await RecordAsync(message.MessageId, idempotencyKey, stepId, Failed, recordedUri, targetRef, ex.Message, cancellationToken);
+            if (UsesStepLedger)
+            {
+                await RecordAsync(message.MessageId, idempotencyKey, stepId, Failed, recordedUri, targetRef, ex.Message, cancellationToken);
+            }
+
             Observe(message.MessageId, stepId, Failed, idempotencyKey, recordedUri, targetRef, ex.Message);
             throw;
         }
