@@ -2,12 +2,17 @@
 
 ## Unreleased
 
-- Startup refuses a Message Store that lacks a table or column that consuming
-  a message writes or reads, naming each one. The contract major check alone
-  let such a store through: every message then failed to record and was
-  consumed again without end, or, with a column missing from
-  `bip_step_outcome`, its step ran once per handler attempt before the message
-  was parked. What only a resend uses is not checked.
+- Startup refuses a Message Store that lacks a table or column of the store
+  schema the adapter ships, for each table this configuration uses: the
+  message tables always, `bip_step_outcome` with the `postgres` step outcome
+  store and `bip_message_replay_audit` when the resend endpoint is mapped. The
+  error names each missing table and column and gives the statements that add
+  them. The contract major check alone let such a store through: every message
+  then failed to record and was consumed again without end, or, with a column
+  missing from `bip_step_outcome`, its step ran once per handler attempt
+  before the message was parked. A store provisioned for an earlier adapter
+  version must be brought up to date before upgrading; while the new version
+  refuses to start, a rolling update keeps the previous one running.
 
 - `BASIS_MESSAGE_STORE_STEP_OUTCOME_STORE` selects the step outcome store, as
   in the Camel adapter: `postgres` (the default, as before) or `noop`. With

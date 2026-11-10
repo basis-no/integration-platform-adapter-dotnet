@@ -28,6 +28,7 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
     private readonly IProducer<string, byte[]> producer;
     private readonly PlatformMessageStoreOptions options;
     private readonly ILogger<PlatformMessageConsumerService> logger;
+    private readonly PlatformReplayEndpoints? replayEndpoints;
 
     public PlatformMessageConsumerService(
         IPlatformMessageHandler handler,
@@ -35,7 +36,8 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
         PlatformStepObservationCollector stepObservations,
         IProducer<string, byte[]> producer,
         IOptions<PlatformMessageStoreOptions> options,
-        ILogger<PlatformMessageConsumerService> logger)
+        ILogger<PlatformMessageConsumerService> logger,
+        PlatformReplayEndpoints? replayEndpoints = null)
     {
         this.handler = handler;
         this.store = store;
@@ -43,17 +45,19 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
         this.producer = producer;
         this.options = options.Value;
         this.logger = logger;
+        this.replayEndpoints = replayEndpoints;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         options.Validate();
         // Startup gate: verify the store schema major in bip_contract, then
-        // that the store has every table and column the adapter writes, before
-        // consuming anything. Wrong major or a missing column fails fast; a
-        // missing bip_contract table warns.
+        // that the store has every table and column of the shipped schema that
+        // this configuration uses, before consuming anything. Wrong major or a
+        // missing table or column fails fast; a missing bip_contract table
+        // warns.
         await store.VerifyContractAsync(stoppingToken);
-        await store.VerifyStoreColumnsAsync(stoppingToken);
+        await store.VerifyStoreColumnsAsync(replayEndpoints?.Mapped == true, stoppingToken);
         var config = new ConsumerConfig(options.CreateKafkaClientConfig())
         {
             GroupId = options.ConsumerGroupId,

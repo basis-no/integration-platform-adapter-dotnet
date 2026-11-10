@@ -16,35 +16,6 @@ public sealed class PlatformMessageStore
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
-    // Every column that consuming a message writes or reads, per table, in
-    // this file and in PlatformStepExecutor.cs; keep them in step. A store
-    // that declares the right major but lacks one of them would fail each
-    // message at that write instead of refusing to start. What only a resend
-    // uses (bip_message_replay_audit, bip_message_log.payload_deleted_at) is
-    // not required to consume and is left to the resend itself.
-    internal static readonly IReadOnlyDictionary<string, string[]> StoreColumns = new Dictionary<string, string[]>(StringComparer.Ordinal)
-    {
-        ["bip_message_log"] =
-        [
-            "message_id", "correlation_id", "integration", "schema_version", "status", "last_attempt", "occurred_at",
-            "updated_at", "source_system", "target_system", "content_type", "payload_storage", "payload_size_bytes",
-            "payload_bytes", "payload_expires_at", "replayable", "replay_disabled_reason",
-            "auto_redelivered", "auto_redelivery_count", "auto_redelivery_max", "error",
-        ],
-        ["bip_message_attempt"] =
-        [
-            "message_id", "attempt", "schema_version", "correlation_id", "integration", "route_id", "status",
-            "occurred_at", "source_system", "target_system", "content_type", "payload_size_bytes", "payload_storage",
-            "payload_bytes", "payload_expires_at", "replayable", "replay_disabled_reason", "auto_redelivered",
-            "auto_redelivery_count", "auto_redelivery_max", "steps_json", "error",
-        ],
-        ["bip_step_outcome"] =
-        [
-            "idempotency_key", "message_id", "step_id", "status", "endpoint_uri", "target_ref", "error", "occurred_at",
-            "updated_at",
-        ],
-    };
-
     private readonly NpgsqlDataSource dataSource;
     private readonly PlatformStepObservationCollector stepObservations;
     private readonly PlatformMessageStoreOptions options;
@@ -142,14 +113,18 @@ public sealed class PlatformMessageStore
     }
 
     /// <summary>
-    /// Startup check after the contract major: every table and column that
-    /// consuming a message writes or reads resolves through the connection's
-    /// search_path, as the adapter's statements resolve them. Anything that
-    /// does not fails startup, naming it; a failure to read gets the gate's
+    /// Startup check after the contract major: every table of the shipped store
+    /// schema that this configuration uses, with every column, resolves
+    /// through the connection's search_path, as the adapter's statements
+    /// resolve them. The message tables are always required, bip_step_outcome
+    /// with the Postgres step outcome store and bip_message_replay_audit when
+    /// the resend endpoint is mapped. Anything missing fails startup, naming it
+    /// with the statement that adds it; a failure to read gets the gate's
     /// bounded retries.
     /// </summary>
-    internal async Task VerifyStoreColumnsAsync(CancellationToken cancellationToken)
+    internal async Task VerifyStoreColumnsAsync(bool replay, CancellationToken cancellationToken)
     {
+        var required = PlatformMessageStoreSchema.Required(options.UsesStepLedger, replay);
         var present = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
         for (var attempt = 1; ; attempt++)
         {
@@ -157,6 +132,9 @@ public sealed class PlatformMessageStore
             {
                 present.Clear();
                 await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
+                // pg_attribute lists every column of a table the search_path
+                // resolves, also one the role has no privilege on; to_regclass
+                // gives null for a table that does not resolve.
                 await using var command = new NpgsqlCommand(
                     """
                     select t.name, a.attname
@@ -164,7 +142,8 @@ public sealed class PlatformMessageStore
                     join pg_attribute a on a.attrelid = to_regclass(t.name) and a.attnum > 0 and not a.attisdropped
                     """,
                     connection);
-                command.Parameters.Add("tables", NpgsqlDbType.Array | NpgsqlDbType.Text).Value = StoreColumns.Keys.ToArray();
+                command.Parameters.Add("tables", NpgsqlDbType.Array | NpgsqlDbType.Text).Value =
+                    required.Select(table => table.Name).ToArray();
                 await using var reader = await command.ExecuteReaderAsync(cancellationToken);
                 while (await reader.ReadAsync(cancellationToken))
                 {
@@ -199,17 +178,31 @@ public sealed class PlatformMessageStore
             }
         }
 
-        var missing = StoreColumns
-            .SelectMany(table => present.TryGetValue(table.Key, out var columns)
-                ? table.Value.Where(column => !columns.Contains(column)).Select(column => $"{table.Key}.{column}")
-                : [$"{table.Key} (table)"])
-            .ToList();
+        var missing = new List<string>();
+        var statements = new List<string>();
+        foreach (var table in required)
+        {
+            if (!present.TryGetValue(table.Name, out var columns))
+            {
+                missing.Add($"table {table.Name}");
+                statements.Add(table.CreateStatement);
+                continue;
+            }
+
+            foreach (var (column, definition) in table.Columns.Where(column => !columns.Contains(column.Key)))
+            {
+                missing.Add($"{table.Name}.{column}");
+                statements.Add(PlatformMessageStoreSchema.AddColumnStatement(table.Name, definition));
+            }
+        }
+
         if (missing.Count > 0)
         {
             throw new InvalidOperationException(
-                $"Message Store tables or columns that consuming writes or reads could not be resolved: {string.Join(", ", missing)}. " +
-                "Refusing to start: each message would fail to record. Check that the store schema for contract major " +
-                $"{SupportedContractMajor} is provisioned completely, and the connection's search_path and its schema USAGE grant.");
+                $"The Message Store lacks {string.Join(", ", missing)}, which this adapter uses. Refusing to start: " +
+                "each message would fail to record and be consumed again. The store was provisioned for an earlier " +
+                $"adapter version, or the connection's search_path or schema USAGE grant hides it. Bring it to the " +
+                $"store schema for contract major {SupportedContractMajor} before starting: {string.Join("; ", statements)}.");
         }
 
         logger.LogInformation("Message Store tables and columns verified.");
