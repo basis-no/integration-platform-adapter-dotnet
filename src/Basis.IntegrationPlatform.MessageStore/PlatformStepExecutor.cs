@@ -167,11 +167,11 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
                 && !ShouldRedo(message, stepId, idempotencyKey, logger)
                 && await WasDeliveredAsync(idempotencyKey, cancellationToken);
         }
-        catch (Exception)
+        catch (Exception ex)
         {
             // Also a cancellation: the token may be the handler's own timeout,
             // and a handler that swallows it must not complete the message.
-            NoteStoreFailure(message.MessageId);
+            NoteStoreFailure(message.MessageId, ex);
             throw;
         }
 
@@ -197,9 +197,9 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
                 {
                     await RecordAsync(message.MessageId, idempotencyKey, stepId, Failed, recordedUri, targetRef, ex.Message, cancellationToken);
                 }
-                catch (Exception)
+                catch (Exception recordFailure)
                 {
-                    NoteStoreFailure(message.MessageId);
+                    NoteStoreFailure(message.MessageId, recordFailure);
                     throw;
                 }
             }
@@ -244,10 +244,10 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
                 await RecordAsync(messageId, idempotencyKey, stepId, Delivered, recordedUri, targetRef, null, cancellationToken);
                 return;
             }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            catch (OperationCanceledException cancelled) when (cancellationToken.IsCancellationRequested)
             {
                 // Not recorded either; the handler's token may be its own timeout.
-                NoteStoreFailure(messageId);
+                NoteStoreFailure(messageId, cancelled);
                 throw;
             }
             catch (Exception ex)
@@ -263,7 +263,7 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
                         messageId,
                         stepId,
                         attempt);
-                    NoteStoreFailure(messageId);
+                    NoteStoreFailure(messageId, ex);
                     throw;
                 }
 
@@ -276,9 +276,9 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
                 {
                     await Task.Delay(DeliveredWriteRetryDelay * attempt, cancellationToken);
                 }
-                catch (OperationCanceledException)
+                catch (OperationCanceledException cancelled)
                 {
-                    NoteStoreFailure(messageId);
+                    NoteStoreFailure(messageId, cancelled);
                     throw;
                 }
             }
@@ -288,7 +288,8 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
     // Recorded next to the step observations, outside the exception the
     // handler sees, so a handler that swallows the exception and returns
     // success can't get the message recorded COMPLETED.
-    private void NoteStoreFailure(string messageId) => observations.NoteStoreFailure(messageId);
+    private void NoteStoreFailure(string messageId, Exception failure) =>
+        observations.NoteStoreFailure(messageId, PlatformStoreFailures.IsOutage(failure));
 
     private static bool IsCallerCancellation(Exception exception, CancellationToken cancellationToken) =>
         exception is OperationCanceledException && cancellationToken.IsCancellationRequested;
@@ -595,6 +596,9 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
         CancellationToken cancellationToken)
     {
         await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
+        // A DELIVERED row the store can't confirm as durable would let a later
+        // delivery skip a step whose record a failover can lose.
+        using var confirmation = PlatformCommitConfirmation.Watch(connection);
         await using var command = new NpgsqlCommand(
             """
             insert into bip_step_outcome (
@@ -639,5 +643,6 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
         PlatformMessageStore.AddNullableText(command, "target_ref", targetRef);
         PlatformMessageStore.AddNullableText(command, "error", error);
         await command.ExecuteNonQueryAsync(cancellationToken);
+        confirmation.ThrowIfUnconfirmed();
     }
 }

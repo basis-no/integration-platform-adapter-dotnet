@@ -26,6 +26,7 @@ public sealed class PlatformStoreTimeoutsTests
     [DataRow("Timeout=30;Command Timeout=60;Keepalive=0;Options=''", null)]
     [DataRow(" TIMEOUT =30; command timeout=60; KEEPALIVE=0; Options = ", null)]
     [DataRow("timeout=30;CommandTimeout=60;keepalive=0;options=-c search_path=app", "-c search_path=app")]
+    [DataRow(";;Timeout=30; ;Command Timeout=60;Keepalive=0;;Options=", null)]
     public void KeepsEveryTimeoutTheConnectionStringSets(string explicitSettings, string? options)
     {
         var applied = new NpgsqlConnectionStringBuilder(PlatformStoreTimeouts.Apply("Host=postgres;Username=app;" + explicitSettings));
@@ -55,7 +56,7 @@ public sealed class PlatformStoreTimeoutsTests
         {
             Environment.SetEnvironmentVariable("PGOPTIONS", "-c search_path=app");
             var applied = new NpgsqlConnectionStringBuilder(PlatformStoreTimeouts.Apply("Host=postgres;Username=app"));
-            Assert.AreEqual("-c search_path=app -c statement_timeout=15000 -c lock_timeout=5000", applied.Options);
+            Assert.AreEqual("-c statement_timeout=15000 -c lock_timeout=5000 -c search_path=app", applied.Options);
         }
         finally
         {

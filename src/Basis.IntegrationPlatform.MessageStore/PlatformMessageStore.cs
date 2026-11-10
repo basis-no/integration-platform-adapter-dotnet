@@ -244,14 +244,48 @@ public sealed class PlatformMessageStore
         // cumulative snapshot of bip_step_outcome.
         var stepsJson = JsonSerializer.Serialize(stepObservations.Snapshot(message.MessageId), JsonOptions);
 
-        await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
-        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
-        payload = await CapPayloadExpiryAsync(connection, transaction, message.MessageId, payload, cancellationToken);
-        await UpsertAttemptAsync(connection, transaction, message, metadata, status, attempt, payload, error, stepsJson, cancellationToken);
-        await UpsertLogAsync(connection, transaction, message, status, attempt, payload, error, metadata, cancellationToken);
-        await transaction.CommitAsync(cancellationToken);
+        // The outcome is kept here and its idempotent write retried in place,
+        // so a short store failure, or a commit the store could not confirm as
+        // durable, doesn't make the delivery run again.
+        for (var write = 1; ; write++)
+        {
+            try
+            {
+                await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
+                using var confirmation = PlatformCommitConfirmation.Watch(connection);
+                await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+                var capped = await CapPayloadExpiryAsync(connection, transaction, message.MessageId, payload, cancellationToken);
+                await UpsertAttemptAsync(connection, transaction, message, metadata, status, attempt, capped, error, stepsJson, cancellationToken);
+                await UpsertLogAsync(connection, transaction, message, status, attempt, capped, error, metadata, cancellationToken);
+                await transaction.CommitAsync(cancellationToken);
+                confirmation.ThrowIfUnconfirmed();
+                break;
+            }
+            catch (Exception ex) when (write < OutcomeWriteAttempts && !(ex is OperationCanceledException && cancellationToken.IsCancellationRequested))
+            {
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+
+                logger.LogWarning(
+                    "Message Store outcome write failed messageId={MessageId} status={Status} write={Write} ({ExceptionType}); retrying.",
+                    message.MessageId,
+                    status,
+                    write,
+                    ex.GetType().Name);
+                await Task.Delay(OutcomeWriteRetryDelay * write, cancellationToken);
+            }
+        }
+
         stepObservations.Clear(message.MessageId);
     }
+
+    /// <summary>Attempts of an outcome write before its store failure is thrown.</summary>
+    internal int OutcomeWriteAttempts { get; init; } = 3;
+
+    /// <summary>Delay before the second outcome write attempt; it grows with each attempt.</summary>
+    internal TimeSpan OutcomeWriteRetryDelay { get; init; } = TimeSpan.FromMilliseconds(500);
 
     public async Task<MessageReplayResult> ReplayAsync(
         string messageId,
@@ -656,6 +690,8 @@ public sealed class PlatformMessageStore
         CancellationToken cancellationToken)
     {
         await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
+        // The REQUESTED row must be durable before the produce.
+        using var confirmation = PlatformCommitConfirmation.Watch(connection);
         await using var command = new NpgsqlCommand(
             """
             insert into bip_message_replay_audit (
@@ -677,6 +713,7 @@ public sealed class PlatformMessageStore
         command.Parameters.Add("redo_steps", NpgsqlDbType.Jsonb).Value = RedoStepsJson(request);
         command.Parameters.AddWithValue("target_topic", targetTopic);
         await command.ExecuteNonQueryAsync(cancellationToken);
+        confirmation.ThrowIfUnconfirmed();
     }
 
     private async Task UpdateReplayAuditAsync(string replayId, string status, string? error, CancellationToken cancellationToken)

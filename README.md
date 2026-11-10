@@ -420,19 +420,31 @@ settings. Plaintext modes are retained for trusted local compatibility.
 Every Message Store call is bounded well under the consumer's poll interval
 (`max.poll.interval.ms`, 300 s by default), so a hung database, a held lock or a
 dead connection fails the call instead of stalling the consumer until it
-leaves its group. A failed or timed-out call is a store failure. For the
-message's outcome record, the delivery is not committed and is processed
-again after the failure backoff. For a step ledger call, the handler
-invocation ends at once: the adapter neither retries the handler nor parks
-the message, and processes the delivery again. A ledger write that fails
-every time for one message therefore blocks its partition until the cause is
-fixed.
+leaves its group. A failed or timed-out call is a store failure. The
+message's outcome record is retried in place (three attempts); if it still
+fails, the delivery is not committed and is processed again after the
+failure backoff. A step ledger call that fails because the store is
+unavailable (it can't be reached, doesn't answer in time, a lock or
+statement timeout, or SQLSTATE classes 08, 53, 57 and 58) ends the handler
+invocation at once: the adapter neither retries the handler nor parks the
+message, and processes the delivery again. A ledger call refused for its
+data, or cancelled by the handler's own token, is retried and parked as any
+handler failure.
+
+With synchronous replication, a commit waits for a standby, and
+`statement_timeout` does not end that wait. When the client's command
+timeout or a cancellation ends it, PostgreSQL reports the commit as done
+with only a warning, although it exists on the primary alone and a failover
+can lose it. The adapter treats such a write as failed: it commits no offset
+for it, skips no step on it and publishes no replay after it, and retries
+the idempotent write.
 
 The adapter applies these defaults to its own datasource (the keyed
 `MessageStoreDataSourceKey` one), for every setting the connection string
 does not set itself. The default `NpgsqlDataSource` it registers for
 compatibility keeps Npgsql's defaults, so an application's own queries are
-not affected.
+not affected. It is a pool of its own, so an application that resolves it
+can open up to twice the configured maximum pool size.
 
 | Npgsql setting | Default | Bounds |
 | --- | --- | --- |
@@ -442,7 +454,8 @@ not affected.
 | `Options` | `-c statement_timeout=15000 -c lock_timeout=5000` | one statement, and a lock wait, on the server |
 
 To change one, set it in `POSTGRES_CONNECTION_STRING`. The server-side
-timeouts are added after any `PGOPTIONS` the environment sets. A connection
+defaults go before any `PGOPTIONS` the environment sets, so a timeout set
+there wins. A connection
 pooler that refuses the `options` startup parameter (PgBouncer by default
 answers `08P01: unsupported startup parameter in options`) needs
 `BASIS_MESSAGE_STORE_POSTGRES_SERVER_TIMEOUTS=off`, which works with

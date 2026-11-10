@@ -15,10 +15,19 @@
   `Options`) leaves out the server-side ones, for a pooler such as PgBouncer
   that refuses them with `08P01`.
 
-- A step ledger failure, a timeout included, now ends the handler
-  invocation at once: the adapter no longer retries the handler, which would
-  send its steps again, and no longer parks the message in the DLQ while the
-  store fails. The delivery is processed again after the failure backoff.
+- A step ledger failure that says the store is unavailable (a timeout, a lock
+  timeout, a lost connection, SQLSTATE classes 08, 53, 57 and 58) now ends the
+  handler invocation at once: the adapter no longer retries the handler,
+  which would send its steps again, and no longer parks the message while
+  the store fails. A ledger call refused for its data, or cancelled by the
+  handler's own token, is still retried and parked.
+
+- A write whose commit the store reports done only with a warning, as when a
+  synchronous replication wait is cancelled, is treated as failed: no offset
+  commit, step skip or replay produce follows it, and the outcome write is
+  retried in place (three attempts). Before, Npgsql returned normally and the
+  adapter committed the offset for an outcome that existed on the primary
+  only.
 
 - The registered `IProducer<string, byte[]>` partitions keyed records with
   `murmur2_random`, as Java Kafka clients do, instead of the .NET client's

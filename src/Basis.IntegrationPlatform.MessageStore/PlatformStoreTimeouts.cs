@@ -57,10 +57,11 @@ internal static class PlatformStoreTimeouts
         if (serverTimeouts && !Has("Options"))
         {
             // Npgsql uses PGOPTIONS only when the connection string has no
-            // Options; keep what it carries (a search_path, say).
+            // Options; keep what it carries (a search_path, say). The last -c
+            // wins, so the defaults go first and its own timeouts win.
             var environment = Environment.GetEnvironmentVariable("PGOPTIONS");
             var timeouts = $"-c statement_timeout={StatementTimeoutMs} -c lock_timeout={LockTimeoutMs}";
-            builder.Options = string.IsNullOrWhiteSpace(environment) ? timeouts : $"{environment.Trim()} {timeouts}";
+            builder.Options = string.IsNullOrWhiteSpace(environment) ? timeouts : $"{timeouts} {environment.Trim()}";
         }
 
         return builder.ConnectionString;
@@ -82,7 +83,8 @@ internal static class PlatformStoreTimeouts
                 break;
             }
 
-            var key = Normalize(connectionString[index..equals]);
+            // Empty segments (";;", "; ;") before a keyword are no part of it.
+            var key = Normalize(connectionString[index..equals].TrimStart(';', ' ', '\t'));
             if (key.Length > 0)
             {
                 keywords.Add(key);
