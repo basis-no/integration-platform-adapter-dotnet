@@ -83,17 +83,23 @@ public sealed class MyMessageHandler : IPlatformMessageHandler
         PlatformMessage message,
         CancellationToken cancellationToken)
     {
-        await steps.ExecuteAsync(
+        await steps.ExecuteWithContextAsync(
             message,
             stepId: "target-system",
             endpointUri: "https://target.example/api/orders",
             targetRef: message.TargetSystem,
-            operation: async ct =>
+            operation: async (step, ct) =>
             {
-                using var content = new ByteArrayContent(message.Payload);
-                content.Headers.ContentType = MediaTypeHeaderValue.Parse(message.ContentType);
-                using var response = await httpClients.CreateClient("target-system")
-                    .PostAsync("api/orders", content, ct);
+                using var request = new HttpRequestMessage(HttpMethod.Post, "api/orders")
+                {
+                    Content = new ByteArrayContent(message.Payload),
+                };
+                request.Content.Headers.ContentType = MediaTypeHeaderValue.Parse(message.ContentType);
+                // The step's stable key lets the receiver deduplicate. The
+                // Camel adapter sends it under both names.
+                request.Headers.Add("Idempotency-Key", step.IdempotencyKey);
+                request.Headers.Add("x-bip-idempotency-key", step.IdempotencyKey);
+                using var response = await httpClients.CreateClient("target-system").SendAsync(request, ct);
                 // HttpClient returns a 4xx or 5xx response without throwing.
                 response.EnsureSuccessStatusCode();
             },
@@ -119,6 +125,14 @@ the handler and then parks the message.
 The step key is `<message-id>:<step-id>`, and a step whose key is already
 `DELIVERED` in `bip_step_outcome` is skipped, unless the message's
 `x-bip-redo-steps` header (a JSON array of step ids or step keys) names it.
+`ExecuteWithContextAsync` passes the operation a `PlatformStepExecutionContext`
+before the call, with `StepId` and `IdempotencyKey`, the key
+`bip_step_outcome` records. The key is stable across redelivery, replay and
+explicit redo. Send it to the receiver, as in the example, so the receiver can
+deduplicate a call it already applied: after a crash between the call and the
+ledger write, and on a redo, which sends the same key. `ExecuteAsync`, whose
+operation receives only the cancellation token, works as before.
+
 Choose step ids with that in mind:
 
 - Give every external call its own step id. A handler that sends several items
@@ -307,6 +321,7 @@ metrics must never be interpreted as zero traffic. Counters reset when the
 process restarts; no topic, message, integration, payload or header values
 become metric labels. Options `TrafficSignals` and `TrafficInputTopics` can
 also be set in registration.
+
 ## Publish
 
 Releases are published to NuGet.org as `Basis.IntegrationPlatform.MessageStore`
