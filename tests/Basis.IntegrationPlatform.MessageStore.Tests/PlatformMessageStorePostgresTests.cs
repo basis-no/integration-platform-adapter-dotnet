@@ -1918,6 +1918,183 @@ public sealed class PlatformMessageStorePostgresTests
         Assert.AreEqual("bip.integration-second.in", producer.Produced.Single().Topic);
     }
 
+    [TestMethod]
+    public async Task DeliveredWriteThatFailsOnceIsRetriedInPlace()
+    {
+        await WithFailingLedgerAsync(failures: 1, async (dataSource, options) =>
+        {
+            var observations = new PlatformStepObservationCollector();
+            var steps = LedgerTestExecutor(dataSource, observations);
+            var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+            var sends = 0;
+
+            var result = await steps.ExecuteAsync(
+                CreateMessage(messageId, options), "deliver", "https://target.example/orders", "target",
+                _ => { sends++; return Task.CompletedTask; }, CancellationToken.None);
+
+            Assert.AreEqual("DELIVERED", result.Status);
+            Assert.AreEqual(1, sends, "The call that succeeded is not made again.");
+            Assert.AreEqual("DELIVERED", await StepStatusAsync(dataSource, $"{messageId}:deliver"));
+            Assert.AreEqual("DELIVERED", observations.Snapshot(messageId).Single().Status);
+            Assert.IsFalse(observations.StoreFailedInCurrentInvocation(messageId));
+        });
+    }
+
+    [TestMethod]
+    public async Task DeliveredWriteThatKeepsFailingNeverRecordsFailed()
+    {
+        await WithFailingLedgerAsync(failures: 100, async (dataSource, options) =>
+        {
+            var observations = new PlatformStepObservationCollector();
+            var steps = LedgerTestExecutor(dataSource, observations);
+            var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+            var sends = 0;
+
+            await Assert.ThrowsExactlyAsync<PostgresException>(() => steps.ExecuteAsync(
+                CreateMessage(messageId, options), "deliver", "https://target.example/orders", "target",
+                _ => { sends++; return Task.CompletedTask; }, CancellationToken.None));
+
+            Assert.AreEqual(1, sends);
+            Assert.IsNull(await StepStatusAsync(dataSource, $"{messageId}:deliver"), "No FAILED row for a call that succeeded.");
+            Assert.AreEqual("DELIVERED", observations.Snapshot(messageId).Single().Status);
+            Assert.IsTrue(observations.StoreFailedInCurrentInvocation(messageId));
+        });
+    }
+
+    [TestMethod]
+    public async Task HandlerThatSwallowsALedgerFailureIsNotRecordedCompleted()
+    {
+        // The store has no bip_step_outcome, so the ledger read before the
+        // step fails and the step's operation never runs.
+        await WithFailingLedgerAsync(failures: 0, async (dataSource, options) =>
+        {
+            await using (var connection = await dataSource.OpenConnectionAsync())
+            {
+                await using var drop = new NpgsqlCommand("drop table bip_step_outcome", connection);
+                await drop.ExecuteNonQueryAsync();
+            }
+
+            var observations = new PlatformStepObservationCollector();
+            var store = new PlatformMessageStore(dataSource, observations, Options.Create(options), NullLogger<PlatformMessageStore>.Instance);
+            var steps = LedgerTestExecutor(dataSource, observations);
+            var sends = 0;
+            var handler = new DelegateHandler(async (message, ct) =>
+            {
+                try
+                {
+                    await steps.ExecuteAsync(message, "deliver", "https://target.example/orders", "target", _ => { sends++; return Task.CompletedTask; }, ct);
+                }
+                catch (PostgresException)
+                {
+                    // An optional step, as the handler sees it.
+                }
+
+                return PlatformMessageResult.Completed();
+            });
+            var producer = new FakeProducer();
+            using var service = CreateConsumerService(handler, store, observations, producer, options);
+            var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+            var committed = false;
+
+            var error = await Assert.ThrowsExactlyAsync<InvalidOperationException>(
+                () => service.ProcessAsync(CreateMessage(messageId, options), () => committed = true, CancellationToken.None));
+
+            StringAssert.Contains(error.Message, "step ledger");
+            Assert.IsFalse(committed);
+            Assert.AreEqual(0, sends);
+            Assert.IsNull(await LogStatusAsync(dataSource, messageId), "Nothing is recorded COMPLETED.");
+            Assert.AreEqual(0, producer.Produced.Count, "Nothing is parked.");
+        });
+    }
+
+    [TestMethod]
+    public async Task HandlerRetryWithoutALedgerFailureCompletes()
+    {
+        // The first invocation's DELIVERED write fails on every attempt; the
+        // handler reports a failure and is retried, and the retry records it.
+        await WithFailingLedgerAsync(failures: 3, async (dataSource, options) =>
+        {
+            options.MaxHandlerAttempts = 2;
+            options.HandlerRetryDelayMs = 0;
+            var observations = new PlatformStepObservationCollector();
+            var store = new PlatformMessageStore(dataSource, observations, Options.Create(options), NullLogger<PlatformMessageStore>.Instance);
+            var steps = LedgerTestExecutor(dataSource, observations);
+            var sends = 0;
+            var handler = new DelegateHandler(async (message, ct) =>
+            {
+                try
+                {
+                    await steps.ExecuteAsync(message, "deliver", "https://target.example/orders", "target", _ => { sends++; return Task.CompletedTask; }, ct);
+                    return PlatformMessageResult.Completed();
+                }
+                catch (PostgresException ex)
+                {
+                    return PlatformMessageResult.Failed(ex.MessageText);
+                }
+            });
+            using var service = CreateConsumerService(handler, store, observations, new FakeProducer(), options);
+            var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+            var committed = false;
+
+            await service.ProcessAsync(CreateMessage(messageId, options), () => committed = true, CancellationToken.None);
+
+            Assert.IsTrue(committed);
+            Assert.AreEqual(2, sends, "No DELIVERED row after the first invocation, so the retry sends again.");
+            Assert.AreEqual("COMPLETED", await LogStatusAsync(dataSource, messageId));
+            Assert.AreEqual("DELIVERED", await StepStatusAsync(dataSource, $"{messageId}:deliver"));
+        });
+    }
+
+    private static PlatformStepExecutor LedgerTestExecutor(NpgsqlDataSource dataSource, PlatformStepObservationCollector observations) =>
+        new(dataSource, observations, NullLogger<PlatformStepExecutor>.Instance)
+        {
+            DeliveredWriteRetryDelay = TimeSpan.Zero,
+        };
+
+    // Runs the test against a store in its own schema whose first `failures`
+    // writes to bip_step_outcome fail, as during a short store outage.
+    private static async Task WithFailingLedgerAsync(int failures, Func<NpgsqlDataSource, PlatformMessageStoreOptions, Task> test)
+    {
+        var connectionString = RequireConnectionString();
+        var schemaName = $"bip_ledger_{Guid.NewGuid():N}";
+        await using var admin = NpgsqlDataSource.Create(connectionString);
+        await using (var connection = await admin.OpenConnectionAsync())
+        {
+            await using var create = new NpgsqlCommand(
+                $"""
+                create schema {schemaName};
+                create table {schemaName}.bip_message_log (like public.bip_message_log including all);
+                create table {schemaName}.bip_message_attempt (like public.bip_message_attempt including all);
+                create table {schemaName}.bip_step_outcome (like public.bip_step_outcome including all);
+                create sequence {schemaName}.ledger_writes;
+                create function {schemaName}.fail_ledger_writes() returns trigger language plpgsql as $$
+                begin
+                    if nextval('{schemaName}.ledger_writes') <= {failures} then
+                        raise exception 'synthetic store failure';
+                    end if;
+                    return new;
+                end $$;
+                create trigger fail_ledger_writes before insert or update on {schemaName}.bip_step_outcome
+                    for each row execute function {schemaName}.fail_ledger_writes();
+                """,
+                connection);
+            await create.ExecuteNonQueryAsync();
+        }
+
+        try
+        {
+            var options = CreateOptions(new NpgsqlConnectionStringBuilder(connectionString) { SearchPath = schemaName }.ConnectionString);
+            await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+            await test(dataSource, options);
+        }
+        finally
+        {
+            await using var connection = await admin.OpenConnectionAsync();
+            await using var drop = new NpgsqlCommand($"drop schema {schemaName} cascade", connection);
+            await drop.ExecuteNonQueryAsync();
+        }
+    }
+
     private static PlatformMessageConsumerService CreateConsumerService(
         IPlatformMessageHandler handler,
         PlatformMessageStore store,

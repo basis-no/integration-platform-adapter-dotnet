@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- A step whose operation returned is never recorded `FAILED`. When the
+  `DELIVERED` write fails, the step executor retries it in place, and if it
+  keeps failing, throws the store failure without writing `FAILED`; before,
+  a store error after a successful call recorded the step `FAILED`, so a
+  later attempt or replay sent the call again with the store's error text as
+  the step's error.
+- A handler that catches a step ledger failure and returns success no longer
+  gets the message recorded `COMPLETED`: the adapter notes the store failure
+  next to the step observations and processes the delivery again, without
+  parking it. Before, a step that never ran could be recorded as completed.
+
 - `IPlatformStepExecutor.ExecuteWithContextAsync` passes the operation a
   `PlatformStepExecutionContext` with the step's idempotency key and step id
   before the call. Send the key as `Idempotency-Key` and
