@@ -154,5 +154,4 @@ public sealed class PlatformStepExecutorTests
             return new PlatformStepExecutionResult($"{message.MessageId}:{stepId}", stepId, "DELIVERED", false);
         }
     }
-
 }

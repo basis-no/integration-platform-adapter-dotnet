@@ -95,8 +95,10 @@ public sealed class MyMessageHandler : IPlatformMessageHandler
                     Content = new ByteArrayContent(message.Payload),
                 };
                 request.Content.Headers.ContentType = MediaTypeHeaderValue.Parse(message.ContentType);
-                // The step's stable key lets the receiver deduplicate.
+                // The step's stable key lets the receiver deduplicate. The
+                // Camel adapter sends it under both names.
                 request.Headers.Add("Idempotency-Key", step.IdempotencyKey);
+                request.Headers.Add("x-bip-idempotency-key", step.IdempotencyKey);
                 using var response = await httpClients.CreateClient("target-system").SendAsync(request, ct);
                 // HttpClient returns a 4xx or 5xx response without throwing.
                 response.EnsureSuccessStatusCode();

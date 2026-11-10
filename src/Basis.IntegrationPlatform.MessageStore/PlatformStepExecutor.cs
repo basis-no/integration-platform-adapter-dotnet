@@ -20,7 +20,9 @@ public interface IPlatformStepExecutor
     /// As <c>ExecuteAsync</c>, but the operation receives the step's stable
     /// idempotency key before the external call. A separate name, not an
     /// overload, so no call that compiled against <c>ExecuteAsync</c> becomes
-    /// ambiguous.
+    /// ambiguous. The default body derives the key from the message id and
+    /// step id as given and calls <c>ExecuteAsync</c>; an implementation that
+    /// changes the step id or the key it records must override this method.
     /// </summary>
     Task<PlatformStepExecutionResult> ExecuteWithContextAsync(
         PlatformMessage message,
@@ -31,7 +33,7 @@ public interface IPlatformStepExecutor
         CancellationToken cancellationToken)
     {
         // Keep implementations of the original interface source and binary
-        // compatible. Their original overload still owns execution semantics.
+        // compatible. Their ExecuteAsync still owns execution semantics.
         ArgumentNullException.ThrowIfNull(message);
         ArgumentException.ThrowIfNullOrWhiteSpace(stepId);
         ArgumentNullException.ThrowIfNull(operation);
