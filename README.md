@@ -53,7 +53,18 @@ The adapter owns the message-store mechanics of a .NET integration:
   committing the `REQUESTED` audit row before the Kafka produce
 - verifies the store schema major in `bip_contract` at startup and refuses
   to start on a mismatch (a missing or empty table logs a loud warning and
-  the adapter assumes major 1)
+  the adapter assumes major 1). It then checks that every table it uses
+  resolves through the connection's `search_path` with every column of the
+  store schema the package ships (`tests/fixtures/postgres/002_adapter_v1_message_store.sql`
+  in this repository): `bip_message_log` and `bip_message_attempt` always,
+  `bip_step_outcome` with the `postgres` step outcome store, and
+  `bip_message_replay_audit` when the application maps the resend endpoint.
+  Otherwise it refuses to start, instead of failing every message, and names
+  each missing table and column with the statements that add it: a missing
+  table with its indexes, and a column that must have a value in two steps,
+  so it can be added to a table with rows. Check the `search_path` and the
+  schema's `USAGE` grant first, so the statements don't create a second set
+  of tables. It does not compare types, defaults or check constraints
 
 ## Integration Usage
 
