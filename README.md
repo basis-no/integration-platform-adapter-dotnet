@@ -26,9 +26,9 @@ The adapter owns the message-store mechanics of a .NET integration:
   in `bip_message_attempt.steps_json`
 - records idempotent external step outcomes in `bip_step_outcome`. The
   recorded endpoint URI, there and in `steps_json`, has its user info and the
-  values of credential-like query parameters masked as `xxxxxx` (the DLQ
-  header rule below, plus `key`, `code`, `sig`, `pwd`, passphrase, passcode
-  and private, access or account key). Only the recorded copy is masked
+  values of credential-like query parameters masked as `xxxxxx`, at least as
+  the Camel adapter masks it (see the step section below). Only the recorded
+  copy is masked
 - stores replayable payload bytes in Postgres under the payload policy
   (`replayable` = payload captured, not expired, not deleted — independent
   of message status)
@@ -144,6 +144,24 @@ each integration to its own rows, the other integration's row is hidden, so that
 warning never fires there.
 If the read fails, the step is still skipped and the check is logged at debug.
 
+The endpoint URI a step records is masked first the way the Camel adapter
+masks it, so both adapters record the same value for every credential that
+adapter masks:
+
+- the password in the user info (`https://user:xxxxxx@host`);
+- the value of a query parameter whose name contains, in any case, one of the
+  option names Camel 4.18 treats as sensitive, such as `password`,
+  `passphrase`, `secret`, `token`, `user`, `login`, `clientid`, `apikey`,
+  `api_key` or `privatekey`. The value is masked up to the next `&`, a
+  fragment included, and a `RAW(...)` or `RAW{...}` value as a whole.
+
+This adapter then masks more: the whole user info (`https://xxxxxx@host`, also
+when it holds only a token), and the values of query parameters named by the
+DLQ header rule above, named `key`, `code`, `sig` or `pwd`, or containing
+passphrase, passcode, privatekey, accesskey, accountkey or connectionstring.
+A URI the patterns cannot mask within a second is recorded as `xxxxxx`. The
+operation calls the URI it was given; rows written earlier are unchanged.
+
 ## Required Runtime Environment
 
 The deployment sets these environment variables:
@@ -177,6 +195,15 @@ The same semantics as the Camel Quarkus adapter:
 | `BASIS_MESSAGE_STORE_PAYLOAD_MODE` | `postgres_inline` | `postgres_inline` or `metadata_only` |
 | `BASIS_MESSAGE_STORE_PAYLOAD_MAX_BYTES` | `1048576` | Payloads larger than this degrade to `metadata_only` with a `replay_disabled_reason` |
 | `BASIS_MESSAGE_STORE_PAYLOAD_RETENTION_DAYS` | `30` | Sets `payload_expires_at` on captured payloads |
+
+Inline capture sets expiry to the earlier of capture time plus retention and
+first receipt plus twice retention, matching the Camel adapter. First receipt
+is the earliest `occurred_at` in this integration's attempt history, or capture
+time when there is none. A replay shortly before expiry can renew it up to
+that cap; repeated replays never extend it beyond the cap. The summary and
+new attempt store the same expiry, and earlier attempts keep theirs. Consuming
+attempt 1 again rewrites its `occurred_at`, so the cap can move when that row
+was the earliest receipt; replays write new attempts and do not move it.
 
 `metadata_only` rows store no `payload_bytes` and are `replayable=false` with
 a reason. Replayability is a property of payload availability, never of the

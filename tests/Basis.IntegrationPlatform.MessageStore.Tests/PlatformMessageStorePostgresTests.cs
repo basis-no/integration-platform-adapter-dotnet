@@ -104,6 +104,150 @@ public sealed class PlatformMessageStorePostgresTests
         Assert.AreEqual("COMPLETED", await command.ExecuteScalarAsync());
     }
 
+    [TestMethod]
+    public void RegisteringTheAdapterAddsNothingToTheHttpClientPipeline()
+    {
+        static string[] HttpClientRegistrations(bool withAdapter)
+        {
+            var services = new ServiceCollection();
+            services.AddLogging();
+            services.AddHttpClient("target-system");
+            if (withAdapter)
+            {
+                services.AddBasisMessageStoreAdapter<SyntheticHandler>(options => options.KafkaBootstrapServers = "unused:9092");
+            }
+
+            return services
+                .Where(service => service.ServiceType == typeof(Microsoft.Extensions.Http.IHttpMessageHandlerBuilderFilter)
+                    || service.ServiceType == typeof(IConfigureOptions<Microsoft.Extensions.Http.HttpClientFactoryOptions>)
+                    || service.ServiceType == typeof(IPostConfigureOptions<Microsoft.Extensions.Http.HttpClientFactoryOptions>)
+                    || service.ServiceType == typeof(DelegatingHandler))
+                .Select(service => $"{service.ServiceType.Name} {service.ImplementationType?.FullName ?? service.ImplementationInstance?.GetType().FullName ?? "factory"}")
+                .ToArray();
+        }
+
+        CollectionAssert.AreEqual(HttpClientRegistrations(withAdapter: false), HttpClientRegistrations(withAdapter: true));
+    }
+
+    [TestMethod]
+    public async Task ConsumedCredentialHeadersReachNoHttpReceiver()
+    {
+        var connectionString = RequireConnectionString();
+        var receiver = new RecordingReceiver();
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddHttpClient("target-system", client => client.BaseAddress = new Uri("https://target.example/"))
+            .ConfigurePrimaryHttpMessageHandler(() => receiver);
+        services.AddBasisMessageStoreAdapter<ReadmePatternHandler>(options =>
+        {
+            options.PostgresConnectionString = connectionString;
+            options.KafkaBootstrapServers = "unused:9092";
+            options.ApplicationName = "integration-e2e-dotnet";
+            options.InputTopic = "bip.integration-e2e-dotnet.in";
+        });
+        await using var provider = services.BuildServiceProvider();
+        var consumer = provider.GetServices<Microsoft.Extensions.Hosting.IHostedService>().OfType<PlatformMessageConsumerService>().Single();
+        var options = provider.GetRequiredService<IOptions<PlatformMessageStoreOptions>>().Value;
+        var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+        var consumed = new Message<string, byte[]>
+        {
+            Key = messageId,
+            Value = "{}"u8.ToArray(),
+            Headers = new Headers
+            {
+                { "x-bip-message-id", Encoding.UTF8.GetBytes(messageId) },
+                { "Authorization", Encoding.UTF8.GetBytes("Bearer synthetic-consumed-token") },
+                { "x-api-key", Encoding.UTF8.GetBytes("synthetic-consumed-key") },
+                { "Cookie", Encoding.UTF8.GetBytes("session=synthetic-consumed-session") },
+                { "x-custom-trace", Encoding.UTF8.GetBytes("synthetic-consumed-trace") },
+            },
+        };
+
+        await consumer.ProcessAsync(PlatformMessageConsumerService.ToPlatformMessage(consumed, options), () => { }, CancellationToken.None);
+
+        var request = receiver.Requests.Single();
+        var consumedNames = consumed.Headers.Select(header => header.Key).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        Assert.IsFalse(request.Headers.Any(header => consumedNames.Contains(header.Name)), string.Join(", ", request.Headers.Select(header => header.Name)));
+        Assert.IsFalse(request.Headers.Any(header => header.Value.Contains("synthetic-consumed", StringComparison.Ordinal)));
+        Assert.IsFalse(request.Uri.Contains("synthetic-consumed", StringComparison.Ordinal));
+        Assert.AreEqual("COMPLETED", await LogStatusAsync(provider.GetRequiredKeyedService<NpgsqlDataSource>(PlatformMessageStoreExtensions.MessageStoreDataSourceKey), messageId));
+    }
+
+    [TestMethod]
+    public async Task ReplayRecordCarriesOnlyTheEnvelopeHeaders()
+    {
+        var connectionString = RequireConnectionString();
+        var options = CreateOptions(connectionString);
+        var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+        await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+        var (store, _, _, _) = CreateStore(dataSource, options);
+        var consumed = new Message<string, byte[]>
+        {
+            Key = messageId,
+            Value = "{}"u8.ToArray(),
+            Headers = new Headers
+            {
+                { "x-bip-message-id", Encoding.UTF8.GetBytes(messageId) },
+                { "x-bip-correlation-id", Encoding.UTF8.GetBytes(messageId) },
+                { "Authorization", Encoding.UTF8.GetBytes("Bearer synthetic-consumed-token") },
+                { "x-api-key", Encoding.UTF8.GetBytes("synthetic-consumed-key") },
+                { "x-custom-trace", Encoding.UTF8.GetBytes("synthetic-consumed-trace") },
+                { "x-bip-unknown", Encoding.UTF8.GetBytes("synthetic-consumed-envelope") },
+            },
+        };
+        await store.RecordAttemptAsync(PlatformMessageConsumerService.ToPlatformMessage(consumed, options), "dotnet-handler", "COMPLETED", null, CancellationToken.None);
+        var producer = new FakeProducer();
+
+        var replay = await store.ReplayAsync(messageId, new MessageReplayRequest("operator", "resend"), producer, CancellationToken.None);
+
+        Assert.AreEqual("PUBLISHED", replay.Status);
+        var headers = producer.Produced.Single().Message.Headers;
+        CollectionAssert.AreEquivalent(
+            new[]
+            {
+                "x-bip-message-id", "x-bip-correlation-id", "x-bip-schema-version", "x-bip-content-type", "content-type",
+                "x-bip-source-system", "x-bip-target-system", "x-bip-replay", "x-bip-attempt", "x-bip-redo-steps",
+            },
+            headers.Select(header => header.Key).ToArray());
+        Assert.IsFalse(headers.Any(header => Encoding.UTF8.GetString(header.GetValueBytes()).Contains("synthetic-consumed", StringComparison.Ordinal)));
+    }
+
+    /// <summary>The README's handler: one step around a named client's call.</summary>
+    private sealed class ReadmePatternHandler(IPlatformStepExecutor steps, IHttpClientFactory httpClients) : IPlatformMessageHandler
+    {
+        public async Task<PlatformMessageResult> HandleAsync(PlatformMessage message, CancellationToken cancellationToken)
+        {
+            await steps.ExecuteAsync(
+                message,
+                stepId: "target-system",
+                endpointUri: "https://target.example/api/orders",
+                targetRef: message.TargetSystem,
+                operation: async ct =>
+                {
+                    using var content = new ByteArrayContent(message.Payload);
+                    content.Headers.ContentType = System.Net.Http.Headers.MediaTypeHeaderValue.Parse(message.ContentType);
+                    using var response = await httpClients.CreateClient("target-system").PostAsync("api/orders", content, ct);
+                    response.EnsureSuccessStatusCode();
+                },
+                cancellationToken);
+            return PlatformMessageResult.Completed();
+        }
+    }
+
+    private sealed class RecordingReceiver : HttpMessageHandler
+    {
+        public List<(string Uri, List<(string Name, string Value)> Headers)> Requests { get; } = [];
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            var headers = request.Headers.Concat(request.Content?.Headers ?? Enumerable.Empty<KeyValuePair<string, IEnumerable<string>>>())
+                .SelectMany(header => header.Value.Select(value => (header.Key, value)))
+                .ToList();
+            Requests.Add((request.RequestUri!.ToString(), headers));
+            return Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.OK));
+        }
+    }
+
     private sealed class SyntheticHandler : IPlatformMessageHandler
     {
         public Task<PlatformMessageResult> HandleAsync(PlatformMessage message, CancellationToken cancellationToken)
@@ -1124,40 +1268,109 @@ public sealed class PlatformMessageStorePostgresTests
     }
 
     [TestMethod]
-    public async Task ReplayRecordsANewInlinePayloadExpiry()
+    public async Task ReplayRefreshesInlineExpiryUntilFirstReceiptCap()
     {
-        // Pins current behaviour: the upserts write
-        // payload_expires_at = excluded.payload_expires_at, so each processed
-        // replay sets the expiry from its own processing time.
-        var connectionString = RequireConnectionString();
-        var options = CreateOptions(connectionString);
-        var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+        var options = CreateOptions(RequireConnectionString());
         await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
-        var (store, _, _, _) = CreateStore(dataSource, options);
-
-        await store.RecordAttemptAsync(CreateMessage(messageId, options), "dotnet-handler", "COMPLETED", null, CancellationToken.None);
-        await using (var connection = await dataSource.OpenConnectionAsync())
+        var firstReceipt = new DateTimeOffset(2020, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var clock = new CaptureClock { Now = firstReceipt };
+        var store = new PlatformMessageStore(dataSource, new PlatformStepObservationCollector(),
+            Options.Create(options), NullLogger<PlatformMessageStore>.Instance) { Clock = clock };
+        var message = CreateMessage($"dotnet-test-{Guid.NewGuid():N}", options);
+        await store.RecordAttemptAsync(message, "dotnet-handler", "COMPLETED", null, CancellationToken.None);
+        await using var connection = await dataSource.OpenConnectionAsync();
+        await using (var age = new NpgsqlCommand(
+            "update bip_message_attempt set occurred_at = @first where message_id = @id", connection))
         {
-            await using var age = new NpgsqlCommand(
-                "update bip_message_log set payload_expires_at = now() + interval '1 day' where message_id = @message_id",
-                connection);
-            age.Parameters.AddWithValue("message_id", messageId);
+            age.Parameters.AddWithValue("first", firstReceipt);
+            age.Parameters.AddWithValue("id", message.MessageId);
             await age.ExecuteNonQueryAsync();
         }
 
-        var replay = CreateMessage(messageId, options, new Dictionary<string, string>
+        // Just before expiry, at the renewal boundary, near the cap, at the cap,
+        // and even a delayed delivery beyond it: no processing extends the cap.
+        var attempt = 1;
+        foreach (var days in new[] { 29, 30, 31, 59, 60, 61 })
         {
-            ["x-bip-attempt"] = "2",
-            ["x-bip-replay"] = "true",
-        });
-        await store.RecordAttemptAsync(replay, "dotnet-handler", "COMPLETED", null, CancellationToken.None);
+            clock.Now = firstReceipt.AddDays(days);
+            var replay = message with
+            {
+                Headers = new Dictionary<string, string>
+                {
+                    ["x-bip-attempt"] = (++attempt).ToString(System.Globalization.CultureInfo.InvariantCulture),
+                    ["x-bip-replay"] = "true",
+                },
+            };
+            await store.RecordAttemptAsync(replay, "dotnet-handler", "COMPLETED", null, CancellationToken.None);
+            await using var read = new NpgsqlCommand(
+                """
+                select l.payload_expires_at, a.payload_expires_at,
+                       (select payload_expires_at from bip_message_attempt where message_id = @id and attempt = 1)
+                from bip_message_log l join bip_message_attempt a using (message_id)
+                where message_id = @id and a.attempt = @attempt
+                """, connection);
+            read.Parameters.AddWithValue("id", message.MessageId);
+            read.Parameters.AddWithValue("attempt", attempt);
+            await using var reader = await read.ExecuteReaderAsync();
+            Assert.IsTrue(await reader.ReadAsync());
+            var expected = firstReceipt.AddDays(Math.Min(days + 30, 60));
+            Assert.AreEqual(expected, reader.GetFieldValue<DateTimeOffset>(0), $"Replay on day {days}");
+            Assert.AreEqual(expected, reader.GetFieldValue<DateTimeOffset>(1));
+            Assert.AreEqual(firstReceipt.AddDays(30), reader.GetFieldValue<DateTimeOffset>(2),
+                "Replaying must not extend historical payload expiry.");
+        }
+    }
 
-        await using var read = await dataSource.OpenConnectionAsync();
-        await using var command = new NpgsqlCommand(
-            "select payload_expires_at > now() + interval '29 days' from bip_message_log where message_id = @message_id",
-            read);
-        command.Parameters.AddWithValue("message_id", messageId);
-        Assert.AreEqual(true, await command.ExecuteScalarAsync(), "A replay currently extends the inline payload expiry.");
+    [TestMethod]
+    [DataRow(0)]
+    [DataRow(30)]
+    public async Task InlineExpiryUsesOnlyThisIntegrationsHistoryAndHandlesZeroRetention(int retentionDays)
+    {
+        var options = CreateOptions(RequireConnectionString());
+        options.PayloadRetentionDays = retentionDays;
+        await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+        var firstReceipt = new DateTimeOffset(2020, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var clock = new CaptureClock { Now = firstReceipt };
+        var message = CreateMessage($"dotnet-test-{Guid.NewGuid():N}", options);
+        var other = CreateOptions(options.PostgresConnectionString);
+        other.ApplicationName = "integration-other";
+        var (otherStore, _, _, _) = CreateStore(dataSource, other);
+        await otherStore.RecordAttemptAsync(message, "other-handler", "COMPLETED", null, CancellationToken.None);
+        await using var connection = await dataSource.OpenConnectionAsync();
+        await using var age = new NpgsqlCommand(
+            "update bip_message_attempt set occurred_at = @first where message_id = @id and attempt = @attempt", connection);
+        age.Parameters.AddWithValue("first", firstReceipt.AddYears(-1));
+        age.Parameters.AddWithValue("id", message.MessageId);
+        age.Parameters.AddWithValue("attempt", 1);
+        await age.ExecuteNonQueryAsync();
+
+        var store = new PlatformMessageStore(dataSource, new PlatformStepObservationCollector(),
+            Options.Create(options), NullLogger<PlatformMessageStore>.Instance) { Clock = clock };
+        await store.RecordAttemptAsync(message with
+        {
+            Headers = new Dictionary<string, string> { ["x-bip-attempt"] = "2" },
+        }, "dotnet-handler", "COMPLETED", null, CancellationToken.None);
+        await using var read = new NpgsqlCommand(
+            "select payload_expires_at from bip_message_log where message_id = @id", connection);
+        read.Parameters.AddWithValue("id", message.MessageId);
+        Assert.AreEqual(firstReceipt.AddDays(retentionDays).UtcDateTime, await read.ExecuteScalarAsync(),
+            "Without this integration's history, capture time anchors the expiry.");
+
+        age.Parameters["first"].Value = firstReceipt;
+        age.Parameters["attempt"].Value = 2;
+        await age.ExecuteNonQueryAsync();
+        clock.Now = firstReceipt.AddDays(90);
+        await store.RecordAttemptAsync(message with
+        {
+            Headers = new Dictionary<string, string> { ["x-bip-attempt"] = "3", ["x-bip-replay"] = "true" },
+        }, "dotnet-handler", "COMPLETED", null, CancellationToken.None);
+        Assert.AreEqual(firstReceipt.AddDays(2 * retentionDays).UtcDateTime, await read.ExecuteScalarAsync());
+    }
+
+    private sealed class CaptureClock : TimeProvider
+    {
+        public DateTimeOffset Now { get; set; }
+        public override DateTimeOffset GetUtcNow() => Now;
     }
 
     [TestMethod]
