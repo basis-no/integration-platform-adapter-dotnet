@@ -1661,6 +1661,45 @@ public sealed class PlatformMessageStorePostgresTests
     }
 
     [TestMethod]
+    public async Task ActivityCountsEachConsumedRedeliveryButNotInProcessRetries()
+    {
+        var options = CreateOptions(RequireConnectionString());
+        options.TrafficSignals = "record_admitted";
+        options.HandlerRetryDelayMs = 0;
+        var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+        await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+        var (store, _, observations, _) = CreateStore(dataSource, options);
+        using var capture = new TrafficCapture();
+        using var metrics = new PlatformTrafficMetrics(options);
+        var calls = 0;
+        var handler = new DelegateHandler((_, _) =>
+        {
+            capture.Collect();
+            Assert.AreEqual(calls < 3 ? 1 : 2, capture.Value("integration_traffic_events_total", "record_admitted"));
+            Assert.AreEqual(1, capture.Value("integration_traffic_signal_supported", "record_admitted"));
+            calls++;
+            return Task.FromResult(PlatformMessageResult.Failed("synthetic handler failure"));
+        });
+        var publications = 0;
+        var producer = new FakeProducer((_, _) =>
+        {
+            if (++publications == 1) throw new InvalidOperationException("synthetic DLQ failure forces redelivery");
+            return Task.CompletedTask;
+        });
+        var service = new PlatformMessageConsumerService(handler, store, observations, producer, Options.Create(options),
+            NullLogger<PlatformMessageConsumerService>.Instance, metrics) { FailureBackoff = TimeSpan.Zero };
+        using var stopping = new CancellationTokenSource();
+        var consumer = new FakeConsumer(stopping, ConsumeResultFor(messageId, 0, options), ConsumeResultFor(messageId, 0, options));
+        await service.ConsumeAsync(consumer, stopping.Token).WaitAsync(TimeSpan.FromSeconds(30));
+        capture.Collect();
+        Assert.AreEqual(2, capture.Value("integration_traffic_events_total", "record_admitted"));
+        Assert.AreEqual(0, capture.Value("integration_traffic_signal_supported", "record_admitted"), "A stopped consumer has unknown coverage.");
+        Assert.AreEqual(6, calls);
+        CollectionAssert.AreEqual(new long[] { 0 }, consumer.Seeks);
+        CollectionAssert.AreEqual(new long[] { 0 }, consumer.Commits);
+    }
+
+    [TestMethod]
     public async Task StepContextSuppliesReceiverKeyBeforeCallAcrossRedeliveryReplayAndRedo()
     {
         var options = CreateOptions(RequireConnectionString());

@@ -15,6 +15,17 @@
   parking it, also when the ledger call was cancelled by the handler's own
   token. Before, a step that never ran could be recorded as completed.
 
+- Export Kafka activity through `System.Diagnostics.Metrics` (meter
+  `Basis.IntegrationPlatform.MessageStore`), with the same metric names and
+  signal labels as the Camel adapter. `BASIS_TRAFFIC_SIGNALS` selects the
+  signals: `record_admitted` is on by default, an empty value turns export
+  off, and `record_published` also needs `BASIS_TRAFFIC_INPUT_TOPICS`. A
+  signal that is not selected or cannot be counted reports `supported=0`, and
+  the adapter logs once when coverage becomes unknown. The registered
+  `IProducer<string, byte[]>` is now a wrapper that forwards every call to the
+  Kafka producer and observes acknowledgements. No metrics endpoint, exporter
+  dependency, schema change or message data in labels.
+
 - `IPlatformStepExecutor.ExecuteWithContextAsync` passes the operation a
   `PlatformStepExecutionContext` with the step's idempotency key and step id
   before the call. Send the key as `Idempotency-Key` and

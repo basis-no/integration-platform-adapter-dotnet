@@ -66,6 +66,29 @@ public sealed class PlatformMessageStoreOptionsTests
     }
 
     [TestMethod]
+    public void TrafficEnvironmentDefaultsToAdmissionAndReadsExplicitSelection()
+    {
+        var signals = Environment.GetEnvironmentVariable("BASIS_TRAFFIC_SIGNALS");
+        var topics = Environment.GetEnvironmentVariable("BASIS_TRAFFIC_INPUT_TOPICS");
+        try
+        {
+            Environment.SetEnvironmentVariable("BASIS_TRAFFIC_SIGNALS", null);
+            Environment.SetEnvironmentVariable("BASIS_TRAFFIC_INPUT_TOPICS", null);
+            Assert.AreEqual("record_admitted", new PlatformMessageStoreOptions().TrafficSignals);
+            Assert.AreEqual("", new PlatformMessageStoreOptions().TrafficInputTopics);
+            Environment.SetEnvironmentVariable("BASIS_TRAFFIC_SIGNALS", "record_admitted,record_published");
+            Environment.SetEnvironmentVariable("BASIS_TRAFFIC_INPUT_TOPICS", "orders.in");
+            Assert.AreEqual("record_admitted,record_published", new PlatformMessageStoreOptions().TrafficSignals);
+            Assert.AreEqual("orders.in", new PlatformMessageStoreOptions().TrafficInputTopics);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("BASIS_TRAFFIC_SIGNALS", signals);
+            Environment.SetEnvironmentVariable("BASIS_TRAFFIC_INPUT_TOPICS", topics);
+        }
+    }
+
+    [TestMethod]
     public void ValidateNormalizesPayloadModeSpelling()
     {
         var options = ValidOptions();

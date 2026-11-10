@@ -30,6 +30,8 @@ public sealed class PlatformMessageStoreOptions
     public string PayloadMode { get; set; } = Environment.GetEnvironmentVariable("BASIS_MESSAGE_STORE_PAYLOAD_MODE") ?? PayloadModePostgresInline;
     public long PayloadMaxBytes { get; set; } = LongFromEnvironment("BASIS_MESSAGE_STORE_PAYLOAD_MAX_BYTES", 1_048_576);
     public int PayloadRetentionDays { get; set; } = IntFromEnvironment("BASIS_MESSAGE_STORE_PAYLOAD_RETENTION_DAYS", 30);
+    public string TrafficSignals { get; set; } = Environment.GetEnvironmentVariable("BASIS_TRAFFIC_SIGNALS") ?? "record_admitted";
+    public string TrafficInputTopics { get; set; } = Environment.GetEnvironmentVariable("BASIS_TRAFFIC_INPUT_TOPICS") ?? "";
 
     /// <summary>
     /// Where delivered steps are kept: <c>postgres</c> (bip_step_outcome, the

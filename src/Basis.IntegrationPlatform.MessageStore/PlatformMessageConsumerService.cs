@@ -28,6 +28,7 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
     private readonly IProducer<string, byte[]> producer;
     private readonly PlatformMessageStoreOptions options;
     private readonly ILogger<PlatformMessageConsumerService> logger;
+    private readonly PlatformTrafficMetrics? traffic;
 
     public PlatformMessageConsumerService(
         IPlatformMessageHandler handler,
@@ -35,7 +36,8 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
         PlatformStepObservationCollector stepObservations,
         IProducer<string, byte[]> producer,
         IOptions<PlatformMessageStoreOptions> options,
-        ILogger<PlatformMessageConsumerService> logger)
+        ILogger<PlatformMessageConsumerService> logger,
+        PlatformTrafficMetrics? traffic = null)
     {
         this.handler = handler;
         this.store = store;
@@ -43,6 +45,9 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
         this.producer = producer;
         this.options = options.Value;
         this.logger = logger;
+        this.traffic = traffic;
+        if (producer is PlatformTrafficProducer instrumented) instrumented.Selected();
+        else traffic?.InvalidatePublication();
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -68,40 +73,50 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
 
     internal async Task ConsumeAsync(IConsumer<string, byte[]> consumer, CancellationToken stoppingToken)
     {
-        while (!stoppingToken.IsCancellationRequested)
+        traffic?.ConsumerStarted();
+        try
         {
-            ConsumeResult<string, byte[]> result;
-            try
+            while (!stoppingToken.IsCancellationRequested)
             {
-                result = consumer.Consume(stoppingToken);
-            }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-            {
-                break;
-            }
-            catch (ConsumeException ex) when (!ex.Error.IsFatal)
-            {
-                // The client reports recoverable errors, such as a subscribed
-                // topic that does not exist yet, and keeps going; so does the
-                // loop. The deserializers cannot fail (keys are decoded as UTF-8
-                // with replacement, values are raw bytes), so no record is
-                // skipped. A fatal error still ends the consumer.
-                logger.LogWarning("Message-store adapter consume error, retrying code={ErrorCode} reason={Reason}", ex.Error.Code, ex.Error.Reason);
-                await Task.Delay(FailureBackoff, stoppingToken);
-                continue;
-            }
+                ConsumeResult<string, byte[]> result;
+                try
+                {
+                    result = consumer.Consume(stoppingToken);
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (ConsumeException ex) when (!ex.Error.IsFatal)
+                {
+                    // The client reports recoverable errors, such as a subscribed
+                    // topic that does not exist yet, and keeps going; so does the
+                    // loop. The deserializers cannot fail (keys are decoded as UTF-8
+                    // with replacement, values are raw bytes), so no record is
+                    // skipped. A fatal error still ends the consumer.
+                    logger.LogWarning("Message-store adapter consume error, retrying code={ErrorCode} reason={Reason}", ex.Error.Code, ex.Error.Reason);
+                    await Task.Delay(FailureBackoff, stoppingToken);
+                    continue;
+                }
 
-            var message = ToPlatformMessage(result.Message, options);
-            try
-            {
-                await ProcessAsync(message, () => consumer.Commit(result), stoppingToken);
+                if (result.IsPartitionEOF || result.Message is null) continue;
+                var message = ToPlatformMessage(result.Message, options);
+                traffic?.RecordAdmitted(result.Topic, result.Partition.Value, result.Offset.Value);
+                try
+                {
+                    await ProcessAsync(message, () => consumer.Commit(result), stoppingToken);
+                }
+                catch (Exception ex) when (!IsShutdown(ex, stoppingToken))
+                {
+                    logger.LogError(ex, "Message-store adapter failed to persist or publish message result messageId={MessageId}", message.MessageId);
+                    consumer.Seek(result.TopicPartitionOffset);
+                    await Task.Delay(FailureBackoff, stoppingToken);
+                }
             }
-            catch (Exception ex) when (!IsShutdown(ex, stoppingToken))
-            {
-                logger.LogError(ex, "Message-store adapter failed to persist or publish message result messageId={MessageId}", message.MessageId);
-                consumer.Seek(result.TopicPartitionOffset);
-                await Task.Delay(FailureBackoff, stoppingToken);
-            }
+        }
+        finally
+        {
+            traffic?.ConsumerStopped();
         }
     }
 
