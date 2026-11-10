@@ -14,6 +14,19 @@
   upgrade if per-key order matters. An empty (non-null) key now hashes to one
   fixed partition like any other key, as in Java; only a null key is spread.
 
+- A step whose operation returned is never recorded `FAILED`. When the
+  `DELIVERED` write fails, the step executor retries it in place, and if it
+  keeps failing, throws the store failure without writing `FAILED`. Before,
+  a store error after a successful call recorded the step `FAILED`, with the
+  store's error text as the step's error, so a later attempt or replay sent
+  the call again.
+
+- A handler that catches a step ledger failure and returns success no longer
+  gets the message recorded `COMPLETED`: the adapter notes the store failure
+  next to the step observations and processes the delivery again, without
+  parking it, also when the ledger call was cancelled by the handler's own
+  token. Before, a step that never ran could be recorded as completed.
+
 - Startup refuses a Message Store that lacks a table or column of the store
   schema the adapter ships, for each table this configuration uses: the
   message tables always, `bip_step_outcome` with the `postgres` step outcome

@@ -30,6 +30,8 @@ public sealed class PlatformStepObservationCollector
     // In-process retries re-run the handler within one processing attempt, so
     // a step seen again in a later invocation is a retry, not a reused id.
     private readonly ConcurrentDictionary<string, int> invocationStarts = new(StringComparer.Ordinal);
+    // Messages whose current handler invocation saw a step ledger call fail.
+    private readonly ConcurrentDictionary<string, bool> storeFailures = new(StringComparer.Ordinal);
 
     public void Record(string messageId, PlatformStepObservation observation)
     {
@@ -59,12 +61,25 @@ public sealed class PlatformStepObservationCollector
     {
         observations.TryRemove(messageId, out _);
         invocationStarts.TryRemove(messageId, out _);
+        storeFailures.TryRemove(messageId, out _);
     }
 
     internal void BeginHandlerInvocation(string messageId)
     {
         invocationStarts[messageId] = Snapshot(messageId).Count;
+        storeFailures.TryRemove(messageId, out _);
     }
+
+    internal void NoteStoreFailure(string messageId)
+    {
+        storeFailures[messageId] = true;
+    }
+
+    /// <summary>
+    /// Whether a step ledger call failed during the current handler
+    /// invocation, whatever the handler did with the exception.
+    /// </summary>
+    internal bool StoreFailedInCurrentInvocation(string messageId) => storeFailures.ContainsKey(messageId);
 
     /// <summary>
     /// How the current handler invocation already used this idempotency key,
