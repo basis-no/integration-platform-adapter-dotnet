@@ -98,6 +98,25 @@ public sealed class PlatformMessageStoreOptionsTests
     }
 
     [TestMethod]
+    public void StepOutcomeStoreReadsEnvironment()
+    {
+        var store = Environment.GetEnvironmentVariable("BASIS_MESSAGE_STORE_STEP_OUTCOME_STORE");
+        try
+        {
+            Environment.SetEnvironmentVariable("BASIS_MESSAGE_STORE_STEP_OUTCOME_STORE", "noop");
+
+            var options = new PlatformMessageStoreOptions();
+
+            Assert.AreEqual("noop", options.StepOutcomeStore);
+            Assert.IsFalse(options.UsesStepLedger);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("BASIS_MESSAGE_STORE_STEP_OUTCOME_STORE", store);
+        }
+    }
+
+    [TestMethod]
     public void PayloadPolicyReadsEnvironment()
     {
         var mode = Environment.GetEnvironmentVariable("BASIS_MESSAGE_STORE_PAYLOAD_MODE");
