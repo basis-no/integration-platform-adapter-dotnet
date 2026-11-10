@@ -690,6 +690,44 @@ public sealed class PlatformMessageStorePostgresTests
     }
 
     [TestMethod]
+    public async Task ReplayRecordIsKeyedByTheCorrelationId()
+    {
+        var connectionString = RequireConnectionString();
+        var options = CreateOptions(connectionString);
+        await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+        var (store, _, _, _) = CreateStore(dataSource, options);
+        var producer = new FakeProducer();
+        var withHeader = $"dotnet-test-{Guid.NewGuid():N}";
+        var withoutHeader = $"dotnet-test-{Guid.NewGuid():N}";
+        var withoutKey = $"dotnet-test-{Guid.NewGuid():N}";
+        foreach (var (messageId, key, correlationId) in new[]
+        {
+            (withHeader, "record-key-1", "correlation-1"),
+            (withoutHeader, "record-key-2", null),
+            (withoutKey, null, null),
+        })
+        {
+            var headers = new Headers { { "x-bip-message-id", Encoding.UTF8.GetBytes(messageId) } };
+            if (correlationId is not null)
+            {
+                headers.Add("x-bip-correlation-id", Encoding.UTF8.GetBytes(correlationId));
+            }
+
+            var consumed = new Message<string, byte[]> { Key = key!, Value = "{}"u8.ToArray(), Headers = headers };
+            await store.RecordAttemptAsync(
+                PlatformMessageConsumerService.ToPlatformMessage(consumed, options), "dotnet-handler", "COMPLETED", null, CancellationToken.None);
+            Assert.AreEqual("PUBLISHED", (await store.ReplayAsync(messageId, new MessageReplayRequest("operator", "resend"), producer, CancellationToken.None)).Status);
+        }
+
+        // x-bip-correlation-id, else the original record's key, else the message id.
+        CollectionAssert.AreEqual(
+            new[] { "correlation-1", "record-key-2", withoutKey },
+            producer.Produced.Select(produced => produced.Message.Key).ToArray());
+        // The replay topic is the pattern with the integration name.
+        Assert.IsTrue(producer.Produced.All(produced => produced.Topic == "bip.integration-e2e-dotnet.in"));
+    }
+
+    [TestMethod]
     public async Task SchemaVersionFromProducerIsStoredAndReemittedOnReplay()
     {
         var connectionString = RequireConnectionString();
