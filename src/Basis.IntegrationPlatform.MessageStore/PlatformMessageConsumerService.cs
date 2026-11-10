@@ -180,6 +180,18 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
 
         if (handled.Result.Succeeded)
         {
+            if (stepObservations.StoreFailedInCurrentInvocation(message.MessageId))
+            {
+                // On shutdown, stop as a shutdown rather than as a store failure.
+                cancellationToken.ThrowIfCancellationRequested();
+                // A step ledger call failed and the handler returned success
+                // anyway: a step may not have run, or its delivery isn't
+                // recorded. Process the delivery again instead of recording
+                // COMPLETED, and park nothing.
+                throw new InvalidOperationException(
+                    "A step ledger call failed in the handler's last invocation, which returned success; the delivery is processed again.");
+            }
+
             await store.RecordAttemptAsync(message, metadata, "COMPLETED", null, cancellationToken);
             commitOffset();
             return;

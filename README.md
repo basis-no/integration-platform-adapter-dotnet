@@ -133,6 +133,21 @@ leave the operation: the handler can catch it and return
 `PlatformMessageResult.Failed`, or let it propagate, and the adapter retries
 the handler and then parks the message.
 
+The step's own record in the Message Store can fail too. An operation that
+returned is never recorded `FAILED`: the executor retries the `DELIVERED`
+write in place (three attempts), and if it still fails, it throws
+the store's exception without writing `FAILED`; the step then runs again on
+the next delivery, so send its idempotency key to the receiver. A failed
+ledger read before the step throws without running the operation. Either way
+the adapter notes the store failure outside the exception: if the handler
+catches it and returns success anyway, the adapter does not record the message
+`COMPLETED` or commit its offset, but processes the delivery again after the
+failure backoff, without parking it. This includes a ledger call cut short by
+the handler's own cancellation token, such as a timeout. A ledger write that
+fails every time for one message, with a handler that swallows it, therefore
+blocks its partition and calls the receiver again on each pass; the error log
+names the message and step.
+
 The step key is `<message-id>:<step-id>`, and a step whose key is already
 `DELIVERED` in `bip_step_outcome` is skipped, unless the message's
 `x-bip-redo-steps` header (a JSON array of step ids or step keys) names it.
