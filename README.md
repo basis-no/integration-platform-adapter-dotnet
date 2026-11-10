@@ -188,6 +188,30 @@ defaults to `dotnet-integration`; set it, because it also names the Kafka
 consumer group and the default input topic. The input and DLQ topics default
 as listed above, and the replay topic pattern defaults to `bip.%s.in`.
 
+## Step outcome store
+
+| Environment variable | Default | Meaning |
+|---|---|---|
+| `BASIS_MESSAGE_STORE_STEP_OUTCOME_STORE` | `postgres` | `postgres` or `noop` |
+
+With `postgres`, delivered steps are kept in `bip_step_outcome` and a replay
+skips them, as described under Integration Usage. With `noop`, nothing is read
+from or written to `bip_step_outcome`: every step runs on every delivery,
+replays included, and `steps_json` still records what each attempt observed.
+A resend whose `redoSteps` names a step is then refused with
+`409 NOT_REPLAYABLE` before any audit row or produce, because every step runs
+anyway; a resend without `redoSteps` works as usual. The value is trimmed and
+read case-insensitively; an empty value means the default, and any other value
+fails startup. The setting reaches the step executor through
+`AddBasisMessageStoreAdapter`; a `PlatformStepExecutor` constructed directly
+uses `bip_step_outcome`. The variable has the same name and values as in the
+Camel adapter, whose library default is `noop`; this adapter's default stays
+`postgres`.
+
+Switching from `noop` back to `postgres` keeps the rows written before the
+`noop` period: a step delivered before the `noop` period is skipped on a later
+replay, even if it ran again and failed under `noop`. Name such a step in `redoSteps` to run it.
+
 ## Payload policy
 
 The same semantics as the Camel Quarkus adapter:
