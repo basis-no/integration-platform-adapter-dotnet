@@ -130,6 +130,20 @@ public sealed class PlatformMessageStoreOptions
         return config;
     }
 
+    /// <summary>
+    /// The registered producer's configuration. It partitions a keyed record
+    /// with murmur2, as Java Kafka clients do, so a replay or a DLQ record
+    /// with the same key lands where a Java producer puts that key; the
+    /// client's own default (consistent_random, CRC32) places it elsewhere.
+    /// </summary>
+    internal ProducerConfig CreateProducerConfig()
+    {
+        return new ProducerConfig(CreateKafkaClientConfig())
+        {
+            Partitioner = Partitioner.Murmur2Random,
+        };
+    }
+
     private static T EnumFromEnvironment<T>(string name, T fallback) where T : struct, Enum
     {
         var raw = Environment.GetEnvironmentVariable(name);

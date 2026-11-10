@@ -140,6 +140,15 @@ public sealed class PlatformMessageStoreOptionsTests
     }
 
     [TestMethod]
+    public void RegisteredProducerPartitionsKeysAsJavaClientsDo()
+    {
+        var config = ValidOptions().CreateProducerConfig();
+
+        Assert.AreEqual(Partitioner.Murmur2Random, config.Partitioner);
+        Assert.AreEqual("murmur2_random", config.Get("partitioner"));
+    }
+
+    [TestMethod]
     public void PayloadPolicyReadsEnvironment()
     {
         var mode = Environment.GetEnvironmentVariable("BASIS_MESSAGE_STORE_PAYLOAD_MODE");
