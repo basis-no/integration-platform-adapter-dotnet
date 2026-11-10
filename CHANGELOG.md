@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Startup refuses a Message Store that lacks a table or column of the store
+  schema the adapter ships, for each table this configuration uses: the
+  message tables always, `bip_step_outcome` with the `postgres` step outcome
+  store and `bip_message_replay_audit` when the resend endpoint is mapped. The
+  error names each missing table and column and gives the statements that add
+  them. The contract major check alone let such a store through: every message
+  then failed to record and was consumed again without end, or, with a column
+  missing from `bip_step_outcome`, its step ran once per handler attempt
+  before the message was parked. A store provisioned for an earlier adapter
+  version must be brought up to date before upgrading: the new version stops
+  its host instead of consuming. The check runs once the host has started, so
+  the consumer starts consuming after the application's other hosted services
+  have started.
+
 - Export Kafka activity through `System.Diagnostics.Metrics` (meter
   `Basis.IntegrationPlatform.MessageStore`), with the same metric names and
   signal labels as the Camel adapter. `BASIS_TRAFFIC_SIGNALS` selects the

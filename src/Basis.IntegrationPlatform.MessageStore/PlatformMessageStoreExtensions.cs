@@ -36,6 +36,7 @@ public static class PlatformMessageStoreExtensions
             return NpgsqlDataSource.Create(options.PostgresConnectionString);
         });
         services.AddSingleton<PlatformStepObservationCollector>();
+        services.AddSingleton<PlatformReplayEndpoints>();
         // Preserve the original default datasource registration for compatibility.
         // Adapter internals always select their own key, even if the application
         // registers a different default datasource for business data afterwards.
@@ -66,6 +67,13 @@ public static class PlatformMessageStoreExtensions
 
     public static IEndpointRouteBuilder MapBasisMessageStoreAdminEndpoints(this IEndpointRouteBuilder endpoints)
     {
+        // Mapping the resend endpoint makes the startup check require the
+        // replay audit table too.
+        if (endpoints.ServiceProvider.GetService<PlatformReplayEndpoints>() is { } replayEndpoints)
+        {
+            replayEndpoints.Mapped = true;
+        }
+
         endpoints.MapPost("/admin/messages/{messageId}/resend", async (
             string messageId,
             HttpContext context,
@@ -140,3 +148,20 @@ public static class PlatformMessageStoreExtensions
 /// Error body of the resend endpoint: { code, error, replayId? }.
 /// </summary>
 public sealed record ReplayErrorBody(string Code, string Error, string? ReplayId = null);
+
+/// <summary>
+/// Whether the application mapped the resend endpoint. The consumer reads it
+/// once the host has started, so endpoints a Startup class maps while the web
+/// host starts count too, to decide whether the store must have the replay
+/// audit table.
+/// </summary>
+internal sealed class PlatformReplayEndpoints
+{
+    private volatile bool mapped;
+
+    internal bool Mapped
+    {
+        get => mapped;
+        set => mapped = value;
+    }
+}
