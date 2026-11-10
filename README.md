@@ -130,7 +130,9 @@ Choose step ids with that in mind:
   Message Store and both use the same step id, the second integration's step is
   skipped as already delivered. Use step ids unique across integrations, and
   when one integration produces for another, give the new message its own
-  `x-bip-message-id` and carry continuity in `x-bip-correlation-id`.
+  `x-bip-message-id` and carry continuity in `x-bip-correlation-id`, which
+  then also has to be the record key if replays should keep its partition
+  (see Replay order).
 
 When the step executor skips a step that the same handler invocation already
 delivered, it logs an ERROR, once per skipped call, with the step id and the
@@ -215,10 +217,13 @@ is captured, unexpired, and undeleted.
 A resend publishes a new record to the replay topic; it never returns to the
 original offset. The replay topic is
 `BASIS_MESSAGE_STORE_REPLAY_INPUT_TOPIC_PATTERN` with `%s` replaced by the
-integration name (default `bip.%s.in`), so it is the input topic when the two
-agree. The record's Kafka key is the message's correlation id:
-`x-bip-correlation-id`, else the original record's key, else the message id.
-Kafka orders records only within a partition, so:
+integration name (default `bip.%s.in`). If `APP_KAFKA_INPUT_TOPIC` names
+another topic, set the pattern to match, or the replay is published to a topic
+this integration does not consume. The record's Kafka key is the message's
+correlation id: `x-bip-correlation-id`, else the original record's key when it
+has one (an empty key is kept as is), else the message id. A replay is
+appended after everything already published, and Kafka orders records only
+within a partition, so:
 
 - records for the same key that were published after the original may already
   have been processed. Replaying an old failure after a newer update for the

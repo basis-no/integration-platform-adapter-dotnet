@@ -596,7 +596,8 @@ public sealed class PlatformMessageStorePostgresTests
         CollectionAssert.AreEqual(
             new[] { "correlation-1", "record-key-2", withoutKey },
             producer.Produced.Select(produced => produced.Message.Key).ToArray());
-        Assert.IsTrue(producer.Produced.All(produced => produced.Topic == options.InputTopic));
+        // The replay topic is the pattern with the integration name.
+        Assert.IsTrue(producer.Produced.All(produced => produced.Topic == "bip.integration-e2e-dotnet.in"));
     }
 
     [TestMethod]
