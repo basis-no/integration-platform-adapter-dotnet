@@ -2089,10 +2089,28 @@ public sealed class PlatformMessageStorePostgresTests
     [DataRow("delivered-write")]
     [DataRow("failed-write")]
     [DataRow("handler-timeout")]
+    [DataRow("handler-timeout-read-lock")]
+    [DataRow("handler-timeout-write-lock")]
     public async Task HandlerThatSwallowsALedgerWriteFailureIsNotRecordedCompleted(string path)
     {
-        await WithFailingLedgerAsync(failures: path == "delivered-write" ? 3 : 100, async (dataSource, options) =>
+        var locked = path.EndsWith("-lock", StringComparison.Ordinal);
+        await WithFailingLedgerAsync(failures: locked ? 0 : path == "delivered-write" ? 3 : 100, async (dataSource, options) =>
         {
+            // Another session holds the ledger table, so the ledger call hangs
+            // until the handler's own timeout cancels it.
+            await using var holder = await dataSource.OpenConnectionAsync();
+            await using var holding = await holder.BeginTransactionAsync();
+            async Task HoldLedgerAsync()
+            {
+                await using var hold = new NpgsqlCommand("lock table bip_step_outcome in access exclusive mode", holder, holding);
+                await hold.ExecuteNonQueryAsync();
+            }
+
+            if (path == "handler-timeout-read-lock")
+            {
+                await HoldLedgerAsync();
+            }
+
             var observations = new PlatformStepObservationCollector();
             var store = new PlatformMessageStore(dataSource, observations, Options.Create(options), NullLogger<PlatformMessageStore>.Instance);
             // The handler's own timeout ends the in-place retry of the DELIVERED write.
@@ -2104,11 +2122,19 @@ public sealed class PlatformMessageStorePostgresTests
                 timeout.CancelAfter(TimeSpan.FromMilliseconds(300));
                 try
                 {
-                    await steps.ExecuteAsync(message, "deliver", "https://target.example/orders", "target", _ =>
+                    await steps.ExecuteAsync(message, "deliver", "https://target.example/orders", "target", async _ =>
                     {
                         sends++;
-                        return path == "failed-write" ? throw new HttpRequestException("synthetic receiver failure") : Task.CompletedTask;
-                    }, path == "handler-timeout" ? timeout.Token : ct);
+                        if (path == "failed-write")
+                        {
+                            throw new HttpRequestException("synthetic receiver failure");
+                        }
+
+                        if (path == "handler-timeout-write-lock")
+                        {
+                            await HoldLedgerAsync();
+                        }
+                    }, path.StartsWith("handler-timeout", StringComparison.Ordinal) ? timeout.Token : ct);
                 }
                 catch (Exception)
                 {
@@ -2125,8 +2151,9 @@ public sealed class PlatformMessageStorePostgresTests
             await Assert.ThrowsExactlyAsync<InvalidOperationException>(
                 () => service.ProcessAsync(CreateMessage(messageId, options), () => committed = true, CancellationToken.None));
 
-            Assert.AreEqual(1, sends);
+            Assert.AreEqual(path == "handler-timeout-read-lock" ? 0 : 1, sends);
             Assert.IsFalse(committed);
+            await holding.RollbackAsync();
             Assert.IsNull(await LogStatusAsync(dataSource, messageId), "Nothing is recorded COMPLETED.");
             Assert.IsNull(await StepStatusAsync(dataSource, $"{messageId}:deliver"));
             Assert.AreEqual(0, producer.Produced.Count, "Nothing is parked.");

@@ -148,6 +148,8 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
         {
             if (stepObservations.StoreFailedInCurrentInvocation(message.MessageId))
             {
+                // On shutdown, stop as a shutdown rather than as a store failure.
+                cancellationToken.ThrowIfCancellationRequested();
                 // A step ledger call failed and the handler returned success
                 // anyway: a step may not have run, or its delivery isn't
                 // recorded. Process the delivery again instead of recording
