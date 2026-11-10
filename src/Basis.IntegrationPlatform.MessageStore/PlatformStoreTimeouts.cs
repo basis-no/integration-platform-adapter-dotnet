@@ -1,5 +1,3 @@
-using System.Data.Common;
-using System.Text.RegularExpressions;
 using Npgsql;
 
 namespace Basis.IntegrationPlatform.MessageStore;
@@ -30,14 +28,16 @@ internal static class PlatformStoreTimeouts
 
     /// <summary>
     /// The connection string with each timeout the deployment did not set.
-    /// The server-side timeouts go in the startup <c>Options</c>; a
-    /// connection string that sets <c>Options</c> itself is left as it is,
-    /// for a pooler that refuses startup parameters.
+    /// The server-side timeouts go in the startup <c>Options</c>, after any
+    /// <c>PGOPTIONS</c> Npgsql would otherwise use. A connection string that
+    /// sets <c>Options</c> itself, also an empty one, is left as it is, and
+    /// <paramref name="serverTimeouts"/> false adds none, for a pooler that
+    /// refuses startup parameters.
     /// </summary>
-    internal static string Apply(string connectionString)
+    internal static string Apply(string connectionString, bool serverTimeouts = true)
     {
-        var given = new DbConnectionStringBuilder { ConnectionString = connectionString };
-        bool Has(params string[] keys) => keys.Any(given.ContainsKey);
+        var given = Keywords(connectionString);
+        bool Has(params string[] keys) => keys.Any(key => given.Contains(Normalize(key)));
         var builder = new NpgsqlConnectionStringBuilder(connectionString);
         if (!Has("Timeout"))
         {
@@ -49,18 +49,80 @@ internal static class PlatformStoreTimeouts
             builder.CommandTimeout = CommandSeconds;
         }
 
-        if (!Has("Keepalive", "Keep Alive", "KeepAlive"))
+        if (!Has("Keepalive"))
         {
             builder.KeepAlive = KeepaliveSeconds;
         }
 
-        // An empty Options= is a choice too (no startup parameters at all),
-        // and the generic builder drops empty values, so look at the text.
-        if (!Has("Options") && !Regex.IsMatch(connectionString, @"(^|;)\s*options\s*=", RegexOptions.IgnoreCase))
+        if (serverTimeouts && !Has("Options"))
         {
-            builder.Options = $"-c statement_timeout={StatementTimeoutMs} -c lock_timeout={LockTimeoutMs}";
+            // Npgsql uses PGOPTIONS only when the connection string has no
+            // Options; keep what it carries (a search_path, say).
+            var environment = Environment.GetEnvironmentVariable("PGOPTIONS");
+            var timeouts = $"-c statement_timeout={StatementTimeoutMs} -c lock_timeout={LockTimeoutMs}";
+            builder.Options = string.IsNullOrWhiteSpace(environment) ? timeouts : $"{environment.Trim()} {timeouts}";
         }
 
         return builder.ConnectionString;
     }
+
+    /// <summary>
+    /// The keywords a connection string sets, also those with an empty value,
+    /// read outside quoted values so a password can't look like a keyword.
+    /// </summary>
+    internal static HashSet<string> Keywords(string connectionString)
+    {
+        var keywords = new HashSet<string>(StringComparer.Ordinal);
+        var index = 0;
+        while (index < connectionString.Length)
+        {
+            var equals = connectionString.IndexOf('=', index);
+            if (equals < 0)
+            {
+                break;
+            }
+
+            var key = Normalize(connectionString[index..equals]);
+            if (key.Length > 0)
+            {
+                keywords.Add(key);
+            }
+
+            index = equals + 1;
+            while (index < connectionString.Length && char.IsWhiteSpace(connectionString[index]))
+            {
+                index++;
+            }
+
+            if (index < connectionString.Length && connectionString[index] is '\'' or '"')
+            {
+                // A quoted value ends at its closing quote; a doubled quote is
+                // an escaped one.
+                var quote = connectionString[index++];
+                while (index < connectionString.Length)
+                {
+                    if (connectionString[index] == quote)
+                    {
+                        if (index + 1 < connectionString.Length && connectionString[index + 1] == quote)
+                        {
+                            index += 2;
+                            continue;
+                        }
+
+                        index++;
+                        break;
+                    }
+
+                    index++;
+                }
+            }
+
+            var semicolon = connectionString.IndexOf(';', index);
+            index = semicolon < 0 ? connectionString.Length : semicolon + 1;
+        }
+
+        return keywords;
+    }
+
+    private static string Normalize(string key) => string.Join(' ', key.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)).ToLowerInvariant();
 }

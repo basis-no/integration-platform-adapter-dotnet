@@ -1,3 +1,4 @@
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 using Npgsql;
 
@@ -22,6 +23,8 @@ public sealed class PlatformStoreTimeoutsTests
 
     [TestMethod]
     [DataRow("Timeout=30;Command Timeout=60;Keepalive=0;Options=", null)]
+    [DataRow("Timeout=30;Command Timeout=60;Keepalive=0;Options=''", null)]
+    [DataRow(" TIMEOUT =30; command timeout=60; KEEPALIVE=0; Options = ", null)]
     [DataRow("timeout=30;CommandTimeout=60;keepalive=0;options=-c search_path=app", "-c search_path=app")]
     public void KeepsEveryTimeoutTheConnectionStringSets(string explicitSettings, string? options)
     {
@@ -32,5 +35,89 @@ public sealed class PlatformStoreTimeoutsTests
         Assert.AreEqual(0, applied.KeepAlive);
         Assert.AreEqual(options, string.IsNullOrEmpty(applied.Options) ? null : applied.Options,
             "An explicit Options, even an empty one, is left as it is, for a pooler that refuses startup parameters.");
+    }
+
+    [TestMethod]
+    [DataRow("Password='a;options=b'")]
+    [DataRow("Application Name=\"x; Options=\"")]
+    public void AKeywordInsideAQuotedValueDoesNotCount(string quoted)
+    {
+        var applied = new NpgsqlConnectionStringBuilder(PlatformStoreTimeouts.Apply("Host=postgres;Username=app;" + quoted));
+
+        Assert.AreEqual("-c statement_timeout=15000 -c lock_timeout=5000", applied.Options);
+    }
+
+    [TestMethod]
+    public void ServerTimeoutsFollowPgOptionsAndCanBeTurnedOff()
+    {
+        var pgOptions = Environment.GetEnvironmentVariable("PGOPTIONS");
+        try
+        {
+            Environment.SetEnvironmentVariable("PGOPTIONS", "-c search_path=app");
+            var applied = new NpgsqlConnectionStringBuilder(PlatformStoreTimeouts.Apply("Host=postgres;Username=app"));
+            Assert.AreEqual("-c search_path=app -c statement_timeout=15000 -c lock_timeout=5000", applied.Options);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("PGOPTIONS", pgOptions);
+        }
+
+        var off = new NpgsqlConnectionStringBuilder(PlatformStoreTimeouts.Apply("Host=postgres;Username=app", serverTimeouts: false));
+        Assert.IsTrue(string.IsNullOrEmpty(off.Options));
+        Assert.AreEqual(PlatformStoreTimeouts.CommandSeconds, off.CommandTimeout, "The client-side timeouts apply either way.");
+    }
+
+    [TestMethod]
+    [DataRow("on", true)]
+    [DataRow(" OFF ", false)]
+    [DataRow("", true)]
+    public void TheServerTimeoutSwitchReadsOnOrOff(string value, bool expected)
+    {
+        Assert.AreEqual(expected, new PlatformMessageStoreOptions { PostgresServerTimeouts = value }.UsesPostgresServerTimeouts);
+    }
+
+    [TestMethod]
+    public void AnUnknownServerTimeoutSwitchFailsValidationNamingTheVariable()
+    {
+        var options = new PlatformMessageStoreOptions
+        {
+            ApplicationName = "integration-orders", KafkaBootstrapServers = "kafka:9092",
+            PostgresConnectionString = "Host=postgres;Username=app", PostgresServerTimeouts = "maybe",
+        };
+
+        var error = Assert.ThrowsExactly<InvalidOperationException>(options.Validate);
+        StringAssert.Contains(error.Message, "BASIS_MESSAGE_STORE_POSTGRES_SERVER_TIMEOUTS");
+    }
+
+    [TestMethod]
+    public void TheRegistrationAppliesTheTimeoutsToTheAdapterDatasourceOnly()
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddBasisMessageStoreAdapter<TimeoutTestHandler>(options =>
+        {
+            options.ApplicationName = "integration-orders";
+            options.KafkaBootstrapServers = "kafka:9092";
+            options.PostgresConnectionString = "Host=postgres;Username=app;Password=synthetic";
+        });
+        using var provider = services.BuildServiceProvider();
+
+        var adapter = new NpgsqlConnectionStringBuilder(
+            provider.GetRequiredKeyedService<NpgsqlDataSource>(PlatformMessageStoreExtensions.MessageStoreDataSourceKey).ConnectionString);
+        var application = new NpgsqlConnectionStringBuilder(provider.GetRequiredService<NpgsqlDataSource>().ConnectionString);
+
+        Assert.AreEqual(PlatformStoreTimeouts.ConnectSeconds, adapter.Timeout);
+        Assert.AreEqual(PlatformStoreTimeouts.CommandSeconds, adapter.CommandTimeout);
+        Assert.AreEqual(PlatformStoreTimeouts.KeepaliveSeconds, adapter.KeepAlive);
+        StringAssert.Contains(adapter.Options, "lock_timeout=5000");
+        Assert.AreEqual(15, application.Timeout, "The application's default datasource keeps Npgsql's defaults.");
+        Assert.AreEqual(30, application.CommandTimeout);
+        Assert.IsTrue(string.IsNullOrEmpty(application.Options));
+    }
+
+    private sealed class TimeoutTestHandler : IPlatformMessageHandler
+    {
+        public Task<PlatformMessageResult> HandleAsync(PlatformMessage message, CancellationToken cancellationToken) =>
+            Task.FromResult(PlatformMessageResult.Completed());
     }
 }

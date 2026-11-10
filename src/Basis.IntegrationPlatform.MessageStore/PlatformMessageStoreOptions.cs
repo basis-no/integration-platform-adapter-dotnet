@@ -40,6 +40,22 @@ public sealed class PlatformMessageStoreOptions
     /// </summary>
     public string StepOutcomeStore { get; set; } = Environment.GetEnvironmentVariable("BASIS_MESSAGE_STORE_STEP_OUTCOME_STORE") ?? StepOutcomeStorePostgres;
 
+    /// <summary>
+    /// Whether the adapter's Message Store sessions get the server-side
+    /// statement and lock timeouts: <c>on</c> (the default) or <c>off</c>, for
+    /// a connection pooler that refuses the <c>options</c> startup parameter.
+    /// The client-side timeouts apply either way.
+    /// </summary>
+    public string PostgresServerTimeouts { get; set; } = Environment.GetEnvironmentVariable("BASIS_MESSAGE_STORE_POSTGRES_SERVER_TIMEOUTS") ?? "on";
+
+    internal bool UsesPostgresServerTimeouts => PostgresServerTimeouts.Trim().ToLowerInvariant() switch
+    {
+        "" or "on" => true,
+        "off" => false,
+        _ => throw new InvalidOperationException(
+            "Invalid BASIS_MESSAGE_STORE_POSTGRES_SERVER_TIMEOUTS configuration: use on or off."),
+    };
+
     /// Startup schema gate: bounded retries before startup fails when
     /// bip_contract cannot be read. Not env-driven; tests may lower.
     public int ContractGateMaxAttempts { get; set; } = 10;
@@ -51,6 +67,7 @@ public sealed class PlatformMessageStoreOptions
         {
             throw new InvalidOperationException("APP_NAME is required for the message-store adapter.");
         }
+        _ = UsesPostgresServerTimeouts;
         if (string.IsNullOrWhiteSpace(KafkaBootstrapServers))
         {
             throw new InvalidOperationException("KAFKA_BOOTSTRAP_SERVERS is required for the message-store adapter.");

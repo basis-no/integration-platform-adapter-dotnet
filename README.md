@@ -406,6 +406,7 @@ TLS, set these through your deployment's secret and runtime configuration:
 | `BASIS_MESSAGE_STORE_POSTGRES_MAX_POOL_SIZE` | Optional bounded pool size for JDBC-derived settings; previous Npgsql default if unset |
 | `BASIS_MESSAGE_STORE_POSTGRES_SSL_MODE` | Optional Npgsql TLS mode, e.g. `VerifyFull` |
 | `BASIS_MESSAGE_STORE_POSTGRES_ROOT_CERTIFICATE` | Mounted PostgreSQL CA file |
+| `BASIS_MESSAGE_STORE_POSTGRES_SERVER_TIMEOUTS` | `on`; `off` sends no server-side statement and lock timeouts, for a pooler that refuses startup parameters |
 
 The same Kafka client configuration covers consumption, DLQ and replay. TLS
 certificate and hostname verification stay enabled. Missing SASL credentials
@@ -419,22 +420,37 @@ settings. Plaintext modes are retained for trusted local compatibility.
 Every Message Store call is bounded well under the consumer's poll interval
 (`max.poll.interval.ms`, 300 s by default), so a hung database, a held lock or a
 dead connection fails the call instead of stalling the consumer until it
-leaves its group. A failed or timed-out call is a store failure: the delivery
-is not committed and is processed again after the failure backoff. The adapter
-applies these defaults to its own datasource, for every setting the connection
-string does not set itself:
+leaves its group. A failed or timed-out call is a store failure. For the
+message's outcome record, the delivery is not committed and is processed
+again after the failure backoff. For a step ledger call, the handler
+invocation ends at once: the adapter neither retries the handler nor parks
+the message, and processes the delivery again. A ledger write that fails
+every time for one message therefore blocks its partition until the cause is
+fixed.
+
+The adapter applies these defaults to its own datasource (the keyed
+`MessageStoreDataSourceKey` one), for every setting the connection string
+does not set itself. The default `NpgsqlDataSource` it registers for
+compatibility keeps Npgsql's defaults, so an application's own queries are
+not affected.
 
 | Npgsql setting | Default | Bounds |
 | --- | --- | --- |
 | `Timeout` | 5 s (Npgsql: 15 s) | opening a connection, and waiting for a pooled one |
-| `Command Timeout` | 20 s (Npgsql: 30 s) | one command, on the client |
+| `Command Timeout` | 20 s (Npgsql: 30 s) | one command on the client; about 25 s when the server does not answer at all, with the cancel request |
 | `Keepalive` | 10 s (Npgsql: off) | how soon an idle dead connection is found |
 | `Options` | `-c statement_timeout=15000 -c lock_timeout=5000` | one statement, and a lock wait, on the server |
 
-To change one, set it in `POSTGRES_CONNECTION_STRING`. Behind a connection
-pooler that refuses startup parameters, set `Options=` (empty) or your own
-`Options`; the adapter then sends none of its own, and the client-side
-`Command Timeout` still bounds each call.
+To change one, set it in `POSTGRES_CONNECTION_STRING`. The server-side
+timeouts are added after any `PGOPTIONS` the environment sets. A connection
+pooler that refuses the `options` startup parameter (PgBouncer by default
+answers `08P01: unsupported startup parameter in options`) needs
+`BASIS_MESSAGE_STORE_POSTGRES_SERVER_TIMEOUTS=off`, which works with
+`POSTGRES_JDBC_URL` and `POSTGRES_CONNECTION_STRING` alike, or an explicit
+`Options` (also an empty `Options=`) in the connection string; the
+client-side timeouts still bound each call. With the shorter connect timeout,
+the startup contract check gives up on an unreachable store after about 80 s
+(10 attempts) instead of about 180 s.
 
 Business persistence belongs in a separate application database. The adapter
 uses its keyed datasource `PlatformMessageStoreExtensions.MessageStoreDataSourceKey`

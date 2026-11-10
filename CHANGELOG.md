@@ -7,9 +7,18 @@
   a 10 s keepalive, and `statement_timeout=15s` and `lock_timeout=5s` on the
   server. Before, Npgsql's defaults (15 s, 30 s, no keepalive) and no server
   limits let a hung store or a held lock stall the consumer for minutes, past
-  the poll interval. A value set in the connection string wins; an explicit
-  `Options` (also empty) replaces the server-side defaults, for a pooler that
-  refuses startup parameters.
+  the poll interval. They apply to the adapter's keyed datasource only; the
+  default `NpgsqlDataSource` registered for compatibility is now a pool of
+  its own with the plain connection string. A value set in the connection
+  string wins, `PGOPTIONS` is kept, and
+  `BASIS_MESSAGE_STORE_POSTGRES_SERVER_TIMEOUTS=off` (or an explicit
+  `Options`) leaves out the server-side ones, for a pooler such as PgBouncer
+  that refuses them with `08P01`.
+
+- A step ledger failure, a timeout included, now ends the handler
+  invocation at once: the adapter no longer retries the handler, which would
+  send its steps again, and no longer parks the message in the DLQ while the
+  store fails. The delivery is processed again after the failure backoff.
 
 - The registered `IProducer<string, byte[]>` partitions keyed records with
   `murmur2_random`, as Java Kafka clients do, instead of the .NET client's

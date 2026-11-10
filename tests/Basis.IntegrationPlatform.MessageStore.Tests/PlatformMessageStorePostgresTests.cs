@@ -2183,7 +2183,8 @@ public sealed class PlatformMessageStorePostgresTests
         await store.RecordAttemptAsync(message, "dotnet-handler", "RECEIVED", null, CancellationToken.None);
 
         // Another session holds the summary row, as a stuck transaction would.
-        await using var holder = await NpgsqlDataSource.Create(RequireConnectionString()).OpenConnectionAsync();
+        await using var holderSource = NpgsqlDataSource.Create(RequireConnectionString());
+        await using var holder = await holderSource.OpenConnectionAsync();
         await using var transaction = await holder.BeginTransactionAsync();
         await using (var lockRow = new NpgsqlCommand("select 1 from bip_message_log where message_id = @id for update", holder, transaction))
         {
@@ -2296,13 +2297,14 @@ public sealed class PlatformMessageStorePostgresTests
     }
 
     [TestMethod]
-    public async Task HandlerRetryWithoutALedgerFailureCompletes()
+    public async Task ALedgerFailureEndsTheAttemptWithoutRetriesOrParkingAndTheRedeliveryCompletes()
     {
-        // The first invocation's DELIVERED write fails on every attempt; the
-        // handler reports a failure and is retried, and the retry records it.
+        // The first delivery's DELIVERED write fails on every attempt and the
+        // handler reports a failure: no in-process retry sends again, nothing
+        // is parked or committed. The redelivery records it.
         await WithFailingLedgerAsync(failures: 3, async (dataSource, options) =>
         {
-            options.MaxHandlerAttempts = 2;
+            options.MaxHandlerAttempts = 3;
             options.HandlerRetryDelayMs = 0;
             var observations = new PlatformStepObservationCollector();
             var store = new PlatformMessageStore(dataSource, observations, Options.Create(options), NullLogger<PlatformMessageStore>.Instance);
@@ -2320,16 +2322,24 @@ public sealed class PlatformMessageStorePostgresTests
                     return PlatformMessageResult.Failed(ex.MessageText);
                 }
             });
-            using var service = CreateConsumerService(handler, store, observations, new FakeProducer(), options);
-            var messageId = $"dotnet-test-{Guid.NewGuid():N}";
-            var committed = false;
+            var producer = new FakeProducer();
+            using var service = CreateConsumerService(handler, store, observations, producer, options);
+            var message = CreateMessage($"dotnet-test-{Guid.NewGuid():N}", options);
+            var commits = 0;
 
-            await service.ProcessAsync(CreateMessage(messageId, options), () => committed = true, CancellationToken.None);
+            await Assert.ThrowsExactlyAsync<InvalidOperationException>(
+                () => service.ProcessAsync(message, () => commits++, CancellationToken.None));
+            Assert.AreEqual(1, handler.Calls.Count, "A store failure ends the attempt without in-process retries.");
+            Assert.AreEqual(0, commits);
+            Assert.AreEqual(0, producer.Produced.Count, "Nothing is parked while the store fails.");
+            Assert.IsNull(await LogStatusAsync(dataSource, message.MessageId));
 
-            Assert.IsTrue(committed);
-            Assert.AreEqual(2, sends, "No DELIVERED row after the first invocation, so the retry sends again.");
-            Assert.AreEqual("COMPLETED", await LogStatusAsync(dataSource, messageId));
-            Assert.AreEqual("DELIVERED", await StepStatusAsync(dataSource, $"{messageId}:deliver"));
+            await service.ProcessAsync(message, () => commits++, CancellationToken.None);
+
+            Assert.AreEqual(1, commits);
+            Assert.AreEqual(2, sends, "No DELIVERED row after the first delivery, so the redelivery sends again.");
+            Assert.AreEqual("COMPLETED", await LogStatusAsync(dataSource, message.MessageId));
+            Assert.AreEqual("DELIVERED", await StepStatusAsync(dataSource, $"{message.MessageId}:deliver"));
         });
     }
 
