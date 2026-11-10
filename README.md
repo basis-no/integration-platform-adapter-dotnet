@@ -231,18 +231,22 @@ unique messages.
 
 `BASIS_TRAFFIC_SIGNALS` is a comma-separated selection of `record_admitted` and
 `record_published`; its default is `record_admitted`. Set it to an empty string
-to disable both. Publication is opt-in: select `record_published` and set
+to disable both; the adapter then registers no instruments. Publication is opt-in: select `record_published` and set
 `BASIS_TRAFFIC_INPUT_TOPICS` to the exact, comma-separated destination topics
 that count (no wildcards). Only broker-acknowledged records sent through the
 adapter's registered `IProducer<string, byte[]>` count, including callback-based
 sends. Failed and unacknowledged sends add nothing. Application-owned producers
-are outside this coverage; replacing the registered producer leaves publication
-unsupported. DLQ and replay sends count only if their destination is listed.
+are outside this coverage, and so is a producer built from the registered
+producer's `Handle` (`DependentProducerBuilder`); replacing the registered
+producer leaves publication unsupported. DLQ and replay sends count only if their destination is listed.
 
 Unselected signals, invalid signal names or topic lists, a missing producer or
 consumer boundary, and ambiguous acknowledgement metadata report
 `supported=0`. Transactional sends and cancellation before an observed ACK also
-make publication coverage unknown. Unknown coverage and absent metrics must
+make publication coverage unknown, and so does admission of a record from a
+topic other than `APP_KAFKA_INPUT_TOPIC` (as with a regex subscription).
+Coverage that becomes unknown stays unknown until the process restarts, and the
+adapter logs a warning naming the signal the first time. Unknown coverage and absent metrics must
 never be interpreted as zero traffic. Counters reset when the process restarts;
 no topic, message, integration, payload or header values become metric labels.
 Options `TrafficSignals` and `TrafficInputTopics` can also be set in registration.

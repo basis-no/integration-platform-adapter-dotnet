@@ -1,6 +1,8 @@
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
 using Confluent.Kafka;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Basis.IntegrationPlatform.MessageStore;
 
@@ -12,6 +14,7 @@ internal sealed class PlatformTrafficMetrics : IDisposable
     private const long MaxExact = (1L << 53) - 1;
 
     private readonly Meter meter = new(MeterName);
+    private readonly ILogger logger;
     private readonly Signal admitted;
     private readonly Signal published;
     private readonly HashSet<string> inputTopics;
@@ -20,15 +23,28 @@ internal sealed class PlatformTrafficMetrics : IDisposable
     private int producerReady;
     private int instrumentsReady;
 
-    internal PlatformTrafficMetrics(PlatformMessageStoreOptions options)
+    internal PlatformTrafficMetrics(PlatformMessageStoreOptions options, ILogger<PlatformTrafficMetrics>? logger = null)
     {
+        this.logger = logger ?? NullLogger<PlatformTrafficMetrics>.Instance;
         var selected = Split(options.TrafficSignals);
         var valid = selected.All(s => s is Admitted or Published);
-        admitted = new Signal(valid && selected.Contains(Admitted));
-        published = new Signal(valid && selected.Contains(Published));
+        admitted = new Signal(Admitted, valid && selected.Contains(Admitted));
+        published = new Signal(Published, valid && selected.Contains(Published));
         inputTopics = Split(options.TrafficInputTopics);
         consumerTopic = options.InputTopic;
-        if (inputTopics.Count == 0 || inputTopics.Any(t => !ValidTopic(t))) published.Invalid = 1;
+        if (!valid)
+        {
+            this.logger.LogWarning(
+                "BASIS_TRAFFIC_SIGNALS selects an unknown signal; Kafka activity coverage is unknown. Use record_admitted, record_published or both.");
+        }
+
+        if (inputTopics.Count == 0 || inputTopics.Any(t => !ValidTopic(t))) Invalidate(published, "BASIS_TRAFFIC_INPUT_TOPICS is empty or names an invalid topic");
+        if (selected.Count == 0)
+        {
+            // Disabled export registers no instruments, as in the Camel adapter.
+            return;
+        }
+
         try
         {
             meter.CreateObservableCounter<long>("integration_traffic_events_total", () => new[]
@@ -46,11 +62,12 @@ internal sealed class PlatformTrafficMetrics : IDisposable
             meter.CreateObservableGauge<double>("integration_traffic_process_start_time_seconds", () => started);
             instrumentsReady = 1;
         }
-        catch (Exception)
+        catch (Exception ex)
         {
             // Telemetry registration must not prevent processing. An absent
             // series, like supported=0, means that traffic is unknown.
             instrumentsReady = 0;
+            this.logger.LogWarning("Kafka activity metrics could not be registered ({ExceptionType}); coverage is unknown.", ex.GetType().Name);
         }
     }
 
@@ -58,14 +75,14 @@ internal sealed class PlatformTrafficMetrics : IDisposable
     internal void ConsumerStopped() => Volatile.Write(ref consumerReady, 0);
     internal void ProducerStarted() => Volatile.Write(ref producerReady, 1);
     internal void ProducerStopped() => Volatile.Write(ref producerReady, 0);
-    internal void InvalidatePublication() => Volatile.Write(ref published.Invalid, 1);
+    internal void InvalidatePublication() => Invalidate(published, "a send's acknowledgement is unknown, a transaction was used, or the registered producer was replaced");
 
     internal void RecordAdmitted(string topic, int partition, long offset)
     {
         if (!Supported(admitted, Volatile.Read(ref consumerReady))) return;
         if (!string.Equals(topic, consumerTopic, StringComparison.Ordinal) || partition < 0 || offset < 0)
         {
-            Volatile.Write(ref admitted.Invalid, 1);
+            Invalidate(admitted, "a record came from a topic other than the input topic, or without a position");
             return;
         }
         Increment(admitted);
@@ -81,13 +98,13 @@ internal sealed class PlatformTrafficMetrics : IDisposable
         if (!Supported(published, Volatile.Read(ref producerReady)) || !inputTopics.Contains(topic)) return;
         if (status == PersistenceStatus.PossiblyPersisted)
         {
-            InvalidatePublication();
+            Invalidate(published, "a send was possibly persisted");
             return;
         }
         if (status != PersistenceStatus.Persisted) return;
         if (partition < 0 || offset < 0)
         {
-            InvalidatePublication();
+            Invalidate(published, "an acknowledgement had no position");
             return;
         }
         Increment(published);
@@ -96,14 +113,24 @@ internal sealed class PlatformTrafficMetrics : IDisposable
     private bool Supported(Signal signal, int ready) => Volatile.Read(ref instrumentsReady) != 0
         && signal.Selected && Volatile.Read(ref signal.Invalid) == 0 && ready != 0;
 
-    private static void Increment(Signal signal)
+    // Coverage of a signal, once unknown, stays unknown for the process; the
+    // first time, a selected signal logs why (never a topic or message).
+    private void Invalidate(Signal signal, string reason)
+    {
+        if (Interlocked.Exchange(ref signal.Invalid, 1) == 0 && signal.Selected)
+        {
+            logger.LogWarning("Kafka activity signal {Signal} coverage is unknown from now on: {Reason}.", signal.Name, reason);
+        }
+    }
+
+    private void Increment(Signal signal)
     {
         for (;;)
         {
             var previous = Interlocked.Read(ref signal.Total);
             if (previous == MaxExact)
             {
-                Volatile.Write(ref signal.Invalid, 1);
+                Invalidate(signal, "the count reached its exact limit");
                 return;
             }
             if (Interlocked.CompareExchange(ref signal.Total, previous + 1, previous) == previous) return;
@@ -126,8 +153,9 @@ internal sealed class PlatformTrafficMetrics : IDisposable
         catch (Exception) { /* A telemetry listener must not break shutdown. */ }
     }
 
-    private sealed class Signal(bool selected)
+    private sealed class Signal(string name, bool selected)
     {
+        internal readonly string Name = name;
         internal readonly bool Selected = selected;
         internal long Total;
         internal int Invalid;

@@ -27,7 +27,7 @@ public static class PlatformMessageStoreExtensions
         {
             var options = provider.GetRequiredService<IOptions<PlatformMessageStoreOptions>>().Value;
             options.Validate();
-            return new PlatformTrafficMetrics(options);
+            return new PlatformTrafficMetrics(options, provider.GetService<ILogger<PlatformTrafficMetrics>>());
         });
         services.AddKeyedSingleton<NpgsqlDataSource>(MessageStoreDataSourceKey, (provider, _) =>
         {

@@ -40,7 +40,76 @@ public sealed class PlatformTrafficMetricsTests
     }
 
     [TestMethod]
-    [DataRow("", "orders.in", 0, 0)]
+    public void DisabledExportRegistersNoInstruments()
+    {
+        using var capture = new TrafficCapture();
+        using var metrics = new PlatformTrafficMetrics(Options("", "orders.in"));
+        metrics.ConsumerStarted();
+        metrics.ProducerStarted();
+        metrics.RecordAdmitted("orders.in", 0, 1);
+        capture.Collect();
+        Assert.AreEqual(0, capture.Values.Count);
+    }
+
+    [TestMethod]
+    public void UnknownCoverageIsLoggedOncePerSignalWithoutTopics()
+    {
+        var logger = new ListLogger();
+        using var metrics = new PlatformTrafficMetrics(Options("record_admitted,record_published", "secret-topic.*"), logger);
+        metrics.ConsumerStarted();
+        metrics.RecordAdmitted("other.in", 0, 1);
+        metrics.RecordAdmitted("other.in", 0, 2);
+        metrics.InvalidatePublication();
+
+        Assert.AreEqual(2, logger.Messages.Count, string.Join(" | ", logger.Messages));
+        StringAssert.Contains(logger.Messages[0], "record_published");
+        StringAssert.Contains(logger.Messages[1], "record_admitted");
+        Assert.IsFalse(logger.Messages.Any(m => m.Contains("secret-topic", StringComparison.Ordinal) || m.Contains("other.in", StringComparison.Ordinal)));
+
+        var invalid = new ListLogger();
+        using var typo = new PlatformTrafficMetrics(Options("record_admited"), invalid);
+        StringAssert.Contains(invalid.Messages.Single(), "BASIS_TRAFFIC_SIGNALS");
+    }
+
+    [TestMethod]
+    public void TheDefaultRegistrationCountsPublicationThroughTheRegisteredProducer()
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddBasisMessageStoreAdapter<SyntheticHandler>(o =>
+        {
+            o.KafkaBootstrapServers = "127.0.0.1:1";
+            o.PostgresConnectionString = "Host=unused;Username=synthetic";
+            o.TrafficSignals = "record_admitted,record_published";
+            o.TrafficInputTopics = "orders.in";
+        });
+        using var provider = services.BuildServiceProvider();
+        using var capture = new TrafficCapture();
+        Assert.IsInstanceOfType<PlatformTrafficProducer>(provider.GetRequiredService<IProducer<string, byte[]>>());
+        provider.GetServices<IHostedService>().Single();
+        capture.Collect();
+        Assert.AreEqual(1, capture.Value("integration_traffic_signal_supported", "record_published"));
+    }
+
+    [TestMethod]
+    public void DisposingTheProducerEndsPublicationCoverageAndDisposesTheClient()
+    {
+        using var capture = new TrafficCapture();
+        using var metrics = new PlatformTrafficMetrics(Options("record_published", "orders.in"));
+        var inner = new SyntheticProducer();
+        var producer = new PlatformTrafficProducer(inner, metrics);
+        producer.Selected();
+        capture.Collect();
+        Assert.AreEqual(1, capture.Value("integration_traffic_signal_supported", "record_published"));
+
+        producer.Dispose();
+
+        capture.Collect();
+        Assert.AreEqual(0, capture.Value("integration_traffic_signal_supported", "record_published"));
+        Assert.IsTrue(inner.Disposed);
+    }
+
+    [TestMethod]
     [DataRow("Record_admitted", "orders.in", 0, 0)]
     [DataRow("record_admitted,unknown", "orders.in", 0, 0)]
     [DataRow("record_admitted,record_published", "", 1, 0)]
@@ -320,7 +389,17 @@ public sealed class PlatformTrafficMetricsTests
         public void AbortTransaction(TimeSpan timeout) { }
         public void AbortTransaction() { }
         public void SendOffsetsToTransaction(IEnumerable<TopicPartitionOffset> offsets, IConsumerGroupMetadata groupMetadata, TimeSpan timeout) { }
-        public void Dispose() { }
+        internal bool Disposed { get; private set; }
+        public void Dispose() => Disposed = true;
+    }
+
+    private sealed class ListLogger : Microsoft.Extensions.Logging.ILogger<PlatformTrafficMetrics>
+    {
+        internal List<string> Messages { get; } = [];
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
+        public void Log<TState>(Microsoft.Extensions.Logging.LogLevel logLevel, Microsoft.Extensions.Logging.EventId eventId, TState state,
+            Exception? exception, Func<TState, Exception?, string> formatter) => Messages.Add(formatter(state, exception));
     }
 }
 
