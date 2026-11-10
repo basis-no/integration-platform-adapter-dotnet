@@ -130,7 +130,9 @@ Choose step ids with that in mind:
   Message Store and both use the same step id, the second integration's step is
   skipped as already delivered. Use step ids unique across integrations, and
   when one integration produces for another, give the new message its own
-  `x-bip-message-id` and carry continuity in `x-bip-correlation-id`.
+  `x-bip-message-id` and carry continuity in `x-bip-correlation-id`, which
+  then also has to be the record key if replays should keep its partition
+  (see Replay order).
 
 When the step executor skips a step that the same handler invocation already
 delivered, it logs an ERROR, once per skipped call, with the step id and the
@@ -186,6 +188,30 @@ defaults to `dotnet-integration`; set it, because it also names the Kafka
 consumer group and the default input topic. The input and DLQ topics default
 as listed above, and the replay topic pattern defaults to `bip.%s.in`.
 
+## Step outcome store
+
+| Environment variable | Default | Meaning |
+|---|---|---|
+| `BASIS_MESSAGE_STORE_STEP_OUTCOME_STORE` | `postgres` | `postgres` or `noop` |
+
+With `postgres`, delivered steps are kept in `bip_step_outcome` and a replay
+skips them, as described under Integration Usage. With `noop`, nothing is read
+from or written to `bip_step_outcome`: every step runs on every delivery,
+replays included, and `steps_json` still records what each attempt observed.
+A resend whose `redoSteps` names a step is then refused with
+`409 NOT_REPLAYABLE` before any audit row or produce, because every step runs
+anyway; a resend without `redoSteps` works as usual. The value is trimmed and
+read case-insensitively; an empty value means the default, and any other value
+fails startup. The setting reaches the step executor through
+`AddBasisMessageStoreAdapter`; a `PlatformStepExecutor` constructed directly
+uses `bip_step_outcome`. The variable has the same name and values as in the
+Camel adapter, whose library default is `noop`; this adapter's default stays
+`postgres`.
+
+Switching from `noop` back to `postgres` keeps the rows written before the
+`noop` period: a step delivered before the `noop` period is skipped on a later
+replay, even if it ran again and failed under `noop`. Name such a step in `redoSteps` to run it.
+
 ## Payload policy
 
 The same semantics as the Camel Quarkus adapter:
@@ -210,6 +236,34 @@ a reason. Replayability is a property of payload availability, never of the
 message outcome: `COMPLETED` messages are resendable as long as the payload
 is captured, unexpired, and undeleted.
 
+## Replay order
+
+A resend publishes a new record to the replay topic; it never returns to the
+original offset. The replay topic is
+`BASIS_MESSAGE_STORE_REPLAY_INPUT_TOPIC_PATTERN` with `%s` replaced by the
+integration name (default `bip.%s.in`). If `APP_KAFKA_INPUT_TOPIC` names
+another topic, set the pattern to match, or the replay is published to a topic
+this integration does not consume. The record's Kafka key is the message's
+correlation id: `x-bip-correlation-id`, else the original record's key when it
+has one (an empty key is kept as is), else the message id. A replay is
+appended after everything already published, and Kafka orders records only
+within a partition, so:
+
+- records for the same key that were published after the original may already
+  have been processed. Replaying an old failure after a newer update for the
+  same entity can restore stale data at the receiver;
+- resending several messages has no overall order. Resend one key's messages
+  oldest first, one request at a time, waiting for each response before the
+  next, and do not resend a failure that a newer message for the same key has
+  superseded;
+- a replay reliably lands on the original's partition only when it goes to the
+  same topic, the partition count is unchanged, the original record had the
+  same non-empty key and no explicit partition, and both producers hash keys
+  the same way. Keep `x-bip-correlation-id` equal to the record key, or leave
+  it out. This adapter's producer uses the .NET Kafka client's default
+  partitioner (`consistent_random`, CRC32), which can place a key on a
+  different partition than the Java client's default (`murmur2`).
+
 ## Kafka activity metrics
 
 From 0.4, admission activity is enabled by default. The adapter exports through
@@ -231,26 +285,28 @@ unique messages.
 
 `BASIS_TRAFFIC_SIGNALS` is a comma-separated selection of `record_admitted` and
 `record_published`; its default is `record_admitted`. Set it to an empty string
-to disable both; the adapter then registers no instruments. Publication is opt-in: select `record_published` and set
-`BASIS_TRAFFIC_INPUT_TOPICS` to the exact, comma-separated destination topics
-that count (no wildcards). Only broker-acknowledged records sent through the
-adapter's registered `IProducer<string, byte[]>` count, including callback-based
-sends. Failed and unacknowledged sends add nothing. Application-owned producers
-are outside this coverage, and so is a producer built from the registered
-producer's `Handle` (`DependentProducerBuilder`); replacing the registered
-producer leaves publication unsupported. DLQ and replay sends count only if their destination is listed.
+to disable both; the adapter then registers no instruments. Publication is
+opt-in: select `record_published` and set `BASIS_TRAFFIC_INPUT_TOPICS` to the
+exact, comma-separated destination topics that count (no wildcards). Only
+broker-acknowledged records sent through the adapter's registered
+`IProducer<string, byte[]>` count, including callback-based sends. Failed and
+unacknowledged sends add nothing. Application-owned producers are outside this
+coverage, and so is a producer built from the registered producer's `Handle`
+(`DependentProducerBuilder`); replacing the registered producer leaves
+publication unsupported. DLQ and replay sends count only if their destination
+is listed.
 
 Unselected signals, invalid signal names or topic lists, a missing producer or
-consumer boundary, and ambiguous acknowledgement metadata report
-`supported=0`. Transactional sends and cancellation before an observed ACK also
-make publication coverage unknown, and so does admission of a record from a
-topic other than `APP_KAFKA_INPUT_TOPIC` (as with a regex subscription).
-Coverage that becomes unknown stays unknown until the process restarts, and the
-adapter logs a warning naming the signal the first time. Unknown coverage and absent metrics must
-never be interpreted as zero traffic. Counters reset when the process restarts;
-no topic, message, integration, payload or header values become metric labels.
-Options `TrafficSignals` and `TrafficInputTopics` can also be set in registration.
-
+consumer boundary, and ambiguous acknowledgement metadata report `supported=0`.
+Transactional sends and cancellation before an observed ACK also make
+publication coverage unknown, and so does admission of a record from a topic
+other than `APP_KAFKA_INPUT_TOPIC` (as with a regex subscription). Coverage
+that becomes unknown stays unknown until the process restarts, and the adapter
+logs a warning naming the signal the first time. Unknown coverage and absent
+metrics must never be interpreted as zero traffic. Counters reset when the
+process restarts; no topic, message, integration, payload or header values
+become metric labels. Options `TrafficSignals` and `TrafficInputTopics` can
+also be set in registration.
 ## Publish
 
 Releases are published to NuGet.org as `Basis.IntegrationPlatform.MessageStore`

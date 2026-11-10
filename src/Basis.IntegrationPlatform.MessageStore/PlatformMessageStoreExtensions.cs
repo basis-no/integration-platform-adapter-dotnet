@@ -48,7 +48,10 @@ public static class PlatformMessageStoreExtensions
         services.AddSingleton<IPlatformStepExecutor>(provider => new PlatformStepExecutor(
             provider.GetRequiredKeyedService<NpgsqlDataSource>(MessageStoreDataSourceKey),
             provider.GetRequiredService<PlatformStepObservationCollector>(),
-            provider.GetRequiredService<ILogger<PlatformStepExecutor>>()));
+            provider.GetRequiredService<ILogger<PlatformStepExecutor>>())
+        {
+            UsesStepLedger = provider.GetRequiredService<IOptions<PlatformMessageStoreOptions>>().Value.UsesStepLedger,
+        });
         services.AddSingleton<IProducer<string, byte[]>>(provider =>
         {
             var options = provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<PlatformMessageStoreOptions>>().Value;

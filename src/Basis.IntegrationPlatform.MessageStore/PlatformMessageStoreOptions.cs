@@ -7,6 +7,8 @@ public sealed class PlatformMessageStoreOptions
 {
     public const string PayloadModePostgresInline = "postgres_inline";
     public const string PayloadModeMetadataOnly = "metadata_only";
+    public const string StepOutcomeStorePostgres = "postgres";
+    public const string StepOutcomeStoreNoop = "noop";
 
     public string ApplicationName { get; set; } = Environment.GetEnvironmentVariable("APP_NAME") ?? "dotnet-integration";
     public string EnvironmentName { get; set; } = Environment.GetEnvironmentVariable("APP_ENVIRONMENT") ?? "local";
@@ -30,6 +32,13 @@ public sealed class PlatformMessageStoreOptions
     public int PayloadRetentionDays { get; set; } = IntFromEnvironment("BASIS_MESSAGE_STORE_PAYLOAD_RETENTION_DAYS", 30);
     public string TrafficSignals { get; set; } = Environment.GetEnvironmentVariable("BASIS_TRAFFIC_SIGNALS") ?? "record_admitted";
     public string TrafficInputTopics { get; set; } = Environment.GetEnvironmentVariable("BASIS_TRAFFIC_INPUT_TOPICS") ?? "";
+
+    /// <summary>
+    /// Where delivered steps are kept: <c>postgres</c> (bip_step_outcome, the
+    /// default) or <c>noop</c>, which keeps nothing, so every step runs on every
+    /// replay and a resend naming redoSteps is refused.
+    /// </summary>
+    public string StepOutcomeStore { get; set; } = Environment.GetEnvironmentVariable("BASIS_MESSAGE_STORE_STEP_OUTCOME_STORE") ?? StepOutcomeStorePostgres;
 
     /// Startup schema gate: bounded retries before startup fails when
     /// bip_contract cannot be read. Not env-driven; tests may lower.
@@ -83,6 +92,7 @@ public sealed class PlatformMessageStoreOptions
             throw new InvalidOperationException("BASIS_MESSAGE_STORE_HANDLER_RETRY_DELAY_MS must be at least 0.");
         }
         PayloadMode = NormalizePayloadMode(PayloadMode);
+        StepOutcomeStore = NormalizeStepOutcomeStore(StepOutcomeStore);
         if (PayloadMaxBytes < 0)
         {
             throw new InvalidOperationException("BASIS_MESSAGE_STORE_PAYLOAD_MAX_BYTES must be at least 0.");
@@ -139,6 +149,21 @@ public sealed class PlatformMessageStoreOptions
             throw new InvalidOperationException(
                 $"Unsupported BASIS_MESSAGE_STORE_PAYLOAD_MODE value: {value}. " +
                 $"Supported values: {PayloadModePostgresInline}, {PayloadModeMetadataOnly}.");
+        }
+
+        return normalized;
+    }
+
+    internal bool UsesStepLedger => NormalizeStepOutcomeStore(StepOutcomeStore) == StepOutcomeStorePostgres;
+
+    private static string NormalizeStepOutcomeStore(string? value)
+    {
+        var normalized = string.IsNullOrWhiteSpace(value) ? StepOutcomeStorePostgres : value.Trim().ToLowerInvariant();
+        if (normalized is not (StepOutcomeStorePostgres or StepOutcomeStoreNoop))
+        {
+            throw new InvalidOperationException(
+                $"Unsupported BASIS_MESSAGE_STORE_STEP_OUTCOME_STORE value: {value}. " +
+                $"Supported values: {StepOutcomeStorePostgres}, {StepOutcomeStoreNoop}.");
         }
 
         return normalized;

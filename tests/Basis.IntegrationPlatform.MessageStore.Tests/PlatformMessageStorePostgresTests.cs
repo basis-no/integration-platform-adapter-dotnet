@@ -68,8 +68,134 @@ public sealed class PlatformMessageStorePostgresTests
             observations,
             Options.Create(options),
             logs.For<PlatformMessageStore>());
-        var steps = new PlatformStepExecutor(dataSource, observations, NullLogger<PlatformStepExecutor>.Instance);
+        var steps = new PlatformStepExecutor(dataSource, observations, NullLogger<PlatformStepExecutor>.Instance)
+        {
+            UsesStepLedger = options.UsesStepLedger,
+        };
         return (store, steps, observations, logs);
+    }
+
+    [TestMethod]
+    public async Task RegistrationGivesTheStepExecutorTheConfiguredStepOutcomeStore()
+    {
+        var connectionString = RequireConnectionString();
+        foreach (var (store, usesLedger) in new[] { ("postgres", true), ("noop", false) })
+        {
+            var services = new ServiceCollection();
+            services.AddLogging();
+            services.AddBasisMessageStoreAdapter<SyntheticHandler>(options =>
+            {
+                options.PostgresConnectionString = connectionString;
+                options.KafkaBootstrapServers = "unused:9092";
+                options.StepOutcomeStore = store;
+            });
+            await using var provider = services.BuildServiceProvider();
+
+            var steps = (PlatformStepExecutor)provider.GetRequiredService<IPlatformStepExecutor>();
+
+            Assert.AreEqual(usesLedger, steps.UsesStepLedger, store);
+        }
+    }
+
+    [TestMethod]
+    public async Task NoopStepStoreRunsEveryStepOnReplayAndLeavesTheLedgerUntouched()
+    {
+        var connectionString = RequireConnectionString();
+        var options = CreateOptions(connectionString);
+        options.StepOutcomeStore = PlatformMessageStoreOptions.StepOutcomeStoreNoop;
+        var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+        await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+        var (store, steps, observations, _) = CreateStore(dataSource, options);
+        var sends = 0;
+        var handler = new DelegateHandler(async (message, cancellationToken) =>
+        {
+            await steps.ExecuteAsync(message, "post-order", "https://target.example/orders", "target",
+                _ => { sends++; return Task.CompletedTask; }, cancellationToken);
+            return PlatformMessageResult.Completed();
+        });
+        var producer = new FakeProducer();
+        var service = CreateConsumerService(handler, store, observations, producer, options);
+
+        await service.ProcessAsync(CreateMessage(messageId, options), () => { }, CancellationToken.None);
+        var replay = await store.ReplayAsync(messageId, new MessageReplayRequest("operator", "resend"), producer, CancellationToken.None);
+        Assert.AreEqual("PUBLISHED", replay.Status);
+        var resent = producer.Produced.Single(produced => produced.Topic == options.InputTopic).Message;
+        await service.ProcessAsync(PlatformMessageConsumerService.ToPlatformMessage(resent, options), () => { }, CancellationToken.None);
+
+        Assert.AreEqual(2, sends, "With noop, a replay runs the step a postgres store would skip.");
+        Assert.AreEqual(0, await CountRowsAsync(dataSource, "bip_step_outcome", messageId));
+        CollectionAssert.AreEqual(new[] { "post-order DELIVERED" }, await ObservedStepsAsync(dataSource, messageId, 1));
+        CollectionAssert.AreEqual(new[] { "post-order DELIVERED" }, await ObservedStepsAsync(dataSource, messageId, 2));
+    }
+
+    [TestMethod]
+    public async Task NoopStepStoreNeitherReadsNorWritesAnExistingLedgerRow()
+    {
+        var connectionString = RequireConnectionString();
+        var postgres = CreateOptions(connectionString);
+        var noop = CreateOptions(connectionString);
+        noop.StepOutcomeStore = PlatformMessageStoreOptions.StepOutcomeStoreNoop;
+        var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+        await using var dataSource = NpgsqlDataSource.Create(connectionString);
+        var (_, postgresSteps, _, _) = CreateStore(dataSource, postgres);
+        var message = CreateMessage(messageId, postgres);
+        await postgresSteps.ExecuteAsync(message, "post-order", "https://target.example/orders", "target", _ => Task.CompletedTask, CancellationToken.None);
+        var (_, noopSteps, observations, _) = CreateStore(dataSource, noop);
+        var runs = 0;
+
+        // DELIVERED is in the ledger, yet noop runs the step; its failure is
+        // observed but not written over the row.
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => noopSteps.ExecuteAsync(
+            message, "post-order", "https://target.example/orders", "target",
+            _ => { runs++; throw new InvalidOperationException("synthetic receiver failure"); },
+            CancellationToken.None));
+
+        Assert.AreEqual(1, runs);
+        Assert.AreEqual("DELIVERED", await StepStatusAsync(dataSource, $"{messageId}:post-order"));
+        Assert.AreEqual("FAILED", observations.Snapshot(messageId).Single().Status);
+
+        // A failure on a key with no row writes none either.
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => noopSteps.ExecuteAsync(
+            message, "post-invoice", "https://target.example/invoices", "target",
+            _ => throw new InvalidOperationException("synthetic receiver failure"),
+            CancellationToken.None));
+        Assert.IsNull(await StepStatusAsync(dataSource, $"{messageId}:post-invoice"));
+    }
+
+    [TestMethod]
+    public async Task NoopStepStoreRefusesARedoRequestBeforeAnyAuditRowOrProduce()
+    {
+        var connectionString = RequireConnectionString();
+        var noop = CreateOptions(connectionString);
+        noop.StepOutcomeStore = PlatformMessageStoreOptions.StepOutcomeStoreNoop;
+        var postgres = CreateOptions(connectionString);
+        var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+        await using var dataSource = NpgsqlDataSource.Create(connectionString);
+        var (noopStore, _, _, _) = CreateStore(dataSource, noop);
+        var (postgresStore, _, _, _) = CreateStore(dataSource, postgres);
+        await noopStore.RecordAttemptAsync(CreateMessage(messageId, noop), "dotnet-handler", "COMPLETED", null, CancellationToken.None);
+        var producer = new FakeProducer();
+        var redo = new MessageReplayRequest("operator", "redo", ["post-order"]);
+
+        var refused = await noopStore.ReplayAsync(messageId, redo, producer, CancellationToken.None);
+
+        Assert.AreEqual("FAILED", refused.Status);
+        Assert.AreEqual(MessageReplayErrorCodes.NotReplayable, refused.ErrorCode);
+        StringAssert.Contains(refused.Error, "BASIS_MESSAGE_STORE_STEP_OUTCOME_STORE=noop");
+        Assert.IsNull(refused.ReplayId);
+        Assert.AreEqual(0, producer.Produced.Count);
+        Assert.AreEqual(0, await CountAuditRowsAsync(dataSource, messageId));
+
+        // Blank entries are not a redo request, and a resend without one works.
+        var blank = await noopStore.ReplayAsync(messageId, new MessageReplayRequest("operator", "resend", [" "]), producer, CancellationToken.None);
+        Assert.AreEqual("PUBLISHED", blank.Status);
+        var plain = await noopStore.ReplayAsync(messageId, new MessageReplayRequest("operator", "resend"), producer, CancellationToken.None);
+        Assert.AreEqual("PUBLISHED", plain.Status);
+
+        // The postgres store accepts the same redo request.
+        var accepted = await postgresStore.ReplayAsync(messageId, redo, producer, CancellationToken.None);
+        Assert.AreEqual("PUBLISHED", accepted.Status);
+        Assert.AreEqual("[\"post-order\"]", PlatformMessageConsumerService.ReadHeaders(producer.Produced[^1].Message.Headers)["x-bip-redo-steps"]);
     }
 
     [TestMethod]
@@ -560,6 +686,44 @@ public sealed class PlatformMessageStorePostgresTests
         Assert.IsTrue(updatedReader.IsDBNull(9));
         Assert.IsTrue(updatedReader.IsDBNull(10));
         Assert.IsTrue(updatedReader.GetBoolean(11));
+    }
+
+    [TestMethod]
+    public async Task ReplayRecordIsKeyedByTheCorrelationId()
+    {
+        var connectionString = RequireConnectionString();
+        var options = CreateOptions(connectionString);
+        await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+        var (store, _, _, _) = CreateStore(dataSource, options);
+        var producer = new FakeProducer();
+        var withHeader = $"dotnet-test-{Guid.NewGuid():N}";
+        var withoutHeader = $"dotnet-test-{Guid.NewGuid():N}";
+        var withoutKey = $"dotnet-test-{Guid.NewGuid():N}";
+        foreach (var (messageId, key, correlationId) in new[]
+        {
+            (withHeader, "record-key-1", "correlation-1"),
+            (withoutHeader, "record-key-2", null),
+            (withoutKey, null, null),
+        })
+        {
+            var headers = new Headers { { "x-bip-message-id", Encoding.UTF8.GetBytes(messageId) } };
+            if (correlationId is not null)
+            {
+                headers.Add("x-bip-correlation-id", Encoding.UTF8.GetBytes(correlationId));
+            }
+
+            var consumed = new Message<string, byte[]> { Key = key!, Value = "{}"u8.ToArray(), Headers = headers };
+            await store.RecordAttemptAsync(
+                PlatformMessageConsumerService.ToPlatformMessage(consumed, options), "dotnet-handler", "COMPLETED", null, CancellationToken.None);
+            Assert.AreEqual("PUBLISHED", (await store.ReplayAsync(messageId, new MessageReplayRequest("operator", "resend"), producer, CancellationToken.None)).Status);
+        }
+
+        // x-bip-correlation-id, else the original record's key, else the message id.
+        CollectionAssert.AreEqual(
+            new[] { "correlation-1", "record-key-2", withoutKey },
+            producer.Produced.Select(produced => produced.Message.Key).ToArray());
+        // The replay topic is the pattern with the integration name.
+        Assert.IsTrue(producer.Produced.All(produced => produced.Topic == "bip.integration-e2e-dotnet.in"));
     }
 
     [TestMethod]
