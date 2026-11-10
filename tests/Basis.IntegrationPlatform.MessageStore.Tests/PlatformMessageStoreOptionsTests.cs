@@ -36,6 +36,33 @@ public sealed class PlatformMessageStoreOptionsTests
         Assert.AreEqual(PlatformMessageStoreOptions.PayloadModePostgresInline, options.PayloadMode);
         Assert.AreEqual(1_048_576, options.PayloadMaxBytes);
         Assert.AreEqual(30, options.PayloadRetentionDays);
+        Assert.AreEqual(PlatformMessageStoreOptions.StepOutcomeStorePostgres, options.StepOutcomeStore);
+        Assert.IsTrue(options.UsesStepLedger);
+    }
+
+    [TestMethod]
+    [DataRow("postgres", "postgres")]
+    [DataRow(" NOOP ", "noop")]
+    [DataRow("", "postgres")]
+    public void ValidateNormalizesTheStepOutcomeStore(string configured, string expected)
+    {
+        var options = ValidOptions();
+        options.StepOutcomeStore = configured;
+
+        options.Validate();
+
+        Assert.AreEqual(expected, options.StepOutcomeStore);
+        Assert.AreEqual(expected == "postgres", options.UsesStepLedger);
+    }
+
+    [TestMethod]
+    public void ValidateRejectsAnUnknownStepOutcomeStoreByItsVariable()
+    {
+        var options = ValidOptions();
+        options.StepOutcomeStore = "memory";
+
+        var error = Assert.ThrowsExactly<InvalidOperationException>(options.Validate);
+        StringAssert.Contains(error.Message, "BASIS_MESSAGE_STORE_STEP_OUTCOME_STORE");
     }
 
     [TestMethod]
@@ -68,6 +95,25 @@ public sealed class PlatformMessageStoreOptionsTests
         options = ValidOptions();
         options.PayloadRetentionDays = -1;
         Assert.ThrowsExactly<InvalidOperationException>(options.Validate);
+    }
+
+    [TestMethod]
+    public void StepOutcomeStoreReadsEnvironment()
+    {
+        var store = Environment.GetEnvironmentVariable("BASIS_MESSAGE_STORE_STEP_OUTCOME_STORE");
+        try
+        {
+            Environment.SetEnvironmentVariable("BASIS_MESSAGE_STORE_STEP_OUTCOME_STORE", "noop");
+
+            var options = new PlatformMessageStoreOptions();
+
+            Assert.AreEqual("noop", options.StepOutcomeStore);
+            Assert.IsFalse(options.UsesStepLedger);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("BASIS_MESSAGE_STORE_STEP_OUTCOME_STORE", store);
+        }
     }
 
     [TestMethod]
