@@ -11,6 +11,45 @@
   `Options` (also empty) replaces the server-side defaults, for a pooler that
   refuses startup parameters.
 
+- The registered `IProducer<string, byte[]>` partitions keyed records with
+  `murmur2_random`, as Java Kafka clients do, instead of the .NET client's
+  default `consistent_random` (CRC32). A replay or DLQ record now lands on the
+  partition a Java producer uses for the same key. Upgrading moves keys once:
+  an application that publishes keyed records through the registered producer,
+  or a producer built from its `Handle`, sends most keys to a different
+  partition than before from this version on, so a record sent after the
+  upgrade can be consumed before an older record for the same key that is
+  still waiting on its old partition. Drain or pause such topics across the
+  upgrade if per-key order matters. An empty (non-null) key now hashes to one
+  fixed partition like any other key, as in Java; only a null key is spread.
+
+- A step whose operation returned is never recorded `FAILED`. When the
+  `DELIVERED` write fails, the step executor retries it in place, and if it
+  keeps failing, throws the store failure without writing `FAILED`. Before,
+  a store error after a successful call recorded the step `FAILED`, with the
+  store's error text as the step's error, so a later attempt or replay sent
+  the call again.
+
+- A handler that catches a step ledger failure and returns success no longer
+  gets the message recorded `COMPLETED`: the adapter notes the store failure
+  next to the step observations and processes the delivery again, without
+  parking it, also when the ledger call was cancelled by the handler's own
+  token. Before, a step that never ran could be recorded as completed.
+
+- Startup refuses a Message Store that lacks a table or column of the store
+  schema the adapter ships, for each table this configuration uses: the
+  message tables always, `bip_step_outcome` with the `postgres` step outcome
+  store and `bip_message_replay_audit` when the resend endpoint is mapped. The
+  error names each missing table and column and gives the statements that add
+  them. The contract major check alone let such a store through: every message
+  then failed to record and was consumed again without end, or, with a column
+  missing from `bip_step_outcome`, its step ran once per handler attempt
+  before the message was parked. A store provisioned for an earlier adapter
+  version must be brought up to date before upgrading: the new version stops
+  its host instead of consuming. The check runs once the host has started, so
+  the consumer starts consuming after the application's other hosted services
+  have started.
+
 - Export Kafka activity through `System.Diagnostics.Metrics` (meter
   `Basis.IntegrationPlatform.MessageStore`), with the same metric names and
   signal labels as the Camel adapter. `BASIS_TRAFFIC_SIGNALS` selects the

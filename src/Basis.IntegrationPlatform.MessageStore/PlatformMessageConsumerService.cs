@@ -29,6 +29,8 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
     private readonly PlatformMessageStoreOptions options;
     private readonly ILogger<PlatformMessageConsumerService> logger;
     private readonly PlatformTrafficMetrics? traffic;
+    private readonly PlatformReplayEndpoints? replayEndpoints;
+    private readonly IHostApplicationLifetime? lifetime;
 
     public PlatformMessageConsumerService(
         IPlatformMessageHandler handler,
@@ -37,7 +39,9 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
         IProducer<string, byte[]> producer,
         IOptions<PlatformMessageStoreOptions> options,
         ILogger<PlatformMessageConsumerService> logger,
-        PlatformTrafficMetrics? traffic = null)
+        PlatformTrafficMetrics? traffic = null,
+        PlatformReplayEndpoints? replayEndpoints = null,
+        IHostApplicationLifetime? lifetime = null)
     {
         this.handler = handler;
         this.store = store;
@@ -45,6 +49,8 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
         this.producer = producer;
         this.options = options.Value;
         this.logger = logger;
+        this.replayEndpoints = replayEndpoints;
+        this.lifetime = lifetime;
         this.traffic = traffic;
         if (producer is PlatformTrafficProducer instrumented) instrumented.Selected();
         else traffic?.InvalidatePublication();
@@ -53,9 +59,30 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         options.Validate();
-        // Startup gate: verify the store schema major in bip_contract before
-        // consuming anything. Wrong major fails fast; missing table warns.
+        // Startup gate: verify the store schema major in bip_contract, then
+        // that the store has every table and column of the shipped schema that
+        // this configuration uses, before consuming anything. Wrong major or a
+        // missing table or column fails fast; a missing bip_contract table
+        // warns.
         await store.VerifyContractAsync(stoppingToken);
+        // Whether the resend endpoint is mapped is known once the host has
+        // started: a Startup class maps its endpoints while the web host
+        // starts, after this service.
+        if (lifetime is not null && replayEndpoints is not null)
+        {
+            logger.LogInformation("Waiting for the host to start before checking the Message Store tables.");
+            try
+            {
+                await WhenStartedAsync(lifetime, stoppingToken);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                // The host stopped before it started, for another reason.
+                return;
+            }
+        }
+
+        await store.VerifyStoreColumnsAsync(replayEndpoints?.Mapped == true, stoppingToken);
         var config = new ConsumerConfig(options.CreateKafkaClientConfig())
         {
             GroupId = options.ConsumerGroupId,
@@ -67,6 +94,13 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
         consumer.Subscribe(options.InputTopic);
         logger.LogInformation("Message-store adapter consuming topic {Topic} group {GroupId}", options.InputTopic, options.ConsumerGroupId);
         await ConsumeAsync(consumer, stoppingToken);
+    }
+
+    private static Task WhenStartedAsync(IHostApplicationLifetime lifetime, CancellationToken stoppingToken)
+    {
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        lifetime.ApplicationStarted.Register(() => started.TrySetResult());
+        return started.Task.WaitAsync(stoppingToken);
     }
 
     internal TimeSpan FailureBackoff { get; init; } = TimeSpan.FromSeconds(5);
@@ -146,6 +180,18 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
 
         if (handled.Result.Succeeded)
         {
+            if (stepObservations.StoreFailedInCurrentInvocation(message.MessageId))
+            {
+                // On shutdown, stop as a shutdown rather than as a store failure.
+                cancellationToken.ThrowIfCancellationRequested();
+                // A step ledger call failed and the handler returned success
+                // anyway: a step may not have run, or its delivery isn't
+                // recorded. Process the delivery again instead of recording
+                // COMPLETED, and park nothing.
+                throw new InvalidOperationException(
+                    "A step ledger call failed in the handler's last invocation, which returned success; the delivery is processed again.");
+            }
+
             await store.RecordAttemptAsync(message, metadata, "COMPLETED", null, cancellationToken);
             commitOffset();
             return;

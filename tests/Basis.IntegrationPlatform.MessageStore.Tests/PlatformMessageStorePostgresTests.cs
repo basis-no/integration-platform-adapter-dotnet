@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using Confluent.Kafka;
@@ -1171,6 +1172,208 @@ public sealed class PlatformMessageStorePostgresTests
     }
 
     [TestMethod]
+    public async Task StoreColumnCheckAcceptsTheFixtureSchema()
+    {
+        var options = CreateOptions(RequireConnectionString());
+        await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+        var (store, _, _, _) = CreateStore(dataSource, options);
+
+        await store.VerifyStoreColumnsAsync(replay: false, CancellationToken.None);
+        await store.VerifyStoreColumnsAsync(replay: true, CancellationToken.None);
+    }
+
+    [TestMethod]
+    public async Task StoreColumnCheckRequiresTheReplayAuditTableOnlyWhenResendIsMapped()
+    {
+        await WithStoreSchemaAsync(
+            """
+            create table {0}.bip_message_log (like public.bip_message_log including all);
+            create table {0}.bip_message_attempt (like public.bip_message_attempt including all);
+            create table {0}.bip_step_outcome (like public.bip_step_outcome including all);
+            """,
+            async connectionString =>
+            {
+                var options = CreateOptions(connectionString);
+                options.ContractGateMaxAttempts = 1;
+                await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+                var (store, _, _, _) = CreateStore(dataSource, options);
+
+                await store.VerifyStoreColumnsAsync(replay: false, CancellationToken.None);
+                var error = await Assert.ThrowsExactlyAsync<InvalidOperationException>(
+                    () => store.VerifyStoreColumnsAsync(replay: true, CancellationToken.None));
+                StringAssert.Contains(error.Message, "lacks table bip_message_replay_audit,");
+                StringAssert.Contains(error.Message, "create table if not exists bip_message_replay_audit ( replay_id uuid primary key,");
+                StringAssert.Contains(error.Message, "create index if not exists bip_message_replay_audit_message_id_idx on bip_message_replay_audit (message_id);");
+            });
+    }
+
+    [TestMethod]
+    public async Task StartupChecksTheReplayTablesForAnEndpointMappedWhileTheHostStarts()
+    {
+        // A Startup class maps its endpoints while the web host starts, after
+        // the consumer has started; the check waits for the host to start.
+        await WithStoreSchemaAsync(
+            """
+            create table {0}.bip_contract (like public.bip_contract including all);
+            insert into {0}.bip_contract select * from public.bip_contract;
+            create table {0}.bip_message_log (like public.bip_message_log including all);
+            create table {0}.bip_message_attempt (like public.bip_message_attempt including all);
+            create table {0}.bip_step_outcome (like public.bip_step_outcome including all);
+            """,
+            async connectionString =>
+            {
+                var options = CreateOptions(connectionString);
+                options.ContractGateMaxAttempts = 1;
+                await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+                var (store, _, observations, _) = CreateStore(dataSource, options);
+                var replayEndpoints = new PlatformReplayEndpoints();
+                var lifetime = new StartingLifetime();
+                using var service = new PlatformMessageConsumerService(
+                    new SyntheticHandler(), store, observations, new FakeProducer(), Options.Create(options),
+                    NullLogger<PlatformMessageConsumerService>.Instance, null, replayEndpoints, lifetime);
+
+                await service.StartAsync(CancellationToken.None);
+                await Task.Delay(200);
+                Assert.IsFalse(service.ExecuteTask!.IsCompleted, "The check waits for the host to start.");
+                replayEndpoints.Mapped = true;
+                lifetime.Started();
+
+                var error = await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => service.ExecuteTask!);
+                StringAssert.Contains(error.Message, "lacks table bip_message_replay_audit,");
+            });
+    }
+
+    private sealed class StartingLifetime : Microsoft.Extensions.Hosting.IHostApplicationLifetime
+    {
+        private readonly CancellationTokenSource started = new();
+        public CancellationToken ApplicationStarted => started.Token;
+        public CancellationToken ApplicationStopping => CancellationToken.None;
+        public CancellationToken ApplicationStopped => CancellationToken.None;
+        public void StopApplication() { }
+        public void Started() => started.Cancel();
+    }
+
+    [TestMethod]
+    public async Task StoreColumnCheckRequiresTheStepOutcomeTableOnlyWithThePostgresStepStore()
+    {
+        await WithStoreSchemaAsync(
+            """
+            create table {0}.bip_message_log (like public.bip_message_log including all);
+            create table {0}.bip_message_attempt (like public.bip_message_attempt including all);
+            """,
+            async connectionString =>
+            {
+                var options = CreateOptions(connectionString);
+                options.ContractGateMaxAttempts = 1;
+                options.StepOutcomeStore = PlatformMessageStoreOptions.StepOutcomeStoreNoop;
+                await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+                var (store, _, _, _) = CreateStore(dataSource, options);
+                await store.VerifyStoreColumnsAsync(replay: false, CancellationToken.None);
+
+                options.StepOutcomeStore = PlatformMessageStoreOptions.StepOutcomeStorePostgres;
+                var error = await Assert.ThrowsExactlyAsync<InvalidOperationException>(
+                    () => store.VerifyStoreColumnsAsync(replay: false, CancellationToken.None));
+                StringAssert.Contains(error.Message, "lacks table bip_step_outcome,");
+            });
+    }
+
+    [TestMethod]
+    public async Task StartupRefusesAStoreThatLacksATableOrColumnAndPrintsTheStatementsThatAddThem()
+    {
+        // A store that declares major 1 but lacks a column in two tables and
+        // the whole attempt table.
+        await WithStoreSchemaAsync(
+            """
+            create table {0}.bip_contract (like public.bip_contract including all);
+            insert into {0}.bip_contract select * from public.bip_contract;
+            create table {0}.bip_message_log (like public.bip_message_log including all);
+            create table {0}.bip_step_outcome (like public.bip_step_outcome including all);
+            alter table {0}.bip_message_log drop column replay_disabled_reason;
+            alter table {0}.bip_message_log drop column payload_deleted_at;
+            alter table {0}.bip_message_log drop column integration;
+            alter table {0}.bip_step_outcome drop column target_ref;
+            insert into {0}.bip_message_log (message_id, schema_version, status, last_attempt, occurred_at)
+                values ('synthetic-existing-row', 1, 'COMPLETED', 1, now());
+            """,
+            async connectionString =>
+            {
+                var options = CreateOptions(connectionString);
+                options.ContractGateMaxAttempts = 1;
+                await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+                var (store, _, observations, _) = CreateStore(dataSource, options);
+                var handler = new DelegateHandler((_, _) => Task.FromResult(PlatformMessageResult.Completed()));
+                using var service = CreateConsumerService(handler, store, observations, new FakeProducer(), options);
+
+                await service.StartAsync(CancellationToken.None);
+                var error = await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => service.ExecuteTask!);
+
+                StringAssert.Contains(
+                    error.Message,
+                    "lacks bip_message_log.payload_deleted_at, bip_message_log.replay_disabled_reason, bip_message_log.integration, " +
+                    "table bip_message_attempt, " +
+                    "bip_step_outcome.target_ref, which this adapter uses. Refusing to start");
+                StringAssert.Contains(error.Message, "alter table bip_message_log add column if not exists replay_disabled_reason text");
+                StringAssert.Contains(error.Message, "alter table bip_step_outcome add column if not exists target_ref text");
+                Assert.IsFalse(error.Message.Contains("bip_message_replay_audit", StringComparison.Ordinal), error.Message);
+                Assert.AreEqual(0, handler.Calls.Count, "Nothing is consumed.");
+
+                // The printed statements, then the follow-ups once the existing
+                // row has a value, bring the store to the shipped schema.
+                const string statementsMarker = "before starting: ";
+                const string followUpMarker = ". Then give existing rows a value in each added column and run: ";
+                var start = error.Message.IndexOf(statementsMarker, StringComparison.Ordinal) + statementsMarker.Length;
+                var followUpAt = error.Message.IndexOf(followUpMarker, StringComparison.Ordinal);
+                Assert.IsTrue(followUpAt > start, error.Message);
+                var statements = error.Message[start..followUpAt].Split("; ");
+                var followUps = error.Message[(followUpAt + followUpMarker.Length)..^1].Split("; ");
+                CollectionAssert.AreEqual(new[] { "alter table bip_message_log alter column integration set not null" }, followUps);
+                await using (var connection = await dataSource.OpenConnectionAsync())
+                {
+                    foreach (var statement in statements
+                        .Append("update bip_message_log set integration = 'integration-e2e-dotnet' where integration is null")
+                        .Concat(followUps))
+                    {
+                        await using var apply = new NpgsqlCommand(statement, connection);
+                        await apply.ExecuteNonQueryAsync();
+                    }
+
+                    await using var indexes = new NpgsqlCommand(
+                        "select count(*) from pg_indexes where schemaname = current_schema() and tablename = 'bip_message_attempt'", connection);
+                    Assert.AreEqual(3L, await indexes.ExecuteScalarAsync(), "The primary key and both shipped indexes.");
+                }
+
+                await store.VerifyStoreColumnsAsync(replay: false, CancellationToken.None);
+            });
+    }
+
+    // Runs the test against a store in its own schema, made by the statements
+    // ({0} is the schema), found through the connection's search_path.
+    private static async Task WithStoreSchemaAsync(string statements, Func<string, Task> test)
+    {
+        var connectionString = RequireConnectionString();
+        var schemaName = $"bip_shape_{Guid.NewGuid():N}";
+        await using var admin = NpgsqlDataSource.Create(connectionString);
+        await using (var connection = await admin.OpenConnectionAsync())
+        {
+            await using var create = new NpgsqlCommand(
+                $"create schema \"{schemaName}\";\n" + string.Format(CultureInfo.InvariantCulture, statements, $"\"{schemaName}\""),
+                connection);
+            await create.ExecuteNonQueryAsync();
+        }
+
+        try
+        {
+            await test(new NpgsqlConnectionStringBuilder(connectionString) { SearchPath = schemaName }.ConnectionString);
+        }
+        finally
+        {
+            await using var connection = await admin.OpenConnectionAsync();
+            await using var drop = new NpgsqlCommand($"drop schema \"{schemaName}\" cascade", connection);
+            await drop.ExecuteNonQueryAsync();
+        }
+    }
+
+    [TestMethod]
     public async Task VerifyContractWarnsAndContinuesWhenTableMissing()
     {
         var connectionString = RequireConnectionString();
@@ -2000,6 +2203,294 @@ public sealed class PlatformMessageStorePostgresTests
         Assert.IsTrue(started.Elapsed < TimeSpan.FromSeconds(15), started.Elapsed.ToString());
         Assert.IsFalse(committed, "A record that timed out commits nothing.");
         await transaction.RollbackAsync();
+    }
+
+    [TestMethod]
+    public async Task DeliveredWriteThatFailsOnceIsRetriedInPlace()
+    {
+        await WithFailingLedgerAsync(failures: 1, async (dataSource, options) =>
+        {
+            var observations = new PlatformStepObservationCollector();
+            var steps = LedgerTestExecutor(dataSource, observations);
+            var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+            var sends = 0;
+
+            var result = await steps.ExecuteAsync(
+                CreateMessage(messageId, options), "deliver", "https://target.example/orders", "target",
+                _ => { sends++; return Task.CompletedTask; }, CancellationToken.None);
+
+            Assert.AreEqual("DELIVERED", result.Status);
+            Assert.AreEqual(1, sends, "The call that succeeded is not made again.");
+            Assert.AreEqual("DELIVERED", await StepStatusAsync(dataSource, $"{messageId}:deliver"));
+            Assert.AreEqual("DELIVERED", observations.Snapshot(messageId).Single().Status);
+            Assert.IsFalse(observations.StoreFailedInCurrentInvocation(messageId));
+        });
+    }
+
+    [TestMethod]
+    public async Task DeliveredWriteThatKeepsFailingNeverRecordsFailed()
+    {
+        // Every DELIVERED attempt fails; a further write would succeed and show.
+        await WithFailingLedgerAsync(failures: 3, async (dataSource, options) =>
+        {
+            var observations = new PlatformStepObservationCollector();
+            var steps = LedgerTestExecutor(dataSource, observations);
+            var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+            var sends = 0;
+
+            await Assert.ThrowsExactlyAsync<PostgresException>(() => steps.ExecuteAsync(
+                CreateMessage(messageId, options), "deliver", "https://target.example/orders", "target",
+                _ => { sends++; return Task.CompletedTask; }, CancellationToken.None));
+
+            Assert.AreEqual(1, sends);
+            Assert.IsNull(await StepStatusAsync(dataSource, $"{messageId}:deliver"), "No FAILED row for a call that succeeded.");
+            Assert.AreEqual("DELIVERED", observations.Snapshot(messageId).Single().Status);
+            Assert.IsTrue(observations.StoreFailedInCurrentInvocation(messageId));
+        });
+    }
+
+    [TestMethod]
+    public async Task HandlerThatSwallowsALedgerFailureIsNotRecordedCompleted()
+    {
+        // The store has no bip_step_outcome, so the ledger read before the
+        // step fails and the step's operation never runs.
+        await WithFailingLedgerAsync(failures: 0, async (dataSource, options) =>
+        {
+            await using (var connection = await dataSource.OpenConnectionAsync())
+            {
+                await using var drop = new NpgsqlCommand("drop table bip_step_outcome", connection);
+                await drop.ExecuteNonQueryAsync();
+            }
+
+            var observations = new PlatformStepObservationCollector();
+            var store = new PlatformMessageStore(dataSource, observations, Options.Create(options), NullLogger<PlatformMessageStore>.Instance);
+            var steps = LedgerTestExecutor(dataSource, observations);
+            var sends = 0;
+            var handler = new DelegateHandler(async (message, ct) =>
+            {
+                try
+                {
+                    await steps.ExecuteAsync(message, "deliver", "https://target.example/orders", "target", _ => { sends++; return Task.CompletedTask; }, ct);
+                }
+                catch (PostgresException)
+                {
+                    // An optional step, as the handler sees it.
+                }
+
+                return PlatformMessageResult.Completed();
+            });
+            var producer = new FakeProducer();
+            using var service = CreateConsumerService(handler, store, observations, producer, options);
+            var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+            var committed = false;
+
+            var error = await Assert.ThrowsExactlyAsync<InvalidOperationException>(
+                () => service.ProcessAsync(CreateMessage(messageId, options), () => committed = true, CancellationToken.None));
+
+            StringAssert.Contains(error.Message, "step ledger");
+            Assert.IsFalse(committed);
+            Assert.AreEqual(0, sends);
+            Assert.IsNull(await LogStatusAsync(dataSource, messageId), "Nothing is recorded COMPLETED.");
+            Assert.AreEqual(0, producer.Produced.Count, "Nothing is parked.");
+        });
+    }
+
+    [TestMethod]
+    public async Task HandlerRetryWithoutALedgerFailureCompletes()
+    {
+        // The first invocation's DELIVERED write fails on every attempt; the
+        // handler reports a failure and is retried, and the retry records it.
+        await WithFailingLedgerAsync(failures: 3, async (dataSource, options) =>
+        {
+            options.MaxHandlerAttempts = 2;
+            options.HandlerRetryDelayMs = 0;
+            var observations = new PlatformStepObservationCollector();
+            var store = new PlatformMessageStore(dataSource, observations, Options.Create(options), NullLogger<PlatformMessageStore>.Instance);
+            var steps = LedgerTestExecutor(dataSource, observations);
+            var sends = 0;
+            var handler = new DelegateHandler(async (message, ct) =>
+            {
+                try
+                {
+                    await steps.ExecuteAsync(message, "deliver", "https://target.example/orders", "target", _ => { sends++; return Task.CompletedTask; }, ct);
+                    return PlatformMessageResult.Completed();
+                }
+                catch (PostgresException ex)
+                {
+                    return PlatformMessageResult.Failed(ex.MessageText);
+                }
+            });
+            using var service = CreateConsumerService(handler, store, observations, new FakeProducer(), options);
+            var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+            var committed = false;
+
+            await service.ProcessAsync(CreateMessage(messageId, options), () => committed = true, CancellationToken.None);
+
+            Assert.IsTrue(committed);
+            Assert.AreEqual(2, sends, "No DELIVERED row after the first invocation, so the retry sends again.");
+            Assert.AreEqual("COMPLETED", await LogStatusAsync(dataSource, messageId));
+            Assert.AreEqual("DELIVERED", await StepStatusAsync(dataSource, $"{messageId}:deliver"));
+        });
+    }
+
+    [TestMethod]
+    [DataRow("delivered-write")]
+    [DataRow("failed-write")]
+    [DataRow("handler-timeout")]
+    [DataRow("handler-timeout-read-lock")]
+    [DataRow("handler-timeout-write-lock")]
+    public async Task HandlerThatSwallowsALedgerWriteFailureIsNotRecordedCompleted(string path)
+    {
+        var locked = path.EndsWith("-lock", StringComparison.Ordinal);
+        await WithFailingLedgerAsync(failures: locked ? 0 : path == "delivered-write" ? 3 : 100, async (dataSource, options) =>
+        {
+            // Another session holds the ledger table, so the ledger call hangs
+            // until the handler's own timeout cancels it.
+            await using var holder = await dataSource.OpenConnectionAsync();
+            await using var holding = await holder.BeginTransactionAsync();
+            async Task HoldLedgerAsync()
+            {
+                await using var hold = new NpgsqlCommand("lock table bip_step_outcome in access exclusive mode", holder, holding);
+                await hold.ExecuteNonQueryAsync();
+            }
+
+            if (path == "handler-timeout-read-lock")
+            {
+                await HoldLedgerAsync();
+            }
+
+            var observations = new PlatformStepObservationCollector();
+            var store = new PlatformMessageStore(dataSource, observations, Options.Create(options), NullLogger<PlatformMessageStore>.Instance);
+            // The handler's own timeout ends the in-place retry of the DELIVERED write.
+            var steps = LedgerTestExecutor(dataSource, observations, path == "handler-timeout" ? TimeSpan.FromSeconds(5) : TimeSpan.Zero);
+            var sends = 0;
+            var handler = new DelegateHandler(async (message, ct) =>
+            {
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                timeout.CancelAfter(TimeSpan.FromMilliseconds(300));
+                try
+                {
+                    await steps.ExecuteAsync(message, "deliver", "https://target.example/orders", "target", async _ =>
+                    {
+                        sends++;
+                        if (path == "failed-write")
+                        {
+                            throw new HttpRequestException("synthetic receiver failure");
+                        }
+
+                        if (path == "handler-timeout-write-lock")
+                        {
+                            await HoldLedgerAsync();
+                        }
+                    }, path.StartsWith("handler-timeout", StringComparison.Ordinal) ? timeout.Token : ct);
+                }
+                catch (Exception)
+                {
+                    // A generic catch, as the handler sees an optional step.
+                }
+
+                return PlatformMessageResult.Completed();
+            });
+            var producer = new FakeProducer();
+            using var service = CreateConsumerService(handler, store, observations, producer, options);
+            var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+            var committed = false;
+
+            await Assert.ThrowsExactlyAsync<InvalidOperationException>(
+                () => service.ProcessAsync(CreateMessage(messageId, options), () => committed = true, CancellationToken.None));
+
+            Assert.AreEqual(path == "handler-timeout-read-lock" ? 0 : 1, sends);
+            Assert.IsFalse(committed);
+            await holding.RollbackAsync();
+            Assert.IsNull(await LogStatusAsync(dataSource, messageId), "Nothing is recorded COMPLETED.");
+            Assert.IsNull(await StepStatusAsync(dataSource, $"{messageId}:deliver"));
+            Assert.AreEqual(0, producer.Produced.Count, "Nothing is parked.");
+        });
+    }
+
+    [TestMethod]
+    public async Task HandlerThatSwallowsAFailedOperationStillCompletes()
+    {
+        await WithFailingLedgerAsync(failures: 0, async (dataSource, options) =>
+        {
+            var observations = new PlatformStepObservationCollector();
+            var store = new PlatformMessageStore(dataSource, observations, Options.Create(options), NullLogger<PlatformMessageStore>.Instance);
+            var steps = LedgerTestExecutor(dataSource, observations);
+            var handler = new DelegateHandler(async (message, ct) =>
+            {
+                try
+                {
+                    await steps.ExecuteAsync(message, "optional", "https://target.example/orders", "target",
+                        _ => throw new HttpRequestException("synthetic receiver failure"), ct);
+                }
+                catch (HttpRequestException)
+                {
+                    // The step is optional for this handler.
+                }
+
+                return PlatformMessageResult.Completed();
+            });
+            using var service = CreateConsumerService(handler, store, observations, new FakeProducer(), options);
+            var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+            var committed = false;
+
+            await service.ProcessAsync(CreateMessage(messageId, options), () => committed = true, CancellationToken.None);
+
+            Assert.IsTrue(committed);
+            Assert.AreEqual("COMPLETED", await LogStatusAsync(dataSource, messageId));
+            Assert.AreEqual("FAILED", await StepStatusAsync(dataSource, $"{messageId}:optional"));
+        });
+    }
+
+    private static PlatformStepExecutor LedgerTestExecutor(
+        NpgsqlDataSource dataSource, PlatformStepObservationCollector observations, TimeSpan? retryDelay = null) =>
+        new(dataSource, observations, NullLogger<PlatformStepExecutor>.Instance)
+        {
+            DeliveredWriteRetryDelay = retryDelay ?? TimeSpan.Zero,
+        };
+
+    // Runs the test against a store in its own schema whose first `failures`
+    // writes to bip_step_outcome fail, as during a short store outage.
+    private static async Task WithFailingLedgerAsync(int failures, Func<NpgsqlDataSource, PlatformMessageStoreOptions, Task> test)
+    {
+        var connectionString = RequireConnectionString();
+        var schemaName = $"bip_ledger_{Guid.NewGuid():N}";
+        await using var admin = NpgsqlDataSource.Create(connectionString);
+        await using (var connection = await admin.OpenConnectionAsync())
+        {
+            await using var create = new NpgsqlCommand(
+                $"""
+                create schema {schemaName};
+                create table {schemaName}.bip_message_log (like public.bip_message_log including all);
+                create table {schemaName}.bip_message_attempt (like public.bip_message_attempt including all);
+                create table {schemaName}.bip_step_outcome (like public.bip_step_outcome including all);
+                create sequence {schemaName}.ledger_writes;
+                create function {schemaName}.fail_ledger_writes() returns trigger language plpgsql as $$
+                begin
+                    if nextval('{schemaName}.ledger_writes') <= {failures} then
+                        raise exception 'synthetic store failure';
+                    end if;
+                    return new;
+                end $$;
+                create trigger fail_ledger_writes before insert or update on {schemaName}.bip_step_outcome
+                    for each row execute function {schemaName}.fail_ledger_writes();
+                """,
+                connection);
+            await create.ExecuteNonQueryAsync();
+        }
+
+        try
+        {
+            var options = CreateOptions(new NpgsqlConnectionStringBuilder(connectionString) { SearchPath = schemaName }.ConnectionString);
+            await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+            await test(dataSource, options);
+        }
+        finally
+        {
+            await using var connection = await admin.OpenConnectionAsync();
+            await using var drop = new NpgsqlCommand($"drop schema {schemaName} cascade", connection);
+            await drop.ExecuteNonQueryAsync();
+        }
     }
 
     private static PlatformMessageConsumerService CreateConsumerService(

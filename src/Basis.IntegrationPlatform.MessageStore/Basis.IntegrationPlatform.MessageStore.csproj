@@ -20,6 +20,11 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- The store schema the adapter expects; the startup check reads its required tables and columns from it. -->
+    <EmbeddedResource Include="../../tests/fixtures/postgres/002_adapter_v1_message_store.sql" LogicalName="Basis.IntegrationPlatform.MessageStore.Schema.002_adapter_v1_message_store.sql" />
+  </ItemGroup>
+
+  <ItemGroup>
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
     <PackageReference Include="Confluent.Kafka" />
     <PackageReference Include="Npgsql" />
