@@ -384,6 +384,28 @@ credentials out of source, endpoint URLs and logs. An explicit
 `POSTGRES_CONNECTION_STRING` takes precedence and must carry its own pool/TLS
 settings. Plaintext modes are retained for trusted local compatibility.
 
+### Message Store timeouts
+
+Every Message Store call is bounded well under the consumer's poll interval
+(`max.poll.interval.ms`, 300 s by default), so a hung database, a held lock or a
+dead connection fails the call instead of stalling the consumer until it
+leaves its group. A failed or timed-out call is a store failure: the delivery
+is not committed and is processed again after the failure backoff. The adapter
+applies these defaults to its own datasource, for every setting the connection
+string does not set itself:
+
+| Npgsql setting | Default | Bounds |
+| --- | --- | --- |
+| `Timeout` | 5 s (Npgsql: 15 s) | opening a connection, and waiting for a pooled one |
+| `Command Timeout` | 20 s (Npgsql: 30 s) | one command, on the client |
+| `Keepalive` | 10 s (Npgsql: off) | how soon an idle dead connection is found |
+| `Options` | `-c statement_timeout=15000 -c lock_timeout=5000` | one statement, and a lock wait, on the server |
+
+To change one, set it in `POSTGRES_CONNECTION_STRING`. Behind a connection
+pooler that refuses startup parameters, set `Options=` (empty) or your own
+`Options`; the adapter then sends none of its own, and the client-side
+`Command Timeout` still bounds each call.
+
 Business persistence belongs in a separate application database. The adapter
 uses its keyed datasource `PlatformMessageStoreExtensions.MessageStoreDataSourceKey`
 for both journal and step persistence. A default datasource is still registered

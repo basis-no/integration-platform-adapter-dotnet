@@ -1957,6 +1957,51 @@ public sealed class PlatformMessageStorePostgresTests
         Assert.AreEqual("bip.integration-second.in", producer.Produced.Single().Topic);
     }
 
+    [TestMethod]
+    public async Task StoreSessionsGetTheServerTimeouts()
+    {
+        await using var dataSource = NpgsqlDataSource.Create(PlatformStoreTimeouts.Apply(RequireConnectionString()));
+        await using var connection = await dataSource.OpenConnectionAsync();
+        await using var command = new NpgsqlCommand("select current_setting('statement_timeout'), current_setting('lock_timeout')", connection);
+        await using var reader = await command.ExecuteReaderAsync();
+        Assert.IsTrue(await reader.ReadAsync());
+        Assert.AreEqual("15s", reader.GetString(0));
+        Assert.AreEqual("5s", reader.GetString(1));
+    }
+
+    [TestMethod]
+    public async Task AHeldLockFailsTheRecordWithinTheLockTimeoutAndCommitsNothing()
+    {
+        var options = CreateOptions(RequireConnectionString());
+        await using var dataSource = NpgsqlDataSource.Create(PlatformStoreTimeouts.Apply(options.PostgresConnectionString));
+        var (store, _, observations, _) = CreateStore(dataSource, options);
+        var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+        var message = CreateMessage(messageId, options);
+        await store.RecordAttemptAsync(message, "dotnet-handler", "RECEIVED", null, CancellationToken.None);
+
+        // Another session holds the summary row, as a stuck transaction would.
+        await using var holder = await NpgsqlDataSource.Create(RequireConnectionString()).OpenConnectionAsync();
+        await using var transaction = await holder.BeginTransactionAsync();
+        await using (var lockRow = new NpgsqlCommand("select 1 from bip_message_log where message_id = @id for update", holder, transaction))
+        {
+            lockRow.Parameters.AddWithValue("id", messageId);
+            await lockRow.ExecuteScalarAsync();
+        }
+
+        var handler = new DelegateHandler((_, _) => Task.FromResult(PlatformMessageResult.Completed()));
+        using var service = CreateConsumerService(handler, store, observations, new FakeProducer(), options);
+        var committed = false;
+        var started = System.Diagnostics.Stopwatch.StartNew();
+
+        var error = await Assert.ThrowsExactlyAsync<PostgresException>(
+            () => service.ProcessAsync(message, () => committed = true, CancellationToken.None));
+
+        Assert.AreEqual(PostgresErrorCodes.LockNotAvailable, error.SqlState);
+        Assert.IsTrue(started.Elapsed < TimeSpan.FromSeconds(15), started.Elapsed.ToString());
+        Assert.IsFalse(committed, "A record that timed out commits nothing.");
+        await transaction.RollbackAsync();
+    }
+
     private static PlatformMessageConsumerService CreateConsumerService(
         IPlatformMessageHandler handler,
         PlatformMessageStore store,

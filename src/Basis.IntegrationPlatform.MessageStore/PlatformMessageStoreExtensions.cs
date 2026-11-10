@@ -33,7 +33,7 @@ public static class PlatformMessageStoreExtensions
         {
             var options = provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<PlatformMessageStoreOptions>>().Value;
             options.Validate();
-            return NpgsqlDataSource.Create(options.PostgresConnectionString);
+            return NpgsqlDataSource.Create(PlatformStoreTimeouts.Apply(options.PostgresConnectionString));
         });
         services.AddSingleton<PlatformStepObservationCollector>();
         // Preserve the original default datasource registration for compatibility.

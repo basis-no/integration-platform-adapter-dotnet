@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Every Message Store call now has a timeout well under the consumer's poll
+  interval: 5 s to connect or wait for a pooled connection, 20 s per command,
+  a 10 s keepalive, and `statement_timeout=15s` and `lock_timeout=5s` on the
+  server. Before, Npgsql's defaults (15 s, 30 s, no keepalive) and no server
+  limits let a hung store or a held lock stall the consumer for minutes, past
+  the poll interval. A value set in the connection string wins; an explicit
+  `Options` (also empty) replaces the server-side defaults, for a pooler that
+  refuses startup parameters.
+
 - Export Kafka activity through `System.Diagnostics.Metrics` (meter
   `Basis.IntegrationPlatform.MessageStore`), with the same metric names and
   signal labels as the Camel adapter. `BASIS_TRAFFIC_SIGNALS` selects the
