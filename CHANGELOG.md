@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- `IPlatformStepExecutor.ExecuteWithContextAsync` passes the operation a
+  `PlatformStepExecutionContext` with the step's idempotency key and step id
+  before the call. Send the key as `Idempotency-Key` and
+  `x-bip-idempotency-key`, as the Camel adapter does, so the receiver can
+  deduplicate a redelivery, a replay or a redo of a call it already applied.
+  `ExecuteAsync`, and implementations of `IPlatformStepExecutor` written
+  against it, keep working unchanged.
+
 - `BASIS_MESSAGE_STORE_STEP_OUTCOME_STORE` selects the step outcome store, as
   in the Camel adapter: `postgres` (the default, as before) or `noop`. With
   `noop`, every step runs on every delivery and replay, nothing is read from

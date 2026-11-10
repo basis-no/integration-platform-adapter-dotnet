@@ -296,6 +296,9 @@ public sealed class PlatformMessageStorePostgresTests
         Assert.IsFalse(request.Headers.Any(header => consumedNames.Contains(header.Name)), string.Join(", ", request.Headers.Select(header => header.Name)));
         Assert.IsFalse(request.Headers.Any(header => header.Value.Contains("synthetic-consumed", StringComparison.Ordinal)));
         Assert.IsFalse(request.Uri.Contains("synthetic-consumed", StringComparison.Ordinal));
+        CollectionAssert.IsSubsetOf(
+            new[] { ("Idempotency-Key", $"{messageId}:target-system"), ("x-bip-idempotency-key", $"{messageId}:target-system") },
+            request.Headers.ToArray());
         Assert.AreEqual("COMPLETED", await LogStatusAsync(provider.GetRequiredKeyedService<NpgsqlDataSource>(PlatformMessageStoreExtensions.MessageStoreDataSourceKey), messageId));
     }
 
@@ -338,21 +341,26 @@ public sealed class PlatformMessageStorePostgresTests
         Assert.IsFalse(headers.Any(header => Encoding.UTF8.GetString(header.GetValueBytes()).Contains("synthetic-consumed", StringComparison.Ordinal)));
     }
 
-    /// <summary>The README's handler: one step around a named client's call.</summary>
+    /// <summary>The README's handler: one step around a named client's call, keyed by the step.</summary>
     private sealed class ReadmePatternHandler(IPlatformStepExecutor steps, IHttpClientFactory httpClients) : IPlatformMessageHandler
     {
         public async Task<PlatformMessageResult> HandleAsync(PlatformMessage message, CancellationToken cancellationToken)
         {
-            await steps.ExecuteAsync(
+            await steps.ExecuteWithContextAsync(
                 message,
                 stepId: "target-system",
                 endpointUri: "https://target.example/api/orders",
                 targetRef: message.TargetSystem,
-                operation: async ct =>
+                operation: async (step, ct) =>
                 {
-                    using var content = new ByteArrayContent(message.Payload);
-                    content.Headers.ContentType = System.Net.Http.Headers.MediaTypeHeaderValue.Parse(message.ContentType);
-                    using var response = await httpClients.CreateClient("target-system").PostAsync("api/orders", content, ct);
+                    using var request = new HttpRequestMessage(HttpMethod.Post, "api/orders")
+                    {
+                        Content = new ByteArrayContent(message.Payload),
+                    };
+                    request.Content.Headers.ContentType = System.Net.Http.Headers.MediaTypeHeaderValue.Parse(message.ContentType);
+                    request.Headers.Add("Idempotency-Key", step.IdempotencyKey);
+                    request.Headers.Add("x-bip-idempotency-key", step.IdempotencyKey);
+                    using var response = await httpClients.CreateClient("target-system").SendAsync(request, ct);
                     response.EnsureSuccessStatusCode();
                 },
                 cancellationToken);
@@ -1650,6 +1658,79 @@ public sealed class PlatformMessageStorePostgresTests
 
         await Assert.ThrowsExactlyAsync<ConsumeException>(() => service.ConsumeAsync(consumer, stopping.Token));
         Assert.AreEqual(0, handler.Calls.Count);
+    }
+
+    [TestMethod]
+    public async Task StepContextSuppliesReceiverKeyBeforeCallAcrossRedeliveryReplayAndRedo()
+    {
+        var options = CreateOptions(RequireConnectionString());
+        await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+        var (_, executor, _, _) = CreateStore(dataSource, options);
+        IPlatformStepExecutor steps = executor;
+        var message = CreateMessage($"dotnet-test-{Guid.NewGuid():N}", options);
+        using var receiver = new IdempotentReceiver();
+        using var client = new HttpClient(receiver);
+        using var cancellation = new CancellationTokenSource();
+        var expectedKey = $"{message.MessageId}:deliver";
+        async Task Send(PlatformStepExecutionContext context, CancellationToken ct)
+        {
+            Assert.AreEqual("deliver", context.StepId);
+            Assert.AreEqual(expectedKey, context.IdempotencyKey);
+            Assert.AreEqual(cancellation.Token, ct);
+            using var request = new HttpRequestMessage(HttpMethod.Post, "https://target.example/orders");
+            request.Headers.Add("Idempotency-Key", context.IdempotencyKey);
+            using var response = await client.SendAsync(request, ct);
+            response.EnsureSuccessStatusCode();
+        }
+
+        // The receiver applied the first call, then the attempt failed.
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => steps.ExecuteWithContextAsync(
+            message, "deliver", "https://target.example/orders", "target", async (context, ct) =>
+            {
+                await Send(context, ct);
+                throw new InvalidOperationException("synthetic failure after receiver applied call");
+            }, cancellation.Token));
+        CollectionAssert.AreEqual(new[] { expectedKey }, receiver.Keys);
+        var delivered = await steps.ExecuteWithContextAsync(message, "deliver", "https://target.example/orders", "target", Send, cancellation.Token);
+        var replay = message with { Headers = new Dictionary<string, string> { ["x-bip-attempt"] = "2", ["x-bip-replay"] = "true" } };
+        var skipped = await steps.ExecuteWithContextAsync(replay, "deliver", "https://target.example/orders", "target", Send, cancellation.Token);
+        var redo = replay with { Headers = new Dictionary<string, string> { ["x-bip-attempt"] = "2", ["x-bip-replay"] = "true", ["x-bip-redo-steps"] = "[\"deliver\"]" } };
+        var redone = await steps.ExecuteWithContextAsync(redo, "deliver", "https://target.example/orders", "target", Send, cancellation.Token);
+        Assert.IsTrue(skipped.Skipped);
+        Assert.IsFalse(redone.Skipped);
+        Assert.AreEqual(expectedKey, delivered.IdempotencyKey);
+        Assert.AreEqual(expectedKey, skipped.IdempotencyKey);
+        Assert.AreEqual(expectedKey, redone.IdempotencyKey);
+        CollectionAssert.AreEqual(new[] { expectedKey, expectedKey, expectedKey }, receiver.Keys);
+        Assert.AreEqual(1, receiver.Applications, "A receiver can deduplicate retries and explicit redo with the stable key.");
+        await using var connection = await dataSource.OpenConnectionAsync();
+        await using var read = new NpgsqlCommand(
+            "select idempotency_key, step_id, status from bip_step_outcome where message_id = @id", connection);
+        read.Parameters.AddWithValue("id", message.MessageId);
+        await using var reader = await read.ExecuteReaderAsync();
+        Assert.IsTrue(await reader.ReadAsync());
+        Assert.AreEqual(receiver.Keys[0], reader.GetString(0));
+        Assert.AreEqual("deliver", reader.GetString(1));
+        Assert.AreEqual("DELIVERED", reader.GetString(2));
+        Assert.IsFalse(await reader.ReadAsync());
+    }
+
+    private sealed class IdempotentReceiver : HttpMessageHandler
+    {
+        public List<string> Keys { get; } = [];
+        public int Applications { get; private set; }
+        private readonly HashSet<string> applied = new(StringComparer.Ordinal);
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            var key = request.Headers.GetValues("Idempotency-Key").Single();
+            Keys.Add(key);
+            if (applied.Add(key))
+            {
+                Applications++;
+            }
+
+            return Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.OK));
+        }
     }
 
     [TestMethod]
