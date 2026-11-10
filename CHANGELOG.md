@@ -6,11 +6,13 @@
   `murmur2_random`, as Java Kafka clients do, instead of the .NET client's
   default `consistent_random` (CRC32). A replay or DLQ record now lands on the
   partition a Java producer uses for the same key. Upgrading moves keys once:
-  an application that publishes keyed records through the registered producer
-  sends each key to a different partition than before from this version on,
-  so a record sent after the upgrade can be consumed before an older record
-  for the same key that is still waiting on its old partition. Drain or pause
-  such topics across the upgrade if per-key order matters.
+  an application that publishes keyed records through the registered producer,
+  or a producer built from its `Handle`, sends most keys to a different
+  partition than before from this version on, so a record sent after the
+  upgrade can be consumed before an older record for the same key that is
+  still waiting on its old partition. Drain or pause such topics across the
+  upgrade if per-key order matters. An empty (non-null) key now hashes to one
+  fixed partition like any other key, as in Java; only a null key is spread.
 
 - Export Kafka activity through `System.Diagnostics.Metrics` (meter
   `Basis.IntegrationPlatform.MessageStore`), with the same metric names and

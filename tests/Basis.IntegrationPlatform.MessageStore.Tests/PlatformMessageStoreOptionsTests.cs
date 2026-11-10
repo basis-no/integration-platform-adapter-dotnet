@@ -146,6 +146,28 @@ public sealed class PlatformMessageStoreOptionsTests
 
         Assert.AreEqual(Partitioner.Murmur2Random, config.Partitioner);
         Assert.AreEqual("murmur2_random", config.Get("partitioner"));
+        // The registration builds its producer through BuildProducer, the one
+        // place a producer is constructed.
+        var registration = File.ReadAllText(Path.Combine(RepositoryRoot(), "src", "Basis.IntegrationPlatform.MessageStore", "PlatformMessageStoreExtensions.cs"));
+        StringAssert.Contains(registration, "options.BuildProducer()");
+        Assert.IsFalse(
+            Directory.GetFiles(Path.Combine(RepositoryRoot(), "src"), "*.cs", SearchOption.AllDirectories)
+                .Any(file => !file.EndsWith("PlatformMessageStoreOptions.cs", StringComparison.Ordinal)
+                    && File.ReadAllText(file).Contains("new ProducerBuilder", StringComparison.Ordinal)),
+            "Only PlatformMessageStoreOptions.BuildProducer constructs a producer.");
+    }
+
+    private static string RepositoryRoot()
+    {
+        for (var directory = new DirectoryInfo(AppContext.BaseDirectory); directory is not null; directory = directory.Parent)
+        {
+            if (Directory.Exists(Path.Combine(directory.FullName, "src", "Basis.IntegrationPlatform.MessageStore")))
+            {
+                return directory.FullName;
+            }
+        }
+
+        throw new InvalidOperationException("Repository root not found above the test output directory.");
     }
 
     [TestMethod]

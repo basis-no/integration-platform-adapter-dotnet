@@ -56,7 +56,7 @@ public static class PlatformMessageStoreExtensions
         {
             var options = provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<PlatformMessageStoreOptions>>().Value;
             return new PlatformTrafficProducer(
-                new ProducerBuilder<string, byte[]>(options.CreateProducerConfig()).Build(),
+                options.BuildProducer(),
                 provider.GetRequiredService<PlatformTrafficMetrics>());
         });
         services.AddSingleton<IPlatformMessageHandler, THandler>();

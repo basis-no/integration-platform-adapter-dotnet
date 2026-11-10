@@ -144,6 +144,9 @@ public sealed class PlatformMessageStoreOptions
         };
     }
 
+    /// <summary>The Kafka producer the adapter registers, built from <see cref="CreateProducerConfig"/>.</summary>
+    internal IProducer<string, byte[]> BuildProducer() => new ProducerBuilder<string, byte[]>(CreateProducerConfig()).Build();
+
     private static T EnumFromEnvironment<T>(string name, T fallback) where T : struct, Enum
     {
         var raw = Environment.GetEnvironmentVariable(name);
