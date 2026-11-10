@@ -70,7 +70,16 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
         // starts, after this service.
         if (lifetime is not null && replayEndpoints is not null)
         {
-            await WhenStartedAsync(lifetime, stoppingToken);
+            logger.LogInformation("Waiting for the host to start before checking the Message Store tables.");
+            try
+            {
+                await WhenStartedAsync(lifetime, stoppingToken);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                // The host stopped before it started, for another reason.
+                return;
+            }
         }
 
         await store.VerifyStoreColumnsAsync(replayEndpoints?.Mapped == true, stoppingToken);

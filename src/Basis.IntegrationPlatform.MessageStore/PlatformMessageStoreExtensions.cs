@@ -151,8 +151,9 @@ public sealed record ReplayErrorBody(string Code, string Error, string? ReplayId
 
 /// <summary>
 /// Whether the application mapped the resend endpoint. The consumer reads it
-/// when it starts, to decide whether the store must have the replay audit
-/// table; an application maps its endpoints before it runs the host.
+/// once the host has started, so endpoints a Startup class maps while the web
+/// host starts count too, to decide whether the store must have the replay
+/// audit table.
 /// </summary>
 internal sealed class PlatformReplayEndpoints
 {

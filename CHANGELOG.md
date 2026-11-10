@@ -11,8 +11,10 @@
   then failed to record and was consumed again without end, or, with a column
   missing from `bip_step_outcome`, its step ran once per handler attempt
   before the message was parked. A store provisioned for an earlier adapter
-  version must be brought up to date before upgrading; while the new version
-  refuses to start, a rolling update keeps the previous one running.
+  version must be brought up to date before upgrading: the new version stops
+  its host instead of consuming. The check runs once the host has started, so
+  the consumer starts consuming after the application's other hosted services
+  have started.
 
 - Export Kafka activity through `System.Diagnostics.Metrics` (meter
   `Basis.IntegrationPlatform.MessageStore`), with the same metric names and
