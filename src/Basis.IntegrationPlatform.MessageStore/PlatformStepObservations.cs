@@ -70,9 +70,10 @@ public sealed class PlatformStepObservationCollector
         storeFailures.TryRemove(messageId, out _);
     }
 
-    internal void NoteStoreFailure(string messageId)
+    /// <param name="outage">Whether the failure says the store is unavailable, rather than refusing this call's data or being cancelled by the handler's own token.</param>
+    internal void NoteStoreFailure(string messageId, bool outage)
     {
-        storeFailures[messageId] = true;
+        storeFailures.AddOrUpdate(messageId, outage, (_, earlier) => earlier || outage);
     }
 
     /// <summary>
@@ -80,6 +81,10 @@ public sealed class PlatformStepObservationCollector
     /// invocation, whatever the handler did with the exception.
     /// </summary>
     internal bool StoreFailedInCurrentInvocation(string messageId) => storeFailures.ContainsKey(messageId);
+
+    /// <summary>Whether a step ledger call in the current handler invocation failed because the store is unavailable.</summary>
+    internal bool StoreUnavailableInCurrentInvocation(string messageId) =>
+        storeFailures.TryGetValue(messageId, out var outage) && outage;
 
     /// <summary>
     /// How the current handler invocation already used this idempotency key,

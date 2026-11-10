@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+- Every Message Store call now has a timeout well under the consumer's poll
+  interval: 5 s to connect or wait for a pooled connection, 20 s per command,
+  a 10 s keepalive, and `statement_timeout=15s` and `lock_timeout=5s` on the
+  server. Before, Npgsql's defaults (15 s, 30 s, no keepalive) and no server
+  limits let a hung store or a held lock stall the consumer for minutes, past
+  the poll interval. They apply to the adapter's keyed datasource only; the
+  default `NpgsqlDataSource` registered for compatibility is now a pool of
+  its own with the plain connection string. A value set in the connection
+  string wins, `PGOPTIONS` is kept, and
+  `BASIS_MESSAGE_STORE_POSTGRES_SERVER_TIMEOUTS=off` (or an explicit
+  `Options`) leaves out the server-side ones, for a pooler such as PgBouncer
+  that refuses them with `08P01`.
+
+- A step ledger failure that says the store is unavailable (a timeout, a lock
+  timeout, a lost connection, SQLSTATE classes 08, 53, 57 and 58) now ends the
+  handler invocation at once: the adapter no longer retries the handler,
+  which would send its steps again, and no longer parks the message while
+  the store fails. A ledger call refused for its data, or cancelled by the
+  handler's own token, is still retried and parked.
+
+- A write whose commit the store reports done only with a warning, as when a
+  synchronous replication wait is cancelled, is treated as failed: no offset
+  commit, step skip or replay produce follows it, and the outcome write is
+  retried in place (three attempts). Before, Npgsql returned normally and the
+  adapter committed the offset for an outcome that existed on the primary
+  only.
+
 - The registered `IProducer<string, byte[]>` partitions keyed records with
   `murmur2_random`, as Java Kafka clients do, instead of the .NET client's
   default `consistent_random` (CRC32). A replay or DLQ record now lands on the

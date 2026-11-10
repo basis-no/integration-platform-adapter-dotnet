@@ -178,20 +178,24 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
             handled.HandlerAttempts > 1 ? handled.HandlerAttempts - 1 : null,
             options.MaxHandlerAttempts > 1 ? options.MaxHandlerAttempts - 1 : null);
 
+        // A step ledger call failed in the handler's last invocation. If the
+        // handler returned success anyway, a step may not have run or its
+        // delivery isn't recorded. If it failed because the store is
+        // unavailable, the store failed, not the message. Either way, process
+        // the delivery again instead of recording an outcome, and park
+        // nothing. A failed handler whose ledger call was refused for its data
+        // or cancelled by its own token is retried and parked as before.
+        if ((handled.Result.Succeeded && stepObservations.StoreFailedInCurrentInvocation(message.MessageId))
+            || (!handled.Result.Succeeded && stepObservations.StoreUnavailableInCurrentInvocation(message.MessageId)))
+        {
+            // On shutdown, stop as a shutdown rather than as a store failure.
+            cancellationToken.ThrowIfCancellationRequested();
+            throw new InvalidOperationException(
+                "A step ledger call failed in the handler's last invocation; the delivery is processed again without parking it.");
+        }
+
         if (handled.Result.Succeeded)
         {
-            if (stepObservations.StoreFailedInCurrentInvocation(message.MessageId))
-            {
-                // On shutdown, stop as a shutdown rather than as a store failure.
-                cancellationToken.ThrowIfCancellationRequested();
-                // A step ledger call failed and the handler returned success
-                // anyway: a step may not have run, or its delivery isn't
-                // recorded. Process the delivery again instead of recording
-                // COMPLETED, and park nothing.
-                throw new InvalidOperationException(
-                    "A step ledger call failed in the handler's last invocation, which returned success; the delivery is processed again.");
-            }
-
             await store.RecordAttemptAsync(message, metadata, "COMPLETED", null, cancellationToken);
             commitOffset();
             return;
@@ -224,7 +228,9 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
                 result = PlatformMessageResult.Failed(ex.Message);
             }
 
-            if (result.Succeeded || attempt == maxAttempts)
+            // A store failure ends the attempt at once: retrying the handler
+            // would send its steps again while the store is unavailable.
+            if (result.Succeeded || attempt == maxAttempts || stepObservations.StoreUnavailableInCurrentInvocation(message.MessageId))
             {
                 return new HandledMessage(result, attempt);
             }

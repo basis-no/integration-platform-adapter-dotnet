@@ -2161,6 +2161,57 @@ public sealed class PlatformMessageStorePostgresTests
     }
 
     [TestMethod]
+    public async Task StoreSessionsGetTheServerTimeouts()
+    {
+        await using var dataSource = NpgsqlDataSource.Create(PlatformStoreTimeouts.Apply(RequireConnectionString()));
+        await using var connection = await dataSource.OpenConnectionAsync();
+        await using var command = new NpgsqlCommand("select current_setting('statement_timeout'), current_setting('lock_timeout')", connection);
+        await using var reader = await command.ExecuteReaderAsync();
+        Assert.IsTrue(await reader.ReadAsync());
+        Assert.AreEqual("15s", reader.GetString(0));
+        Assert.AreEqual("5s", reader.GetString(1));
+    }
+
+    [TestMethod]
+    public async Task AHeldLockFailsTheRecordWithinTheLockTimeoutAndCommitsNothing()
+    {
+        var options = CreateOptions(RequireConnectionString());
+        await using var dataSource = NpgsqlDataSource.Create(PlatformStoreTimeouts.Apply(options.PostgresConnectionString));
+        var observations = new PlatformStepObservationCollector();
+        // One write, so the test measures one lock wait.
+        var store = new PlatformMessageStore(dataSource, observations, Options.Create(options), NullLogger<PlatformMessageStore>.Instance)
+        {
+            OutcomeWriteAttempts = 1,
+        };
+        var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+        var message = CreateMessage(messageId, options);
+        await store.RecordAttemptAsync(message, "dotnet-handler", "RECEIVED", null, CancellationToken.None);
+
+        // Another session holds the summary row, as a stuck transaction would.
+        await using var holderSource = NpgsqlDataSource.Create(RequireConnectionString());
+        await using var holder = await holderSource.OpenConnectionAsync();
+        await using var transaction = await holder.BeginTransactionAsync();
+        await using (var lockRow = new NpgsqlCommand("select 1 from bip_message_log where message_id = @id for update", holder, transaction))
+        {
+            lockRow.Parameters.AddWithValue("id", messageId);
+            await lockRow.ExecuteScalarAsync();
+        }
+
+        var handler = new DelegateHandler((_, _) => Task.FromResult(PlatformMessageResult.Completed()));
+        using var service = CreateConsumerService(handler, store, observations, new FakeProducer(), options);
+        var committed = false;
+        var started = System.Diagnostics.Stopwatch.StartNew();
+
+        var error = await Assert.ThrowsExactlyAsync<PostgresException>(
+            () => service.ProcessAsync(message, () => committed = true, CancellationToken.None));
+
+        Assert.AreEqual(PostgresErrorCodes.LockNotAvailable, error.SqlState);
+        Assert.IsTrue(started.Elapsed < TimeSpan.FromSeconds(15), started.Elapsed.ToString());
+        Assert.IsFalse(committed, "A record that timed out commits nothing.");
+        await transaction.RollbackAsync();
+    }
+
+    [TestMethod]
     public async Task DeliveredWriteThatFailsOnceIsRetriedInPlace()
     {
         await WithFailingLedgerAsync(failures: 1, async (dataSource, options) =>
@@ -2251,13 +2302,14 @@ public sealed class PlatformMessageStorePostgresTests
     }
 
     [TestMethod]
-    public async Task HandlerRetryWithoutALedgerFailureCompletes()
+    public async Task ALedgerFailureEndsTheAttemptWithoutRetriesOrParkingAndTheRedeliveryCompletes()
     {
-        // The first invocation's DELIVERED write fails on every attempt; the
-        // handler reports a failure and is retried, and the retry records it.
+        // The first delivery's DELIVERED write fails on every attempt and the
+        // handler reports a failure: no in-process retry sends again, nothing
+        // is parked or committed. The redelivery records it.
         await WithFailingLedgerAsync(failures: 3, async (dataSource, options) =>
         {
-            options.MaxHandlerAttempts = 2;
+            options.MaxHandlerAttempts = 3;
             options.HandlerRetryDelayMs = 0;
             var observations = new PlatformStepObservationCollector();
             var store = new PlatformMessageStore(dataSource, observations, Options.Create(options), NullLogger<PlatformMessageStore>.Instance);
@@ -2275,16 +2327,24 @@ public sealed class PlatformMessageStorePostgresTests
                     return PlatformMessageResult.Failed(ex.MessageText);
                 }
             });
-            using var service = CreateConsumerService(handler, store, observations, new FakeProducer(), options);
-            var messageId = $"dotnet-test-{Guid.NewGuid():N}";
-            var committed = false;
+            var producer = new FakeProducer();
+            using var service = CreateConsumerService(handler, store, observations, producer, options);
+            var message = CreateMessage($"dotnet-test-{Guid.NewGuid():N}", options);
+            var commits = 0;
 
-            await service.ProcessAsync(CreateMessage(messageId, options), () => committed = true, CancellationToken.None);
+            await Assert.ThrowsExactlyAsync<InvalidOperationException>(
+                () => service.ProcessAsync(message, () => commits++, CancellationToken.None));
+            Assert.AreEqual(1, handler.Calls.Count, "A store failure ends the attempt without in-process retries.");
+            Assert.AreEqual(0, commits);
+            Assert.AreEqual(0, producer.Produced.Count, "Nothing is parked while the store fails.");
+            Assert.IsNull(await LogStatusAsync(dataSource, message.MessageId));
 
-            Assert.IsTrue(committed);
-            Assert.AreEqual(2, sends, "No DELIVERED row after the first invocation, so the retry sends again.");
-            Assert.AreEqual("COMPLETED", await LogStatusAsync(dataSource, messageId));
-            Assert.AreEqual("DELIVERED", await StepStatusAsync(dataSource, $"{messageId}:deliver"));
+            await service.ProcessAsync(message, () => commits++, CancellationToken.None);
+
+            Assert.AreEqual(1, commits);
+            Assert.AreEqual(2, sends, "No DELIVERED row after the first delivery, so the redelivery sends again.");
+            Assert.AreEqual("COMPLETED", await LogStatusAsync(dataSource, message.MessageId));
+            Assert.AreEqual("DELIVERED", await StepStatusAsync(dataSource, $"{message.MessageId}:deliver"));
         });
     }
 
@@ -2406,7 +2466,7 @@ public sealed class PlatformMessageStorePostgresTests
 
     // Runs the test against a store in its own schema whose first `failures`
     // writes to bip_step_outcome fail, as during a short store outage.
-    private static async Task WithFailingLedgerAsync(int failures, Func<NpgsqlDataSource, PlatformMessageStoreOptions, Task> test)
+    private static async Task WithFailingLedgerAsync(int failures, Func<NpgsqlDataSource, PlatformMessageStoreOptions, Task> test, string sqlState = "57P03")
     {
         var connectionString = RequireConnectionString();
         var schemaName = $"bip_ledger_{Guid.NewGuid():N}";
@@ -2423,7 +2483,7 @@ public sealed class PlatformMessageStorePostgresTests
                 create function {schemaName}.fail_ledger_writes() returns trigger language plpgsql as $$
                 begin
                     if nextval('{schemaName}.ledger_writes') <= {failures} then
-                        raise exception 'synthetic store failure';
+                        raise exception 'synthetic store failure' using errcode = '{sqlState}';
                     end if;
                     return new;
                 end $$;
@@ -2445,6 +2505,191 @@ public sealed class PlatformMessageStorePostgresTests
             await using var connection = await admin.OpenConnectionAsync();
             await using var drop = new NpgsqlCommand($"drop schema {schemaName} cascade", connection);
             await drop.ExecuteNonQueryAsync();
+        }
+    }
+
+    [TestMethod]
+    public async Task ACommitWhoseSynchronousReplicationWaitWasCancelledIsAFailedWrite()
+    {
+        // A synchronous standby that never answers: every commit waits for it,
+        // the client's command timeout cancels the wait, and PostgreSQL then
+        // reports the commit done with only a warning, although it is on the
+        // primary alone. statement_timeout does not end that wait.
+        await WithUnansweredSynchronousStandbyAsync(async () =>
+        {
+            var options = CreateOptions(RequireConnectionString());
+            await using var dataSource = NpgsqlDataSource.Create(
+                new NpgsqlConnectionStringBuilder(PlatformStoreTimeouts.Apply(options.PostgresConnectionString)) { CommandTimeout = 1 }.ConnectionString);
+            var observations = new PlatformStepObservationCollector();
+            var store = new PlatformMessageStore(dataSource, observations, Options.Create(options), NullLogger<PlatformMessageStore>.Instance)
+            {
+                OutcomeWriteRetryDelay = TimeSpan.Zero,
+            };
+            var steps = new PlatformStepExecutor(dataSource, observations, NullLogger<PlatformStepExecutor>.Instance)
+            {
+                DeliveredWriteRetryDelay = TimeSpan.Zero,
+            };
+            var handler = new DelegateHandler((_, _) => Task.FromResult(PlatformMessageResult.Completed()));
+            using var service = CreateConsumerService(handler, store, observations, new FakeProducer(), options);
+            var message = CreateMessage($"dotnet-test-{Guid.NewGuid():N}", options);
+            var committed = false;
+
+            await Assert.ThrowsExactlyAsync<PlatformCommitUnconfirmedException>(
+                () => service.ProcessAsync(message, () => committed = true, CancellationToken.None));
+            Assert.IsFalse(committed, "No offset is committed for an outcome that is on the primary only.");
+            Assert.AreEqual(1, handler.Calls.Count, "The outcome write is retried in place; the handler is not run again.");
+
+            var stepMessage = CreateMessage($"dotnet-test-{Guid.NewGuid():N}", options);
+            await Assert.ThrowsExactlyAsync<PlatformCommitUnconfirmedException>(() => steps.ExecuteAsync(
+                stepMessage, "deliver", "https://target.example/orders", "target", _ => Task.CompletedTask, CancellationToken.None));
+            Assert.IsTrue(observations.StoreFailedInCurrentInvocation(stepMessage.MessageId), "An unconfirmed DELIVERED write is a store failure.");
+        });
+    }
+
+    [TestMethod]
+    [DataRow("delivered-write-data")]
+    [DataRow("failed-write-data")]
+    [DataRow("handler-own-timeout")]
+    public async Task ALedgerFailureThatIsNotAnOutageIsRetriedAndParkedAsBefore(string cause)
+    {
+        // The store is healthy: the ledger refuses this call's data, or the
+        // handler's own timeout cancels it. Retrying the delivery would fail
+        // the same way, so the message is parked rather than looping.
+        // 22021 (invalid byte sequence): the ledger refuses the row's data.
+        await WithFailingLedgerAsync(failures: cause == "handler-own-timeout" ? 0 : 100, async (dataSource, options) =>
+        {
+            options.MaxHandlerAttempts = 2;
+            options.HandlerRetryDelayMs = 0;
+            var observations = new PlatformStepObservationCollector();
+            var store = new PlatformMessageStore(dataSource, observations, Options.Create(options), NullLogger<PlatformMessageStore>.Instance);
+            var steps = LedgerTestExecutor(dataSource, observations);
+            var sends = 0;
+            var handler = new DelegateHandler(async (message, ct) =>
+            {
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                await steps.ExecuteAsync(message, "deliver", "https://target.example/orders", "target", async stepToken =>
+                    {
+                        sends++;
+                        if (cause == "failed-write-data")
+                        {
+                            throw new HttpRequestException("synthetic receiver failure");
+                        }
+
+                        if (cause == "handler-own-timeout")
+                        {
+                            timeout.Cancel();
+                        }
+
+                        await Task.CompletedTask;
+                    }, cause == "handler-own-timeout" ? timeout.Token : ct);
+                return PlatformMessageResult.Completed();
+            });
+            var producer = new FakeProducer();
+            using var service = CreateConsumerService(handler, store, observations, producer, options);
+            var message = CreateMessage($"dotnet-test-{Guid.NewGuid():N}", options);
+            var commits = 0;
+
+            await service.ProcessAsync(message, () => commits++, CancellationToken.None);
+
+            Assert.AreEqual(2, handler.Calls.Count, "Retried in process as before.");
+            Assert.AreEqual(1, producer.Produced.Count, "Parked as before.");
+            Assert.AreEqual(1, commits);
+            Assert.AreEqual("DLQ", await LogStatusAsync(dataSource, message.MessageId));
+        }, sqlState: "22021");
+    }
+
+    [TestMethod]
+    public async Task ALedgerReadThatTimesOutOnALockEndsTheAttemptWithoutParking()
+    {
+        await WithFailingLedgerAsync(failures: 0, async (dataSource, options) =>
+        {
+            await using var timedSource = NpgsqlDataSource.Create(
+                new NpgsqlConnectionStringBuilder(options.PostgresConnectionString) { Options = "-c lock_timeout=300" }.ConnectionString);
+            var observations = new PlatformStepObservationCollector();
+            var store = new PlatformMessageStore(dataSource, observations, Options.Create(options), NullLogger<PlatformMessageStore>.Instance);
+            var steps = LedgerTestExecutor(timedSource, observations);
+            var handler = new DelegateHandler(async (message, ct) =>
+            {
+                await steps.ExecuteAsync(message, "deliver", "https://target.example/orders", "target", _ => Task.CompletedTask, ct);
+                return PlatformMessageResult.Completed();
+            });
+            var producer = new FakeProducer();
+            using var service = CreateConsumerService(handler, store, observations, producer, options);
+            await using var holder = await dataSource.OpenConnectionAsync();
+            await using var holding = await holder.BeginTransactionAsync();
+            await using (var hold = new NpgsqlCommand("lock table bip_step_outcome in access exclusive mode", holder, holding))
+            {
+                await hold.ExecuteNonQueryAsync();
+            }
+
+            var committed = false;
+            await Assert.ThrowsExactlyAsync<InvalidOperationException>(
+                () => service.ProcessAsync(CreateMessage($"dotnet-test-{Guid.NewGuid():N}", options), () => committed = true, CancellationToken.None));
+
+            Assert.AreEqual(1, handler.Calls.Count, "A lock timeout is an outage: no in-process retry.");
+            Assert.AreEqual(0, producer.Produced.Count);
+            Assert.IsFalse(committed);
+            await holding.RollbackAsync();
+        });
+    }
+
+    [TestMethod]
+    [DataRow("57P03", true)]
+    [DataRow("08006", true)]
+    [DataRow("53300", true)]
+    [DataRow("55P03", true)]
+    [DataRow("57014", true)]
+    [DataRow("22021", false)]
+    [DataRow("23505", false)]
+    [DataRow("42P01", false)]
+    public void StoreFailuresAreOutagesByTheirClass(string sqlState, bool outage)
+    {
+        Assert.AreEqual(outage, PlatformStoreFailures.IsOutage(new PostgresException("synthetic", "ERROR", "ERROR", sqlState)));
+    }
+
+    // Makes the test server wait for a synchronous standby that does not
+    // exist, for the duration of the test. Needs a superuser; other sessions
+    // of the test opt out with synchronous_commit=local.
+    private static async Task WithUnansweredSynchronousStandbyAsync(Func<Task> test)
+    {
+        var local = new NpgsqlConnectionStringBuilder(RequireConnectionString()) { Options = "-c synchronous_commit=local" }.ConnectionString;
+        await using var admin = NpgsqlDataSource.Create(local);
+        async Task SetStandbyAsync(string sql)
+        {
+            await using var connection = await admin.OpenConnectionAsync();
+            await using var command = new NpgsqlCommand($"{sql}; select pg_reload_conf()", connection);
+            await command.ExecuteNonQueryAsync();
+        }
+
+        try
+        {
+            await SetStandbyAsync("alter system set synchronous_standby_names = 'unanswered_synthetic_standby'");
+        }
+        catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.InsufficientPrivilege)
+        {
+            Assert.Inconclusive("Needs a superuser to configure synchronous replication.");
+        }
+
+        try
+        {
+            // pg_reload_conf only signals; wait until new sessions see it.
+            for (var i = 0; i < 50; i++)
+            {
+                await using var connection = await admin.OpenConnectionAsync();
+                await using var show = new NpgsqlCommand("show synchronous_standby_names", connection);
+                if ((string?)await show.ExecuteScalarAsync() == "unanswered_synthetic_standby")
+                {
+                    break;
+                }
+
+                await Task.Delay(100);
+            }
+
+            await test();
+        }
+        finally
+        {
+            await SetStandbyAsync("alter system reset synchronous_standby_names");
         }
     }
 

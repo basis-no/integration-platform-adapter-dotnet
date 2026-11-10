@@ -33,14 +33,21 @@ public static class PlatformMessageStoreExtensions
         {
             var options = provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<PlatformMessageStoreOptions>>().Value;
             options.Validate();
-            return NpgsqlDataSource.Create(options.PostgresConnectionString);
+            return NpgsqlDataSource.Create(PlatformStoreTimeouts.Apply(options.PostgresConnectionString, options.UsesPostgresServerTimeouts));
         });
         services.AddSingleton<PlatformStepObservationCollector>();
         services.AddSingleton<PlatformReplayEndpoints>();
         // Preserve the original default datasource registration for compatibility.
         // Adapter internals always select their own key, even if the application
         // registers a different default datasource for business data afterwards.
-        services.AddSingleton(provider => provider.GetRequiredKeyedService<NpgsqlDataSource>(MessageStoreDataSourceKey));
+        // It is a pool of its own without the adapter's timeouts, so the
+        // application's own queries keep the limits they had.
+        services.AddSingleton(provider =>
+        {
+            var options = provider.GetRequiredService<IOptions<PlatformMessageStoreOptions>>().Value;
+            options.Validate();
+            return NpgsqlDataSource.Create(options.PostgresConnectionString);
+        });
         services.AddSingleton(provider => new PlatformMessageStore(
             provider.GetRequiredKeyedService<NpgsqlDataSource>(MessageStoreDataSourceKey),
             provider.GetRequiredService<PlatformStepObservationCollector>(),
