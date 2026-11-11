@@ -104,13 +104,16 @@ internal sealed class PlatformDelivery
     }
 
     /// <summary>
-    /// Whether a step's ledger check was not made because the handler's own
-    /// cancellation token was already cancelled: no store failure, but that
-    /// step did not run.
+    /// Whether, in the current handler invocation, a step's ledger check was
+    /// not made because the handler's own cancellation token was already
+    /// cancelled: no store failure, but that step did not run.
     /// </summary>
     internal bool CallerCancelled => callerCancelled;
 
     internal void NoteCallerCancellation() => callerCancelled = true;
+
+    /// <summary>A handler retry runs every step again, so what a cancelled token stopped before no longer counts.</summary>
+    internal void BeginHandlerInvocation() => callerCancelled = false;
 
     internal void NoteUnrecordedSend(string stepId)
     {

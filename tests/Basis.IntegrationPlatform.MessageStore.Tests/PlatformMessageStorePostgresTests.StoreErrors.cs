@@ -204,6 +204,7 @@ public sealed partial class PlatformMessageStorePostgresTests
     [DataRow("failed-write")]
     [DataRow("ledger-check")]
     [DataRow("ledger-check-swallowed")]
+    [DataRow("ledger-check-then-retry")]
     public async Task AStepWhoseLedgerCallTheHandlersCancelledTokenStopsIsAHandlerFailure(string path)
     {
         // The store is healthy; the handler's own timeout has already fired
@@ -217,9 +218,23 @@ public sealed partial class PlatformMessageStorePostgresTests
             var store = new PlatformMessageStore(dataSource, observations, Options.Create(options), NullLogger<PlatformMessageStore>.Instance);
             var steps = LedgerTestExecutor(dataSource, observations);
             var sends = 0;
+            var invocations = 0;
             var handler = new DelegateHandler(async (message, ct) =>
             {
                 using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                if (path == "ledger-check-then-retry")
+                {
+                    // Only the first invocation's timeout has fired; the retry
+                    // sends and completes.
+                    if (++invocations == 1)
+                    {
+                        timeout.Cancel();
+                    }
+
+                    await steps.ExecuteAsync(message, "deliver", DeliverUri, "target", _ => { sends++; return Task.CompletedTask; }, timeout.Token);
+                    return PlatformMessageResult.Completed();
+                }
+
                 if (path != "failed-write")
                 {
                     timeout.Cancel();
@@ -251,8 +266,9 @@ public sealed partial class PlatformMessageStorePostgresTests
             {
                 // The step did not run and the handler returned success: not
                 // recorded COMPLETED.
-                await Assert.ThrowsExactlyAsync<PlatformRecordHeldBackException>(
+                var heldBack = await Assert.ThrowsExactlyAsync<PlatformRecordHeldBackException>(
                     () => service.ProcessAsync(message, () => commits++, CancellationToken.None));
+                Assert.IsNull(heldBack.ErrorClass, "No store failure, so the line names no store error.");
                 Assert.AreEqual(0, commits);
                 Assert.IsNull(await LogStatusAsync(dataSource, message.MessageId));
                 return;
@@ -261,6 +277,15 @@ public sealed partial class PlatformMessageStorePostgresTests
             await service.ProcessAsync(message, () => commits++, CancellationToken.None);
 
             Assert.AreEqual(2, handler.Calls.Count, "Retried in process.");
+            if (path == "ledger-check-then-retry")
+            {
+                Assert.AreEqual(1, sends);
+                Assert.AreEqual(1, commits);
+                Assert.AreEqual(0, producer.Produced.Count);
+                Assert.AreEqual("COMPLETED", await LogStatusAsync(dataSource, message.MessageId));
+                return;
+            }
+
             Assert.AreEqual(path == "failed-write" ? 2 : 0, sends);
             Assert.AreEqual(1, producer.Produced.Count, "Parked.");
             Assert.AreEqual(1, commits);

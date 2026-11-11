@@ -468,6 +468,17 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
             return;
         }
 
+        if (heldBack.ErrorClass is null)
+        {
+            // No store failure: the line names none.
+            logger.LogError(
+                heldBack.InnerException,
+                "Message {MessageId} is not committed: {Reason}",
+                record.Message.MessageId,
+                heldBack.Reason);
+            return;
+        }
+
         // The line ends with the store error class, and the SQLSTATE when
         // known, so an alert can tell a read-only store or a lost grant from
         // an outage.
@@ -477,7 +488,7 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
             record.Message.MessageId,
             heldBack.Position is { } position ? $" at {position}" : string.Empty,
             heldBack.Reason,
-            heldBack.ErrorClass.Label(),
+            heldBack.ErrorClass.Value.Label(),
             heldBack.SqlState is { } sqlState ? $" sqlState={sqlState}" : string.Empty);
     }
 
@@ -494,6 +505,7 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
                 // in-process retry: retry diagnostics are recorded in the
                 // auto_redelivery_* columns, never invented as wire headers.
                 stepObservations.BeginHandlerInvocation(message.MessageId);
+                delivery.BeginHandlerInvocation();
                 result = await handler.HandleAsync(message, cancellationToken);
             }
             catch (Exception ex) when (!IsShutdown(ex, cancellationToken))
@@ -799,7 +811,7 @@ internal sealed class PlatformRecordHeldBackException : Exception
     {
         Reason = reason;
         Position = position;
-        ErrorClass = errorClass ?? PlatformStoreFailures.Classify(storeFailure);
+        ErrorClass = errorClass ?? (storeFailure is null ? null : PlatformStoreFailures.Classify(storeFailure));
         SqlState = errorClass is null ? PlatformStoreFailures.SqlState(storeFailure) : null;
     }
 
@@ -807,7 +819,8 @@ internal sealed class PlatformRecordHeldBackException : Exception
 
     internal PlatformRecordPosition? Position { get; }
 
-    internal PlatformStoreErrorClass ErrorClass { get; }
+    /// <summary>The store error class, or null when no store call failed.</summary>
+    internal PlatformStoreErrorClass? ErrorClass { get; }
 
     internal string? SqlState { get; }
 }
