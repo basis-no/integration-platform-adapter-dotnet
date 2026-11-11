@@ -30,6 +30,9 @@ public sealed class PlatformStepObservationCollector
     // In-process retries re-run the handler within one processing attempt, so
     // a step seen again in a later invocation is a retry, not a reused id.
     private readonly ConcurrentDictionary<string, int> invocationStarts = new(StringComparer.Ordinal);
+    // The processing of each consumed message, for a step whose async flow
+    // does not carry it, such as one a handler hands to a worker of its own.
+    private readonly ConcurrentDictionary<string, PlatformDelivery> deliveries = new(StringComparer.Ordinal);
 
     public void Record(string messageId, PlatformStepObservation observation)
     {
@@ -60,6 +63,15 @@ public sealed class PlatformStepObservationCollector
         observations.TryRemove(messageId, out _);
         invocationStarts.TryRemove(messageId, out _);
     }
+
+    internal void BeginDelivery(string messageId, PlatformDelivery delivery) => deliveries[messageId] = delivery;
+
+    internal void EndDelivery(string messageId, PlatformDelivery delivery) =>
+        deliveries.TryRemove(new KeyValuePair<string, PlatformDelivery>(messageId, delivery));
+
+    /// <summary>The processing of the consumed message with this id, while it runs.</summary>
+    internal PlatformDelivery? Delivery(string messageId) =>
+        deliveries.TryGetValue(messageId, out var delivery) ? delivery : null;
 
     internal void BeginHandlerInvocation(string messageId)
     {

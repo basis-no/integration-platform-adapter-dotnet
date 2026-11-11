@@ -51,7 +51,8 @@
   Before the handler runs, `x-bip-message-id`, `x-bip-correlation-id`,
   `x-bip-content-type`, `x-bip-source-system` and `x-bip-target-system` are
   refused when they contain a NUL byte or are longer than 1,024 bytes, and so
-  is the record key when it becomes the correlation id. A step outcome or
+  are the record key and `content-type` when they become the correlation id
+  and the content type. A step outcome or
   outcome write that fails for the record's own data (SQLSTATE class `22`,
   `54000`) takes the same path. A refused `x-bip-message-id` is replaced by an
   id derived from the record's position, the same in the Camel adapter. After

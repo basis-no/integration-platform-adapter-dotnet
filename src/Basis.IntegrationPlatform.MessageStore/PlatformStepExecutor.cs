@@ -165,7 +165,9 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
         ArgumentException.ThrowIfNullOrWhiteSpace(endpointUri);
         ArgumentNullException.ThrowIfNull(operation);
 
-        var delivery = PlatformDelivery.Current;
+        // The consumed record's processing, also when the handler runs the step
+        // on a flow that does not carry it, found then by the message id.
+        var delivery = PlatformDelivery.Current ?? observations.Delivery(message.MessageId);
         if (delivery?.StoreFailure is { } earlier)
         {
             // A store failure ends the attempt: nothing this processing does

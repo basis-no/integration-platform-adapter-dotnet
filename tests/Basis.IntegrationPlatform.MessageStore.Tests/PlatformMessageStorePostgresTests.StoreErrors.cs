@@ -148,19 +148,88 @@ public sealed partial class PlatformMessageStorePostgresTests
     }
 
     [TestMethod]
+    public async Task AStepOnAFlowThatDoesNotCarryTheProcessingIsStillHeldBackAndMarked()
+    {
+        // The handler runs its step on a worker of its own, without the
+        // consumer's execution context; the processing is found by the
+        // message id.
+        await WithIsolatedStoreAsync(async store =>
+        {
+            var options = store.Options();
+            options.HandlerRetryDelayMs = 0;
+            var (service, steps, _, producer) = store.Consumer(options, new LogRecorder());
+            var sends = 0;
+            var handler = new DelegateHandler(async (message, ct) =>
+            {
+                Task step;
+                using (ExecutionContext.SuppressFlow())
+                {
+                    step = Task.Run(() => steps.ExecuteAsync(message, "deliver", DeliverUri, "target", _ => { sends++; return Task.CompletedTask; }, ct));
+                }
+
+                try
+                {
+                    await step;
+                }
+                catch (PostgresException)
+                {
+                    // An optional step, as the handler sees it.
+                }
+
+                return PlatformMessageResult.Completed();
+            });
+            using var consumerService = service(handler);
+            await store.FailWritesAsync("bip_step_outcome", "57P03");
+            var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+            using var stopping = new CancellationTokenSource();
+            var consumer = new ReadAgainConsumer(stopping, [RecordAt(0, options, messageId)], maxReads: 3, beforeRead: read =>
+            {
+                if (read == 2)
+                {
+                    store.RepairWrites();
+                }
+            });
+
+            await consumerService.ConsumeAsync(consumer, stopping.Token).WaitAsync(TimeSpan.FromSeconds(60));
+
+            Assert.AreEqual(1, sends);
+            Assert.AreEqual(2, consumer.Reads, "Not committed on the first read.");
+            CollectionAssert.AreEqual(new long[] { 0 }, consumer.Commits);
+            Assert.AreEqual(0, producer.Produced.Count);
+            Assert.AreEqual("DELIVERED", await StepStatusAsync(store.Admin, $"{messageId}:deliver"));
+        });
+    }
+
+    [TestMethod]
     public async Task ParallelStepsWhoseWritesFailAreEachSentOnce()
     {
         await WithIsolatedStoreAsync(async store =>
         {
             var options = store.Options();
             options.HandlerRetryDelayMs = 0;
-            var (service, steps, _, _) = store.Consumer(options, new LogRecorder());
+            var logs = new LogRecorder();
+            var (service, steps, _, _) = store.Consumer(options, logs);
             var sends = new int[2];
+            // Both calls return before either write fails, so both are in
+            // flight when the first store failure is noted.
+            var arrived = 0;
+            var bothSent = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            async Task SendAsync(int part)
+            {
+                Interlocked.Increment(ref sends[part]);
+                if (Interlocked.Increment(ref arrived) == 2)
+                {
+                    bothSent.SetResult();
+                }
+
+                await bothSent.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            }
+
             var handler = new DelegateHandler(async (message, ct) =>
             {
                 await Task.WhenAll(
-                    Task.Run(() => steps.ExecuteAsync(message, "part-a", DeliverUri, "target", _ => { Interlocked.Increment(ref sends[0]); return Task.CompletedTask; }, ct)),
-                    Task.Run(() => steps.ExecuteAsync(message, "part-b", DeliverUri, "target", _ => { Interlocked.Increment(ref sends[1]); return Task.CompletedTask; }, ct)));
+                    Task.Run(() => steps.ExecuteAsync(message, "part-a", DeliverUri, "target", _ => SendAsync(0), ct)),
+                    Task.Run(() => steps.ExecuteAsync(message, "part-b", DeliverUri, "target", _ => SendAsync(1), ct)));
                 return PlatformMessageResult.Completed();
             });
             using var consumerService = service(handler);
@@ -180,6 +249,7 @@ public sealed partial class PlatformMessageStorePostgresTests
             CollectionAssert.AreEqual(new[] { 1, 1 }, sends);
             CollectionAssert.AreEqual(new long[] { 0 }, consumer.Commits);
             CollectionAssert.AreEquivalent(new[] { "part-a DELIVERED", "part-b DELIVERED" }, await ObservedStepsAsync(store.Admin, messageId, 1));
+            Assert.AreEqual(2, logs.Warnings.Count(warning => warning.Contains("was sent in an earlier read of record", StringComparison.Ordinal)), "Each part kept its own mark.");
         });
     }
 
@@ -254,19 +324,20 @@ public sealed partial class PlatformMessageStorePostgresTests
                 RecordAt(5, options, $"{id}-5", key: "key\0with-nul"),
                 RecordAt(6, options, new string('m', 2_000)),
                 RecordAt(7, options, $"{id}-7", ("x-bip-correlation-id", new string('c', 1_025))),
-                RecordAt(8, options, $"{id}-8", ("x-bip-correlation-id", new string('c', 1_024))),
-                RecordAt(9, options, $"{id}-9"),
+                RecordAt(8, options, $"{id}-8", ("content-type", "application/json\0")),
+                RecordAt(9, options, $"{id}-9", ("x-bip-correlation-id", new string('c', 1_024))),
+                RecordAt(10, options, $"{id}-10"),
             };
             using var stopping = new CancellationTokenSource();
             var consumer = new ReadAgainConsumer(stopping, records, maxReads: 20);
 
             await consumerService.ConsumeAsync(consumer, stopping.Token).WaitAsync(TimeSpan.FromSeconds(60));
 
-            CollectionAssert.AreEqual(new long[] { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 }, consumer.Commits, "Each record is committed once, and the partition goes on.");
-            CollectionAssert.AreEqual(new[] { $"{id}-8", $"{id}-9" }, handler.Calls, "Only the records the store can hold run their handler.");
+            CollectionAssert.AreEqual(new long[] { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 }, consumer.Commits, "Each record is committed once, and the partition goes on.");
+            CollectionAssert.AreEqual(new[] { $"{id}-9", $"{id}-10" }, handler.Calls, "Only the records the store can hold run their handler.");
             Assert.AreEqual(2, sends);
-            Assert.AreEqual(8, producer.Produced.Count, "One DLQ copy per refused record.");
-            for (var offset = 0; offset < 8; offset++)
+            Assert.AreEqual(9, producer.Produced.Count, "One DLQ copy per refused record.");
+            for (var offset = 0; offset < 9; offset++)
             {
                 var parked = PlatformMessageConsumerService.ReadHeaders(producer.Produced[offset].Message.Headers);
                 var expectedId = offset is 0 or 6 ? PlatformRecordIdentity.Derive(options.ApplicationName, options.InputTopic, 0, offset) : $"{id}-{offset}";
@@ -286,7 +357,8 @@ public sealed partial class PlatformMessageStorePostgresTests
 
             Assert.AreEqual("nul\0correlation", PlatformMessageConsumerService.ReadHeaders(producer.Produced[1].Message.Headers)["x-bip-correlation-id"], "Other refused values stay as they are in the copy.");
             StringAssert.Contains(PlatformMessageConsumerService.ReadHeaders(producer.Produced[6].Message.Headers)["x-bip-error"], "x-bip-message-id is 2000 bytes, over the 1024-byte limit");
-            Assert.AreEqual("COMPLETED", await LogStatusAsync(store.Admin, $"{id}-8"));
+            StringAssert.Contains(PlatformMessageConsumerService.ReadHeaders(producer.Produced[8].Message.Headers)["x-bip-error"], "content-type, which is the content type, contains a NUL byte");
+            Assert.AreEqual("COMPLETED", await LogStatusAsync(store.Admin, $"{id}-9"));
         });
     }
 
@@ -423,14 +495,19 @@ public sealed partial class PlatformMessageStorePostgresTests
     }
 
     [TestMethod]
-    public async Task AfterThreeRecordsInARowWhoseOutcomeTheStoreRefusedTheFourthIsHeldBack()
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task AfterThreeRecordsInARowWhoseOutcomeTheStoreRefusedTheFourthIsHeldBack(bool handlerFails)
     {
         await WithIsolatedStoreAsync(async store =>
         {
             var options = store.Options();
+            options.MaxHandlerAttempts = 1;
             var logs = new LogRecorder();
             var (service, steps, _, producer) = store.Consumer(options, logs);
-            var handler = SendingHandler(steps, () => { });
+            var handler = handlerFails
+                ? new DelegateHandler((_, _) => Task.FromResult(PlatformMessageResult.Failed("synthetic handler failure")))
+                : SendingHandler(steps, () => { });
             using var consumerService = service(handler);
             // A setting or column that refuses every full outcome row.
             await store.FailWritesAsync("bip_message_attempt", "22000", "$1->>'correlation_id' is not null");
@@ -443,10 +520,16 @@ public sealed partial class PlatformMessageStorePostgresTests
 
             CollectionAssert.AreEqual(new long[] { 0, 1, 2 }, consumer.Commits);
             CollectionAssert.AreEqual(new[] { $"{id}-0", $"{id}-1", $"{id}-2", $"{id}-3", $"{id}-3" }, handler.Calls);
-            Assert.AreEqual(0, producer.Produced.Count, "A completed message is not parked.");
-            Assert.AreEqual("COMPLETED", await LogStatusAsync(store.Admin, $"{id}-0"));
+            // A failed handler's message was parked before its DLQ outcome was
+            // refused, and is not parked again on the next read.
+            Assert.AreEqual(handlerFails ? 4 : 0, producer.Produced.Count, "A completed message is not parked.");
+            Assert.AreEqual(handlerFails ? "DLQ" : "COMPLETED", await LogStatusAsync(store.Admin, $"{id}-0"));
             Assert.IsNull((await ReducedRowAsync(store.Admin, $"{id}-0")).Correlation);
-            Assert.AreEqual(3, logs.Errors.Count(error => error.Contains("was recorded without its envelope values: The Message Store cannot hold the record's outcome (SQLSTATE 22000) storeError=record-data", StringComparison.Ordinal)));
+            Assert.AreEqual(3, logs.Errors.Count(error => error.Contains(
+                handlerFails
+                    ? "was parked: The Message Store cannot hold the record's outcome (SQLSTATE 22000) storeError=record-data"
+                    : "was recorded without its envelope values: The Message Store cannot hold the record's outcome (SQLSTATE 22000) storeError=record-data",
+                StringComparison.Ordinal)));
             Assert.AreEqual(2, logs.Errors.Count(error => error.StartsWith($"Message {id}-3 at {options.InputTopic}/0@3 is not committed: 3 records in a row on this partition could not be stored for their own data", StringComparison.Ordinal)
                 && error.EndsWith("storeError=schema", StringComparison.Ordinal)));
         });

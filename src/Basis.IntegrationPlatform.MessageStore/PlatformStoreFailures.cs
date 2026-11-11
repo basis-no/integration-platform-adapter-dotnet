@@ -100,5 +100,5 @@ internal static class PlatformStoreFailures
     /// NUL, so a failure's own message must not make its step or record
     /// unstorable.
     /// </summary>
-    internal static string Storable(string text) => text.Replace('\u0000', '�');
+    internal static string Storable(string text) => text.Replace('\u0000', '\ufffd');
 }

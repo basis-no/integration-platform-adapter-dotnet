@@ -15,7 +15,7 @@ public sealed class PlatformRecordBoundaryTests
     [TestMethod]
     [DataRow("order-pipeline", "bip.order-pipeline.in", 0, 42L, "d7431daf-3b19-51d8-968b-020679b335a5")]
     [DataRow("order-pipeline", "bip.order-pipeline.in", 3, 0L, "3421dcd0-bbee-5491-8683-1fc2b8cbfd84")]
-    [DataRow("invoice-é", "bip.invoice.in", 11, 9007199254740993L, "f3b505ba-d509-5a06-9d6f-fd595e79c844")]
+    [DataRow("invoice-\u00e9", "bip.invoice.in", 11, 9007199254740993L, "f3b505ba-d509-5a06-9d6f-fd595e79c844")]
     public void TheDerivedIdMatchesTheSharedTestVectors(string integration, string topic, int partition, long offset, string expected)
     {
         Assert.AreEqual(expected, PlatformRecordIdentity.Derive(integration, topic, partition, offset));
@@ -54,8 +54,8 @@ public sealed class PlatformRecordBoundaryTests
         StringAssert.Contains(refused.Refusal, "x-bip-correlation-id is 1025 bytes, over the 1024-byte limit");
 
         // Bytes, not characters: 512 two-byte characters are 1,024 bytes.
-        Assert.IsNull(service.ReadRecord(Record(3, ("x-bip-source-system", new string('é', 512)))).Refusal);
-        Assert.IsNotNull(service.ReadRecord(Record(4, ("x-bip-source-system", new string('é', 513)))).Refusal);
+        Assert.IsNull(service.ReadRecord(Record(3, ("x-bip-source-system", new string('\u00e9', 512)))).Refusal);
+        Assert.IsNotNull(service.ReadRecord(Record(4, ("x-bip-source-system", new string('\u00e9', 513)))).Refusal);
     }
 
     [TestMethod]
@@ -109,6 +109,19 @@ public sealed class PlatformRecordBoundaryTests
 
         var withCorrelation = service.ReadRecord(Record(2, "order\0key", ("x-bip-message-id", "order-1"), ("x-bip-correlation-id", "corr-1")));
         Assert.IsNull(withCorrelation.Refusal, "The key is not stored when the record has its own correlation id.");
+    }
+
+    [TestMethod]
+    public void TheContentTypeHeaderIsCheckedWhenItBecomesTheContentType()
+    {
+        using var service = CreateService();
+
+        StringAssert.Contains(
+            service.ReadRecord(Record(1, ("x-bip-message-id", "order-1"), ("Content-Type", "text/plain\0"))).Refusal,
+            "content-type, which is the content type, contains a NUL byte");
+        Assert.IsNull(
+            service.ReadRecord(Record(2, ("x-bip-message-id", "order-1"), ("x-bip-content-type", "application/json"), ("content-type", "text/plain\0"))).Refusal,
+            "Not stored when the record has its own x-bip-content-type.");
     }
 
     [TestMethod]
@@ -188,7 +201,7 @@ public sealed class PlatformRecordBoundaryTests
     [TestMethod]
     public void AStoredFailureTextHasNoNul()
     {
-        Assert.AreEqual("bad � byte", PlatformStoreFailures.Storable("bad \0 byte"));
+        Assert.AreEqual("bad \ufffd byte", PlatformStoreFailures.Storable("bad \0 byte"));
     }
 
     private static PlatformMessageConsumerService CreateService()

@@ -214,12 +214,14 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
         var delivery = new PlatformDelivery(record.Position, marks);
         HandledMessage handled;
         delivery.Begin();
+        stepObservations.BeginDelivery(message.MessageId, delivery);
         try
         {
             handled = await HandleWithRetryAsync(message, delivery, cancellationToken);
         }
         finally
         {
+            stepObservations.EndDelivery(message.MessageId, delivery);
             delivery.End();
         }
 
@@ -255,7 +257,13 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
         }
 
         var error = PlatformStoreFailures.Storable(handled.Result.Error ?? "Handler returned failure.");
-        await PublishDlqAsync(message, error, cancellationToken);
+        // A record already parked in this process, whose DLQ outcome the
+        // store then refused for its data, is not parked again.
+        if (record.Position is null || !parkedForData.Contains(record.Position))
+        {
+            await PublishDlqAsync(message, error, cancellationToken);
+        }
+
         if (await RecordOutcomeAsync(record, metadata, "DLQ", error, parked: true, commitOffset, cancellationToken))
         {
             commitOffset();
@@ -293,7 +301,13 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
         catch (Exception ex) when (PlatformStoreFailures.IsRecordData(ex))
         {
             // Every step outcome is durable here; the outcome alone cannot be
-            // stored.
+            // stored. A record parked just before stays parked, also when the
+            // terminal path holds it back.
+            if (parked && record.Position is not null)
+            {
+                Keep(parkedForData, record.Position);
+            }
+
             await ParkForItsOwnDataAsync(
                 record,
                 metadata,
@@ -387,7 +401,6 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
         commitOffset();
         if (position is not null)
         {
-            parkedForData.Remove(position);
             Committed(position, normal: false);
             if (refusedByStore)
             {
@@ -406,9 +419,9 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
     }
 
     /// <summary>
-    /// What a committed record ends on its partition: the marks and kept id;
-    /// and, unless it took the terminal path, the run of records parked for
-    /// their own data.
+    /// What a committed record ends on its partition: the marks, the kept id
+    /// and that it was parked; and, unless it took the terminal path, the run
+    /// of records parked for their own data.
     /// </summary>
     private void Committed(PlatformRecordPosition? position, bool normal)
     {
@@ -419,6 +432,7 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
 
         marks.Supersede(position, committed: true);
         generatedIds.Remove(PartitionOf(position));
+        parkedForData.Remove(position);
         if (normal)
         {
             recordDataInARow.Remove(PartitionOf(position));
@@ -521,8 +535,9 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
     {
         var position = new PlatformRecordPosition(result.Topic, result.Partition.Value, result.Offset.Value);
         // A later record on the partition supersedes the marks of the one
-        // before it.
+        // before it, and that it was parked.
         marks.Supersede(position, committed: false);
+        parkedForData.RemoveWhere(parked => parked.Topic == position.Topic && parked.Partition == position.Partition && parked.Offset != position.Offset);
         var headers = ReadHeaders(result.Message.Headers);
         var (refusal, idRefused) = RefuseUnstorableEnvelope(result.Message, headers);
         // A refused id is replaced by the derived one, so the record has an id
@@ -576,8 +591,10 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
     /// index entry (at most 2704 bytes) might not. The check is on the
     /// header's raw bytes, so both adapters agree on values that are not
     /// valid UTF-8; the last header of a name counts, as when it is read. The
-    /// record key, which becomes the correlation id when the record has no
-    /// usable x-bip-correlation-id, is checked the same way.
+    /// values this adapter falls back to are checked the same way: the record
+    /// key, which becomes the correlation id when the record has no usable
+    /// x-bip-correlation-id, and content-type, which becomes the content type
+    /// when it has no usable x-bip-content-type.
     /// </summary>
     private static (string? Refusal, bool IdRefused) RefuseUnstorableEnvelope(
         Message<string, byte[]> message, IReadOnlyDictionary<string, string> headers)
@@ -585,7 +602,8 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
         var raw = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
         foreach (var header in message.Headers ?? [])
         {
-            if (StoredTextHeaders.Contains(header.Key, StringComparer.OrdinalIgnoreCase))
+            if (StoredTextHeaders.Contains(header.Key, StringComparer.OrdinalIgnoreCase)
+                || string.Equals(header.Key, "content-type", StringComparison.OrdinalIgnoreCase))
             {
                 raw[header.Key] = header.GetValueBytes() ?? [];
             }
@@ -606,6 +624,12 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
             && WhyUnstorable(Encoding.UTF8.GetBytes(message.Key)) is { } keyWhy)
         {
             refused.Add($"the record key, which is the correlation id, {keyWhy}");
+        }
+
+        if (Header(headers, "x-bip-content-type") is null && raw.TryGetValue("content-type", out var contentType)
+            && WhyUnstorable(contentType) is { } contentTypeWhy)
+        {
+            refused.Add($"content-type, which is the content type, {contentTypeWhy}");
         }
 
         return refused.Count == 0

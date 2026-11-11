@@ -279,9 +279,12 @@ described under Integration Usage: `Message <id> is not committed: a step
 outcome was not checked or recorded, so it is consumed again
 storeError=<class> sqlState=<code>`. The adapter can stop only the calls a
 handler makes through the step executor; a call the handler makes on its own
-is not stopped. A step executor call outside the consumer's processing, such
-as one from an application's own endpoint, does not belong to a record and
-is not affected.
+is not stopped. A step belongs to a record's processing when it runs in the
+handler's async flow, in parallel tasks too, or, on a worker of the handler's
+own that does not carry that flow, when it runs with the consumed message's
+id. A step executor call outside the consumer's processing, such as one from
+an application's own endpoint, does not belong to a record and is not
+affected.
 
 ### A step whose `DELIVERED` outcome could not be written
 
@@ -331,8 +334,9 @@ store keeps as text, `x-bip-message-id`, `x-bip-correlation-id`,
 refuses a value that contains a NUL byte or is longer than 1,024 bytes. Header
 names are matched ignoring case, and the last header of a name counts. The
 record key is checked the same way when it becomes the correlation id because
-the record has no `x-bip-correlation-id` (the Camel adapter does not use the
-key as the correlation id). A refused record's handler does not run, so
+the record has no `x-bip-correlation-id`, and so is `content-type` when it
+becomes the content type because the record has no `x-bip-content-type` (the
+Camel adapter has neither fallback). A refused record's handler does not run, so
 nothing is sent.
 
 The same path runs when the step outcomes that failed all failed for the
