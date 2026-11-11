@@ -9,11 +9,13 @@ import unittest
 SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "public-content-check.py")
 
 
-def isolated_environment():
+def isolated_environment(home):
     """The caller's environment without its git settings: a GIT_DIR from a hook
-    would point git at the caller's repository, and a developer's own config
-    could change the output the script parses."""
+    would point git at the caller's repository, and a developer's own config,
+    ignore or attributes files could change what git does or prints. HOME and
+    XDG_CONFIG_HOME point at an empty directory."""
     env = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+    env.update(HOME=home, XDG_CONFIG_HOME=os.path.join(home, ".config"))
     env.update(GIT_AUTHOR_NAME="Synthetic", GIT_AUTHOR_EMAIL="synthetic@users.noreply.github.com",
                GIT_COMMITTER_NAME="Synthetic", GIT_COMMITTER_EMAIL="synthetic@users.noreply.github.com",
                GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
@@ -23,14 +25,16 @@ def isolated_environment():
 class CommitRangeTest(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
+        self.home = tempfile.TemporaryDirectory()
         self.repo = self.directory.name
         self.git("init", "--quiet", "--initial-branch=main")
 
     def tearDown(self):
         self.directory.cleanup()
+        self.home.cleanup()
 
     def git(self, *args, date=None):
-        env = isolated_environment()
+        env = isolated_environment(self.home.name)
         if date is not None:
             env["GIT_AUTHOR_DATE"] = env["GIT_COMMITTER_DATE"] = f"@{date} +0000"
         return subprocess.run(["git", *args], cwd=self.repo, env=env, check=True,
@@ -48,7 +52,7 @@ class CommitRangeTest(unittest.TestCase):
         with open(patterns, "w", encoding="utf-8") as file:
             file.write("already-published\n")
         return subprocess.run([sys.executable, "-I", "-B", SCRIPT, "--range", commit_range, "--patterns-file", patterns],
-                              cwd=self.repo, env=isolated_environment(), capture_output=True, text=True)
+                              cwd=self.repo, env=isolated_environment(self.home.name), capture_output=True, text=True)
 
     def test_a_commit_dated_before_its_parent_does_not_bring_published_commits_into_the_range(self):
         # The published root holds a line the patterns match. The base branch
