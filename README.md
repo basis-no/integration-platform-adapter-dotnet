@@ -133,19 +133,26 @@ leave the operation: the handler can catch it and return
 the handler and then parks the message.
 
 The step's own record in the Message Store can fail too. An operation that
-returned is never recorded `FAILED`: the executor retries the `DELIVERED`
-write in place (three attempts), and if it still fails, it throws
-the store's exception without writing `FAILED`; the step then runs again on
-the next delivery, so send its idempotency key to the receiver. A failed
-ledger read before the step throws without running the operation. Either way
-the adapter notes the store failure outside the exception: if the handler
-catches it and returns success anyway, the adapter does not record the message
-`COMPLETED` or commit its offset, but processes the delivery again after the
-failure backoff, without parking it. This includes a ledger call cut short by
-the handler's own cancellation token, such as a timeout. A ledger write that
-fails every time for one message, with a handler that swallows it, therefore
-blocks its partition and calls the receiver again on each pass; the error log
-names the message and step.
+returned is never recorded `FAILED`: the executor writes `DELIVERED` again in
+place, and if that still fails, it throws the store's exception without
+writing `FAILED`, and keeps the outcome for the record's next read, which then
+does not call the receiver again (see
+[Message Store failures](#message-store-failures)). A failed ledger read before
+the step throws without running the operation. Either way the adapter notes
+the store failure outside the exception, for the whole processing of the
+record: every later step of it, in a handler retry too, throws before its
+operation runs, the handler is not retried, and whatever the handler returns,
+the adapter neither records the message nor commits its offset, but processes
+the delivery again after the failure backoff, without parking it. This
+includes a ledger call that the handler's own cancellation token, such as a
+timeout, cuts short while it waits for the store. A step started with a token
+that is already cancelled does not reach the store at all: it throws the
+cancellation and records nothing, the handler's failure is retried and parked
+as any other, and a handler that returns success anyway gets the delivery
+processed again. Only a failure for the record's own data, which no later read can
+store, parks the message instead. A ledger that refuses every write therefore
+holds its partition back until it accepts them; the error log names the
+message and the store error.
 
 The step key is `<message-id>:<step-id>`, and a step whose key is already
 `DELIVERED` in `bip_step_outcome` is skipped, unless the message's
@@ -250,6 +257,134 @@ Camel adapter, whose library default is `noop`; this adapter's default stays
 Switching from `noop` back to `postgres` keeps the rows written before the
 `noop` period: a step delivered before the `noop` period is skipped on a later
 replay, even if it ran again and failed under `noop`. Name such a step in `redoSteps` to run it.
+
+## Message Store failures
+
+The Camel adapter follows the same rules; where this adapter differs, the
+text says so.
+
+### Store error classes
+
+A failed Message Store call is classified by its SQLSTATE, and the adapter's
+ERROR lines for a record that is not committed, or that was parked for its own
+data, end with `storeError=<class>` and, when known, `sqlState=<code>`, so an
+alert can tell a read-only store or a lost grant from an outage:
+
+| Class | SQLSTATE | What the adapter does |
+| --- | --- | --- |
+| `record-data` | class `22` (such as `22021`, a NUL byte), `54000` (such as an index row over 2704 bytes) | The record's own data cannot be stored: it is parked, see below. |
+| `read-only` | `25006` | Not committed, read again. |
+| `privilege` | `42501`, class `28` | Not committed, read again. |
+| `schema` | another class `42` (such as `42P01`, a missing table), class `23`, `3D000`, `3F000` | Not committed, read again. |
+| `unavailable` | everything else: class `08`, `53`, `57`, a lock or statement timeout, `40001`, `40P01`, a failure without a SQLSTATE such as a client timeout or a cancellation, and an unconfirmed commit (`08007`) | Not committed, read again. |
+
+A step ledger failure of any class ends the processing of the record, as
+described under Integration Usage: `Message <id> is not committed: a step
+outcome was not checked or recorded, so it is consumed again
+storeError=<class> sqlState=<code>`. The adapter can stop only the calls a
+handler makes through the step executor; a call the handler makes on its own
+is not stopped. A step belongs to a record's processing when it runs in the
+handler's async flow, in parallel tasks too, or, on a worker of the handler's
+own that does not carry that flow, when it runs with the consumed message's
+id. A step executor call outside the consumer's processing, such as one from
+an application's own endpoint, does not belong to a record and is not
+affected, unless it runs with the id of a message the consumer is processing
+at that moment.
+
+### A step whose `DELIVERED` outcome could not be written
+
+When a step's operation returned but its `DELIVERED` outcome cannot be
+written, for example because the Message Store is read-only after a failover or
+the login lost its write privilege, the receiver is not called again only
+because the outcome was lost:
+
+1. The executor writes the same outcome again in place, up to 3 more times
+   after 0.5, 1 and 2 seconds, starting no try more than 10 seconds after the
+   first failure, and not for the record's own data. While the store refuses
+   writes, a step takes up to about 3.5 seconds longer; when it stops
+   answering, each try runs to the call timeouts.
+2. If it still fails, the adapter keeps a mark in memory for the record's
+   topic, partition and offset and the step key: the outcome the write would
+   have stored, with the time of the call. The record is not committed.
+3. When the same record is read again, a step whose step key has a mark gets
+   its outcome written from the mark before the redo and ledger check. If that
+   succeeds, the operation does not run, the step is listed `DELIVERED` with
+   the time of the call in `steps_json`, the result is `DELIVERED` with
+   `Skipped` set, and a WARN says so. If it fails, nothing is called and the
+   record is read again later. A mark wins over `x-bip-redo-steps`: the earlier
+   read of the same record already made that call. A further call with the
+   same step key in the same handler invocation is skipped as a repeated step
+   key is.
+
+A record without `x-bip-message-id` keeps the id generated for it while the
+same offset is read again in the process, so its marks match. A step the
+handler runs with a message id of its own has its own marks. Marks are kept in
+memory only, at most 10,000 of them (a dropped one is logged), and are dropped
+when a record at or after their offset is committed, or when a record at any
+other offset of the partition begins. A restart, or a rebalance to another
+process, loses them, so the next read there can call the receiver once more,
+with the same idempotency key when the record carries `x-bip-message-id`. A
+mark whose step the next read does not reach is not written. Marks and kept
+ids match by offset only, so after a topic is deleted and created again,
+restart the integrations that consume it. There is no mark for a call made
+outside the consumer's processing of a record.
+
+### A record whose own values the Message Store cannot hold
+
+A record whose envelope values PostgreSQL cannot store would otherwise block
+its partition: every write for it fails, so it is neither recorded nor parked.
+Before the handler runs, the adapter checks the raw bytes of the headers the
+store keeps as text, `x-bip-message-id`, `x-bip-correlation-id`,
+`x-bip-content-type`, `x-bip-source-system` and `x-bip-target-system`, and
+refuses a value that contains a NUL byte or is longer than 1,024 bytes. Header
+names are matched ignoring case, and the last header of a name counts. The
+record key is checked the same way when it becomes the correlation id because
+the record has no `x-bip-correlation-id`, and so is `content-type` when it
+becomes the content type because the record has no `x-bip-content-type` (the
+Camel adapter has neither fallback). A refused record's handler does not run, so
+nothing is sent.
+
+The same path runs when the step outcomes that failed all failed for the
+record's own data (class `22` or `54000`), for example a message id the
+handler gave a step that is too long for the step ledger's index, also when
+the handler caught the failure, or when the outcome write fails so while every
+step outcome was written. When a step outcome failed for another reason, the
+record is read again instead:
+
+1. The record is parked, unless it was parked already or, for the outcome
+   write, its handler completed. `x-bip-error` gives the reason: which header
+   was refused and why, or the SQLSTATE and whether a step's call had returned.
+   It ends with the record's position as `(record <topic>/<partition>@<offset>)`;
+   the refused value is not copied into it.
+2. A reduced outcome is recorded under the record's own message id, with its
+   own attempt, `DLQ` (or `COMPLETED` when its handler completed), the payload
+   as captured, the reason as its error, and no correlation id, content type,
+   source or target system or steps. No step outcome is written. If the store
+   refuses that too, it is written without the payload, not replayable.
+3. The offset is committed only after both are durable; otherwise the record is
+   read again, the path runs again and the record is not parked again in the
+   process. The consumer then goes on with the next record, and an ERROR line
+   says `Message <id> from record <position> was parked: <reason>
+   storeError=record-data`, or, when the handler completed and nothing was
+   parked, `... was recorded without its envelope values: <reason>
+   storeError=record-data`.
+
+When `x-bip-message-id` itself is refused, the record is parked and recorded
+under an id derived from its position: the UUID made from the first 16 bytes of
+SHA-256 over `kafka-record`, the integration name (`APP_NAME`), the topic, the
+partition and the offset, joined by line feeds, with the version and variant
+bits of a name-based UUID. The Camel adapter derives the same id.
+
+After three records in a row on a partition took this path because the store
+refused their data (records the boundary check refused do not count), the next
+one is held back, not committed, with `storeError=schema`, so that a setting or
+column that fails every record does not drain the topic into the DLQ. The
+held-back record is read again after the failure backoff and goes on once the
+store takes it. A normal commit on the partition resets the count, and a
+restart does too.
+
+A failure text the adapter stores or parks has U+0000 replaced with U+FFFD, so
+that a failure's own message cannot make its step or record unstorable.
 
 ## Payload policy
 
@@ -421,23 +556,21 @@ Every Message Store call is bounded well under the consumer's poll interval
 (`max.poll.interval.ms`, 300 s by default), so a hung database, a held lock or a
 dead connection fails the call instead of stalling the consumer until it
 leaves its group. A failed or timed-out call is a store failure. The
-message's outcome record is retried in place (three attempts); if it still
-fails, the delivery is not committed and is processed again after the
-failure backoff. A step ledger call that fails because the store is
-unavailable (it can't be reached, doesn't answer in time, a lock or
-statement timeout, or SQLSTATE classes 08, 53, 57 and 58) ends the handler
-invocation at once: the adapter neither retries the handler nor parks the
-message, and processes the delivery again. A ledger call refused for its
-data, or cancelled by the handler's own token, is retried and parked as any
-handler failure.
+message's outcome record is retried in place (three attempts, but one when
+the store refuses the record's own data); if it still fails, the delivery is not committed and is
+processed again after the failure backoff. A failed step ledger call ends the
+processing of the record at once; see
+[Message Store failures](#message-store-failures).
 
 With synchronous replication, a commit waits for a standby, and
 `statement_timeout` does not end that wait. When the client's command
 timeout or a cancellation ends it, PostgreSQL reports the commit as done
 with only a warning, although it exists on the primary alone and a failover
-can lose it. The adapter treats such a write as failed: it commits no offset
-for it, skips no step on it and publishes no replay after it, and retries
-the idempotent write.
+can lose it. That warning has only the generic SQLSTATE `01000` and a
+localized text, so the adapter treats a write whose commit reports any
+warning as failed, with SQLSTATE `08007` (`unavailable`) whatever the
+warning's own: it commits no offset for it, skips no step on it and publishes
+no replay after it, and retries the idempotent write.
 
 The adapter applies these client-side defaults to its own datasource (the
 keyed `MessageStoreDataSourceKey` one), for every setting the connection
@@ -585,8 +718,10 @@ by default).
 
 To recognise it, look for failed writes in the log, such as
 `cannot execute INSERT in a read-only transaction` (SQLSTATE `25006`) or
-`permission denied` (`42501`), and for consumer lag that keeps growing. `main`
-has the same loop; #60 tracks the fix.
+`permission denied` (`42501`), and for consumer lag that keeps growing. The
+next release calls the receiver once per process instead, and holds the record
+back until the store accepts writes, without parking it (see
+[Message Store failures](#message-store-failures)).
 
 The repeats of a message have the same step key, `<message-id>:<step-id>`, the
 key `bip_step_outcome` records, so a receiver that deduplicates by it applies

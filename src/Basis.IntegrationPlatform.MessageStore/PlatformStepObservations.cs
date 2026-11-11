@@ -30,8 +30,9 @@ public sealed class PlatformStepObservationCollector
     // In-process retries re-run the handler within one processing attempt, so
     // a step seen again in a later invocation is a retry, not a reused id.
     private readonly ConcurrentDictionary<string, int> invocationStarts = new(StringComparer.Ordinal);
-    // Messages whose current handler invocation saw a step ledger call fail.
-    private readonly ConcurrentDictionary<string, bool> storeFailures = new(StringComparer.Ordinal);
+    // The processing of each consumed message, for a step whose async flow
+    // does not carry it, such as one a handler hands to a worker of its own.
+    private readonly ConcurrentDictionary<string, PlatformDelivery> deliveries = new(StringComparer.Ordinal);
 
     public void Record(string messageId, PlatformStepObservation observation)
     {
@@ -61,30 +62,21 @@ public sealed class PlatformStepObservationCollector
     {
         observations.TryRemove(messageId, out _);
         invocationStarts.TryRemove(messageId, out _);
-        storeFailures.TryRemove(messageId, out _);
     }
+
+    internal void BeginDelivery(string messageId, PlatformDelivery delivery) => deliveries[messageId] = delivery;
+
+    internal void EndDelivery(string messageId, PlatformDelivery delivery) =>
+        deliveries.TryRemove(new KeyValuePair<string, PlatformDelivery>(messageId, delivery));
+
+    /// <summary>The processing of the consumed message with this id, while it runs.</summary>
+    internal PlatformDelivery? Delivery(string messageId) =>
+        deliveries.TryGetValue(messageId, out var delivery) ? delivery : null;
 
     internal void BeginHandlerInvocation(string messageId)
     {
         invocationStarts[messageId] = Snapshot(messageId).Count;
-        storeFailures.TryRemove(messageId, out _);
     }
-
-    /// <param name="outage">Whether the failure says the store is unavailable, rather than refusing this call's data or being cancelled by the handler's own token.</param>
-    internal void NoteStoreFailure(string messageId, bool outage)
-    {
-        storeFailures.AddOrUpdate(messageId, outage, (_, earlier) => earlier || outage);
-    }
-
-    /// <summary>
-    /// Whether a step ledger call failed during the current handler
-    /// invocation, whatever the handler did with the exception.
-    /// </summary>
-    internal bool StoreFailedInCurrentInvocation(string messageId) => storeFailures.ContainsKey(messageId);
-
-    /// <summary>Whether a step ledger call in the current handler invocation failed because the store is unavailable.</summary>
-    internal bool StoreUnavailableInCurrentInvocation(string messageId) =>
-        storeFailures.TryGetValue(messageId, out var outage) && outage;
 
     /// <summary>
     /// How the current handler invocation already used this idempotency key,

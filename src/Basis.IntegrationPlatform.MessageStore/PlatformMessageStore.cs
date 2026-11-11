@@ -245,17 +245,58 @@ public sealed class PlatformMessageStore
         string? error,
         CancellationToken cancellationToken)
     {
-        // The attempt number comes from the x-bip-attempt header of the
-        // consumed message (absent => 1) and is never derived from the database.
-        var attempt = AttemptFrom(message);
-        var payload = CapturePayload(message);
         // steps_json records what THIS processing attempt observed, not a
         // cumulative snapshot of bip_step_outcome.
         var stepsJson = JsonSerializer.Serialize(stepObservations.Snapshot(message.MessageId), JsonOptions);
+        await WriteAttemptAsync(message, metadata, status, error, CapturePayload(message), stepsJson, envelope: true, cancellationToken);
+        stepObservations.Clear(message.MessageId);
+    }
+
+    /// <summary>
+    /// The outcome of a record whose own values the Message Store cannot
+    /// hold: no correlation id, content type, source or target system, and no
+    /// steps; everything else as a normal outcome. If the store refuses its
+    /// data too, it is written once more without the payload, not replayable.
+    /// </summary>
+    internal async Task RecordReducedAttemptAsync(
+        PlatformMessage message,
+        PlatformMessageAttemptMetadata metadata,
+        string status,
+        string error,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await WriteAttemptAsync(message, metadata, status, error, CapturePayload(message), "[]", envelope: false, cancellationToken);
+        }
+        catch (Exception ex) when (PlatformStoreFailures.IsRecordData(ex))
+        {
+            var withoutPayload = PayloadCapture.MetadataOnly(message.Payload.Length, "the record's envelope values could not be stored");
+            await WriteAttemptAsync(message, metadata, status, error, withoutPayload, "[]", envelope: false, cancellationToken);
+        }
+
+        stepObservations.Clear(message.MessageId);
+    }
+
+    private async Task WriteAttemptAsync(
+        PlatformMessage message,
+        PlatformMessageAttemptMetadata metadata,
+        string status,
+        string? error,
+        PayloadCapture payload,
+        string stepsJson,
+        bool envelope,
+        CancellationToken cancellationToken)
+    {
+        // The attempt number comes from the x-bip-attempt header of the
+        // consumed message (absent => 1) and is never derived from the database.
+        var attempt = AttemptFrom(message);
+        error = error is null ? null : PlatformStoreFailures.Storable(error);
 
         // The outcome is kept here and its idempotent write retried in place,
         // so a short store failure, or a commit the store could not confirm as
-        // durable, doesn't make the delivery run again.
+        // durable, doesn't make the delivery run again. Not the record's own
+        // data, which a retry cannot help.
         for (var write = 1; ; write++)
         {
             try
@@ -264,13 +305,14 @@ public sealed class PlatformMessageStore
                 using var confirmation = PlatformCommitConfirmation.Watch(connection);
                 await using var transaction = await PlatformStoreTimeouts.BeginTransactionAsync(connection, serverTimeouts, cancellationToken);
                 var capped = await CapPayloadExpiryAsync(connection, transaction, message.MessageId, payload, cancellationToken);
-                await UpsertAttemptAsync(connection, transaction, message, metadata, status, attempt, capped, error, stepsJson, cancellationToken);
-                await UpsertLogAsync(connection, transaction, message, status, attempt, capped, error, metadata, cancellationToken);
-                await transaction.CommitAsync(cancellationToken);
-                confirmation.ThrowIfUnconfirmed();
-                break;
+                await UpsertAttemptAsync(connection, transaction, message, metadata, status, attempt, capped, error, stepsJson, envelope, cancellationToken);
+                await UpsertLogAsync(connection, transaction, message, status, attempt, capped, error, metadata, envelope, cancellationToken);
+                await confirmation.CommitAsync(transaction, cancellationToken);
+                return;
             }
-            catch (Exception ex) when (write < OutcomeWriteAttempts && !(ex is OperationCanceledException && cancellationToken.IsCancellationRequested))
+            catch (Exception ex) when (write < OutcomeWriteAttempts
+                && !(ex is OperationCanceledException && cancellationToken.IsCancellationRequested)
+                && !PlatformStoreFailures.IsRecordData(ex))
             {
                 if (cancellationToken.IsCancellationRequested)
                 {
@@ -286,8 +328,6 @@ public sealed class PlatformMessageStore
                 await Task.Delay(OutcomeWriteRetryDelay * write, cancellationToken);
             }
         }
-
-        stepObservations.Clear(message.MessageId);
     }
 
     /// <summary>Attempts of an outcome write before its store failure is thrown.</summary>
@@ -584,6 +624,7 @@ public sealed class PlatformMessageStore
         PayloadCapture payload,
         string? error,
         PlatformMessageAttemptMetadata metadata,
+        bool envelope,
         CancellationToken cancellationToken)
     {
         await using var command = new NpgsqlCommand(
@@ -621,7 +662,7 @@ public sealed class PlatformMessageStore
             """,
             connection,
             transaction);
-        AddMessageParameters(command, message);
+        AddMessageParameters(command, message, envelope);
         command.Parameters.AddWithValue("status", status);
         command.Parameters.AddWithValue("attempt", attempt);
         // schema_version is the producer-declared x-bip-schema-version
@@ -645,6 +686,7 @@ public sealed class PlatformMessageStore
         PayloadCapture payload,
         string? error,
         string stepsJson,
+        bool envelope,
         CancellationToken cancellationToken)
     {
         // Infra redeliveries re-record the same (message_id, attempt) row
@@ -686,7 +728,7 @@ public sealed class PlatformMessageStore
             """,
             connection,
             transaction);
-        AddMessageParameters(command, message);
+        AddMessageParameters(command, message, envelope);
         command.Parameters.AddWithValue("attempt", attempt);
         command.Parameters.AddWithValue("route_id", metadata.RouteId);
         command.Parameters.AddWithValue("status", status);
@@ -737,8 +779,7 @@ public sealed class PlatformMessageStore
         command.Parameters.Add("redo_steps", NpgsqlDbType.Jsonb).Value = RedoStepsJson(request);
         command.Parameters.AddWithValue("target_topic", targetTopic);
         await command.ExecuteNonQueryAsync(cancellationToken);
-        await transaction.CommitAsync(cancellationToken);
-        confirmation.ThrowIfUnconfirmed();
+        await confirmation.CommitAsync(transaction, cancellationToken);
     }
 
     private async Task UpdateReplayAuditAsync(string replayId, string status, string? error, CancellationToken cancellationToken)
@@ -765,14 +806,20 @@ public sealed class PlatformMessageStore
         return JsonSerializer.Serialize(request.RedoSteps ?? [], JsonOptions);
     }
 
-    private void AddMessageParameters(NpgsqlCommand command, PlatformMessage message)
+    /// <param name="envelope">False for a reduced outcome, which stores none of the envelope's text values.</param>
+    private void AddMessageParameters(NpgsqlCommand command, PlatformMessage message, bool envelope = true)
     {
         command.Parameters.AddWithValue("message_id", message.MessageId);
-        command.Parameters.AddWithValue("correlation_id", message.CorrelationId);
         command.Parameters.AddWithValue("integration", options.ApplicationName);
-        command.Parameters.AddWithValue("source_system", message.SourceSystem);
-        command.Parameters.AddWithValue("target_system", message.TargetSystem);
-        command.Parameters.AddWithValue("content_type", message.ContentType);
+        AddEnvelopeText(command, "correlation_id", message.CorrelationId, envelope);
+        AddEnvelopeText(command, "source_system", message.SourceSystem, envelope);
+        AddEnvelopeText(command, "target_system", message.TargetSystem, envelope);
+        AddEnvelopeText(command, "content_type", message.ContentType, envelope);
+    }
+
+    private static void AddEnvelopeText(NpgsqlCommand command, string name, string value, bool envelope)
+    {
+        command.Parameters.Add(name, NpgsqlDbType.Text).Value = envelope ? value : DBNull.Value;
     }
 
     private static void AddPayloadParameters(NpgsqlCommand command, PayloadCapture payload)
