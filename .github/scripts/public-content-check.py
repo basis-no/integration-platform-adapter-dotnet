@@ -59,7 +59,15 @@ def main():
         return hits
 
     findings = []
-    commits = git("rev-list", "--no-merges", args.range).split()
+    # BASE..HEAD as an explicit set difference: git's own walk goes by commit date
+    # and, without a commit-graph, can stop early when a commit is older than its
+    # parent, and then lists commits that BASE already contains.
+    base, dots, head = args.range.partition("..")
+    if dots and base and head and not head.startswith("."):
+        excluded = set(git("rev-list", base).split())
+        commits = [c for c in git("rev-list", "--no-merges", head).split() if c not in excluded]
+    else:
+        commits = git("rev-list", "--no-merges", args.range).split()
     for commit in commits:
         short = commit[:10]
         author, committer = git("show", "-s", "--format=%ae%n%ce", commit).split("\n")[:2]
