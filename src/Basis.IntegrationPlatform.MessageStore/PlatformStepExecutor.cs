@@ -1,3 +1,5 @@
+using System.Diagnostics;
+using System.Runtime.ExceptionServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -163,10 +165,27 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
         ArgumentException.ThrowIfNullOrWhiteSpace(endpointUri);
         ArgumentNullException.ThrowIfNull(operation);
 
+        var delivery = PlatformDelivery.Current;
+        if (delivery?.StoreFailure is { } earlier)
+        {
+            // A store failure ends the attempt: nothing this processing does
+            // can be committed, so no later step of it is sent, not even in a
+            // handler retry.
+            throw new PlatformStepNotSentException(earlier);
+        }
+
         var idempotencyKey = IdempotencyKey(message.MessageId, stepId);
         // The operation calls the real destination; only the recorded copy of
         // the URI is masked.
         var recordedUri = MaskEndpointUri(endpointUri);
+        if (UsesStepLedger && delivery?.Position is { } position && delivery.Marks?.Find(position, idempotencyKey) is { } mark)
+        {
+            // An earlier read of this record made the send. Before the redo
+            // and ledger check: that read made the send whatever the redo
+            // list says.
+            return await WriteFromMarkAsync(delivery, mark, message, stepId, idempotencyKey, cancellationToken);
+        }
+
         bool delivered;
         try
         {
@@ -178,15 +197,13 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
         {
             // Also a cancellation: the token may be the handler's own timeout,
             // and a handler that swallows it must not complete the message.
-            NoteStoreFailure(message.MessageId, ex);
+            delivery?.NoteStoreFailure(ex);
             throw;
         }
 
         if (delivered)
         {
-            await WarnAboutSharedStepKeyAsync(message, stepId, idempotencyKey, cancellationToken);
-            Observe(message.MessageId, stepId, SkippedStatus, idempotencyKey, recordedUri, targetRef, null);
-            return new PlatformStepExecutionResult(idempotencyKey, stepId, SkippedStatus, true);
+            return await SkipDeliveredAsync(message, stepId, idempotencyKey, recordedUri, targetRef, cancellationToken);
         }
 
         try
@@ -197,16 +214,17 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
         {
             // A cancellation the caller did not request, such as an HttpClient
             // timeout, is a failed step like any other.
-            Observe(message.MessageId, stepId, Failed, idempotencyKey, recordedUri, targetRef, ex.Message);
+            var error = PlatformStoreFailures.Storable(ex.Message);
+            Observe(message.MessageId, stepId, Failed, idempotencyKey, recordedUri, targetRef, error);
             if (UsesStepLedger)
             {
                 try
                 {
-                    await RecordAsync(message.MessageId, idempotencyKey, stepId, Failed, recordedUri, targetRef, ex.Message, cancellationToken);
+                    await RecordAsync(message.MessageId, idempotencyKey, stepId, Failed, recordedUri, targetRef, error, null, cancellationToken);
                 }
                 catch (Exception recordFailure)
                 {
-                    NoteStoreFailure(message.MessageId, recordFailure);
+                    delivery?.NoteStoreFailure(recordFailure);
                     throw;
                 }
             }
@@ -217,24 +235,106 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
         // The operation returned, so the call was made: never record FAILED
         // for it. Retry the DELIVERED write in place so a short store outage
         // doesn't make the delivery run the call again.
-        Observe(message.MessageId, stepId, Delivered, idempotencyKey, recordedUri, targetRef, null);
+        var sentAt = DateTimeOffset.UtcNow;
+        Observe(message.MessageId, stepId, Delivered, idempotencyKey, recordedUri, targetRef, null, sentAt);
         if (UsesStepLedger)
         {
-            await RecordDeliveredAsync(message.MessageId, idempotencyKey, stepId, recordedUri, targetRef, cancellationToken);
+            try
+            {
+                await RecordDeliveredAsync(message.MessageId, idempotencyKey, stepId, recordedUri, targetRef, sentAt, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                // Keep the outcome for the record's next read, so the step is
+                // not sent again only because its outcome was lost. Also for
+                // the record's own data: the record is then parked, and its
+                // next read, if the parking fails, sends nothing.
+                if (delivery is not null)
+                {
+                    delivery.NoteUnrecordedSend(stepId);
+                    if (delivery.Position is { } at)
+                    {
+                        delivery.Marks?.Mark(new PlatformUnrecordedDelivery(at, message.MessageId, stepId, idempotencyKey, recordedUri, targetRef, sentAt));
+                    }
+
+                    delivery.NoteStoreFailure(ex);
+                }
+
+                throw;
+            }
         }
 
         return new PlatformStepExecutionResult(idempotencyKey, stepId, Delivered, false);
     }
 
-    /// <summary>
-    /// Attempts of the DELIVERED write before the store failure is thrown.
-    /// With a hung store each attempt costs a command timeout, so this stays
-    /// small against the consumer's poll interval.
-    /// </summary>
-    internal int DeliveredWriteAttempts { get; init; } = 3;
+    private async Task<PlatformStepExecutionResult> SkipDeliveredAsync(
+        PlatformMessage message,
+        string stepId,
+        string idempotencyKey,
+        string recordedUri,
+        string? targetRef,
+        CancellationToken cancellationToken)
+    {
+        await WarnAboutSharedStepKeyAsync(message, stepId, idempotencyKey, cancellationToken);
+        Observe(message.MessageId, stepId, SkippedStatus, idempotencyKey, recordedUri, targetRef, null);
+        return new PlatformStepExecutionResult(idempotencyKey, stepId, SkippedStatus, true);
+    }
 
-    /// <summary>Delay before the second DELIVERED write attempt; it grows with each attempt.</summary>
-    internal TimeSpan DeliveredWriteRetryDelay { get; init; } = TimeSpan.FromMilliseconds(500);
+    /// <summary>
+    /// An earlier read of this record made the send, and its outcome could not
+    /// be written then: write it now, with the time of the send, and do not
+    /// send. A write that fails again fails this attempt before anything is
+    /// sent. The result is <c>DELIVERED</c> and skipped: the operation did not
+    /// run in this call.
+    /// </summary>
+    private async Task<PlatformStepExecutionResult> WriteFromMarkAsync(
+        PlatformDelivery delivery,
+        PlatformUnrecordedDelivery mark,
+        PlatformMessage message,
+        string stepId,
+        string idempotencyKey,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            // The mark stays until its record is committed or superseded;
+            // writing it again on a later read is harmless.
+            await RecordAsync(mark.MessageId, idempotencyKey, mark.StepId, Delivered, mark.EndpointUri, mark.TargetRef, null, mark.SentAt, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            delivery.NoteUnrecordedSend(stepId);
+            delivery.NoteStoreFailure(ex);
+            throw;
+        }
+
+        if (!delivery.TryTakeMark(idempotencyKey, () =>
+                Observe(message.MessageId, stepId, Delivered, idempotencyKey, mark.EndpointUri, mark.TargetRef, null, mark.SentAt)))
+        {
+            // Another call of this processing took the mark's send: this one
+            // shares its step key and is not sent, which the skip reports as a
+            // ledger skip of a repeated key does.
+            return await SkipDeliveredAsync(message, stepId, idempotencyKey, mark.EndpointUri, mark.TargetRef, cancellationToken);
+        }
+
+        logger.LogWarning(
+            "Step {StepId} of message {MessageId} was sent in an earlier read of record {Position}, and its DELIVERED outcome is written now; the send is not repeated",
+            stepId,
+            message.MessageId,
+            mark.Position);
+        return new PlatformStepExecutionResult(idempotencyKey, stepId, Delivered, true);
+    }
+
+    /// <summary>
+    /// Waits before the in-place retries of a failed DELIVERED write, one per
+    /// retry. With a hung store each try costs a command timeout, so the
+    /// retries stay small against the consumer's poll interval.
+    /// </summary>
+    internal IReadOnlyList<TimeSpan> DeliveredWriteRetryWaits { get; init; } =
+        [TimeSpan.FromMilliseconds(500), TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2)];
+
+    /// <summary>No in-place retry of the DELIVERED write starts later than this after its first failure.</summary>
+    internal TimeSpan DeliveredWriteRetryFor { get; init; } = TimeSpan.FromSeconds(10);
 
     private async Task RecordDeliveredAsync(
         string messageId,
@@ -242,61 +342,62 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
         string stepId,
         string recordedUri,
         string? targetRef,
+        DateTimeOffset sentAt,
         CancellationToken cancellationToken)
     {
-        for (var attempt = 1; ; attempt++)
+        Exception failure;
+        try
         {
+            await RecordAsync(messageId, idempotencyKey, stepId, Delivered, recordedUri, targetRef, null, sentAt, cancellationToken);
+            return;
+        }
+        catch (Exception ex) when (!IsCallerCancellation(ex, cancellationToken))
+        {
+            failure = ex;
+        }
+
+        // Not for the record's own data, which a retry cannot help. A
+        // cancellation by the handler's own token ends the retries: not
+        // recorded either.
+        var firstFailure = Stopwatch.GetTimestamp();
+        var tries = 1;
+        foreach (var wait in DeliveredWriteRetryWaits)
+        {
+            if (PlatformStoreFailures.IsRecordData(failure) || Stopwatch.GetElapsedTime(firstFailure) + wait > DeliveredWriteRetryFor)
+            {
+                break;
+            }
+
+            logger.LogWarning(
+                "Step ledger write failed messageId={MessageId} stepId={StepId} attempt={Attempt}; retrying the DELIVERED write.",
+                messageId,
+                stepId,
+                tries);
+            await Task.Delay(wait, cancellationToken);
+            tries++;
             try
             {
-                await RecordAsync(messageId, idempotencyKey, stepId, Delivered, recordedUri, targetRef, null, cancellationToken);
+                await RecordAsync(messageId, idempotencyKey, stepId, Delivered, recordedUri, targetRef, null, sentAt, cancellationToken);
+                logger.LogInformation(
+                    "Step {StepId} of message {MessageId}: its DELIVERED outcome was written when tried again in place",
+                    stepId,
+                    messageId);
                 return;
             }
-            catch (OperationCanceledException cancelled) when (cancellationToken.IsCancellationRequested)
+            catch (Exception ex) when (!IsCallerCancellation(ex, cancellationToken))
             {
-                // Not recorded either; the handler's token may be its own timeout.
-                NoteStoreFailure(messageId, cancelled);
-                throw;
-            }
-            catch (Exception ex)
-            {
-                if (attempt >= Math.Max(1, DeliveredWriteAttempts))
-                {
-                    // The delivery is processed again; the step runs again
-                    // only because no DELIVERED row exists, and the receiver
-                    // deduplicates it with the step's idempotency key.
-                    logger.LogError(
-                        ex,
-                        "Step ledger could not record a delivered step messageId={MessageId} stepId={StepId} attempts={Attempts}; the step was not recorded FAILED.",
-                        messageId,
-                        stepId,
-                        attempt);
-                    NoteStoreFailure(messageId, ex);
-                    throw;
-                }
-
-                logger.LogWarning(
-                    "Step ledger write failed messageId={MessageId} stepId={StepId} attempt={Attempt}; retrying the DELIVERED write.",
-                    messageId,
-                    stepId,
-                    attempt);
-                try
-                {
-                    await Task.Delay(DeliveredWriteRetryDelay * attempt, cancellationToken);
-                }
-                catch (OperationCanceledException cancelled)
-                {
-                    NoteStoreFailure(messageId, cancelled);
-                    throw;
-                }
+                failure = ex;
             }
         }
-    }
 
-    // Recorded next to the step observations, outside the exception the
-    // handler sees, so a handler that swallows the exception and returns
-    // success can't get the message recorded COMPLETED.
-    private void NoteStoreFailure(string messageId, Exception failure) =>
-        observations.NoteStoreFailure(messageId, PlatformStoreFailures.IsOutage(failure));
+        logger.LogError(
+            failure,
+            "Step ledger could not record a delivered step messageId={MessageId} stepId={StepId} attempts={Attempts}; the step was not recorded FAILED.",
+            messageId,
+            stepId,
+            tries);
+        ExceptionDispatchInfo.Throw(failure);
+    }
 
     private static bool IsCallerCancellation(Exception exception, CancellationToken cancellationToken) =>
         exception is OperationCanceledException && cancellationToken.IsCancellationRequested;
@@ -524,7 +625,7 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
         }
     }
 
-    private void Observe(string messageId, string stepId, string status, string idempotencyKey, string endpointUri, string? targetRef, string? error)
+    private void Observe(string messageId, string stepId, string status, string idempotencyKey, string endpointUri, string? targetRef, string? error, DateTimeOffset? occurredAt = null)
     {
         observations.Record(messageId, new PlatformStepObservation(
             stepId,
@@ -533,7 +634,7 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
             endpointUri,
             targetRef,
             error,
-            DateTimeOffset.UtcNow));
+            occurredAt ?? DateTimeOffset.UtcNow));
     }
 
     internal static bool ShouldRedo(PlatformMessage message, string stepId, string idempotencyKey, ILogger logger)
@@ -607,6 +708,7 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
         string endpointUri,
         string? targetRef,
         string? error,
+        DateTimeOffset? occurredAt,
         CancellationToken cancellationToken)
     {
         await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
@@ -634,7 +736,7 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
                 @endpoint_uri,
                 @target_ref,
                 @error,
-                now(),
+                coalesce(@occurred_at, now()),
                 now()
             )
             on conflict (idempotency_key) do update
@@ -658,8 +760,18 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
         command.Parameters.AddWithValue("endpoint_uri", endpointUri);
         PlatformMessageStore.AddNullableText(command, "target_ref", targetRef);
         PlatformMessageStore.AddNullableText(command, "error", error);
+        // The time of the send for an outcome written later from its mark.
+        command.Parameters.Add("occurred_at", NpgsqlTypes.NpgsqlDbType.TimestampTz).Value =
+            occurredAt.HasValue ? occurredAt.Value : DBNull.Value;
         await command.ExecuteNonQueryAsync(cancellationToken);
-        await transaction.CommitAsync(cancellationToken);
-        confirmation.ThrowIfUnconfirmed();
+        await confirmation.CommitAsync(transaction, cancellationToken);
     }
 }
+
+/// <summary>
+/// A step that is not sent because an earlier step outcome check or write of
+/// the same processing failed: nothing the processing does can be committed,
+/// and the record is read again.
+/// </summary>
+internal sealed class PlatformStepNotSentException(Exception storeFailure)
+    : Exception("Not sent: a step outcome of this message's processing was not checked or recorded, so the record is read again.", storeFailure);

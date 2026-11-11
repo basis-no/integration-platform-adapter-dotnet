@@ -21,19 +21,53 @@
   leaves the two timeouts to the database, role or connection settings;
   `client_min_messages=warning` is set either way.
 
-- A step ledger failure that says the store is unavailable (a timeout, a lock
-  timeout, a lost connection, SQLSTATE classes 08, 53, 57 and 58) now ends the
-  handler invocation at once: the adapter no longer retries the handler,
-  which would send its steps again, and no longer parks the message while
-  the store fails. A ledger call refused for its data, or cancelled by the
-  handler's own token, is still retried and parked.
+- A step ledger failure now ends the processing of its record at once,
+  whatever the cause: the adapter no longer retries the handler, which would
+  send its steps again, every later step of that processing throws before
+  its operation runs, and the record is read again without being parked,
+  unless the store refused the record's own data (see below). Before, a
+  read-only store (`25006`), a lost grant (`42501`, class `28`), a schema
+  mismatch (another class `42`, class `23`) or a ledger call cut short by the
+  handler's own token got the handler retried and the message parked, while
+  recording the parked message failed the same way. The ERROR lines for a
+  record that is not committed end with `storeError=<class>`
+  (`record-data`, `read-only`, `privilege`, `schema` or `unavailable`) and its
+  SQLSTATE, as in the Camel adapter.
+
+- A step whose `DELIVERED` outcome could not be written is not sent again on
+  its record's next read in the same process. The write is tried again in
+  place up to 3 more times, after 0.5, 1 and 2 seconds and none after 10
+  seconds, then kept in memory for the record, and the next read writes it
+  before the ledger check instead of calling the receiver. A record without
+  `x-bip-message-id` keeps its generated id while it is read again. Before,
+  with a Message Store that could be read but not written, every read called
+  the receiver again, once per handler attempt, without end. A restart or a
+  rebalance still loses the kept outcomes, so the next read in another
+  process can call once more. While the store refuses writes, a step takes up
+  to about 3.5 seconds longer.
+
+- A Kafka record whose envelope values the Message Store cannot hold is parked
+  and recorded without them, and committed, instead of blocking its partition.
+  Before the handler runs, `x-bip-message-id`, `x-bip-correlation-id`,
+  `x-bip-content-type`, `x-bip-source-system` and `x-bip-target-system` are
+  refused when they contain a NUL byte or are longer than 1,024 bytes, and so
+  is the record key when it becomes the correlation id. A step outcome or
+  outcome write that fails for the record's own data (SQLSTATE class `22`,
+  `54000`) takes the same path. A refused `x-bip-message-id` is replaced by an
+  id derived from the record's position, the same in the Camel adapter. After
+  three records in a row on a partition whose data the store refused, the next
+  one is held back. A failure text with U+0000 is stored with U+FFFD. Upgrade:
+  an envelope value over 1,024 bytes, which the store accepted before, is now
+  refused and its record parked.
 
 - A write whose commit the store reports done only with a warning, as when a
   synchronous replication wait is cancelled, is treated as failed: no offset
   commit, step skip or replay produce follows it, and the outcome write is
-  retried in place (three attempts). Before, Npgsql returned normally and the
-  adapter committed the offset for an outcome that existed on the primary
-  only.
+  retried in place (three attempts). Any warning the commit itself reports
+  counts, whatever its SQLSTATE, and the failure has SQLSTATE `08007`, so a
+  warning is never taken for the record's own data. Before, Npgsql returned
+  normally and the adapter committed the offset for an outcome that existed
+  on the primary only.
 
 - The registered `IProducer<string, byte[]>` partitions keyed records with
   `murmur2_random`, as Java Kafka clients do, instead of the .NET client's
@@ -56,9 +90,9 @@
 
 - A handler that catches a step ledger failure and returns success no longer
   gets the message recorded `COMPLETED`: the adapter notes the store failure
-  next to the step observations and processes the delivery again, without
-  parking it, also when the ledger call was cancelled by the handler's own
-  token. Before, a step that never ran could be recorded as completed.
+  outside the exception and processes the delivery again, without parking it,
+  also when the ledger call was cancelled by the handler's own token. Before,
+  a step that never ran could be recorded as completed.
 
 - Startup refuses a Message Store that lacks a table or column of the store
   schema the adapter ships, for each table this configuration uses: the

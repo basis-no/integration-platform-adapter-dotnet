@@ -11,7 +11,7 @@ using Microsoft.Extensions.DependencyInjection;
 namespace Basis.IntegrationPlatform.MessageStore.Tests;
 
 [TestClass]
-public sealed class PlatformMessageStorePostgresTests
+public sealed partial class PlatformMessageStorePostgresTests
 {
     private static string RequireConnectionString()
     {
@@ -2320,10 +2320,11 @@ public sealed class PlatformMessageStorePostgresTests
         var committed = false;
         var started = System.Diagnostics.Stopwatch.StartNew();
 
-        var error = await Assert.ThrowsExactlyAsync<PostgresException>(
+        var error = await Assert.ThrowsExactlyAsync<PlatformRecordHeldBackException>(
             () => service.ProcessAsync(message, () => committed = true, CancellationToken.None));
 
         Assert.AreEqual(PostgresErrorCodes.LockNotAvailable, error.SqlState);
+        Assert.AreEqual(PlatformStoreErrorClass.Unavailable, error.ErrorClass);
         Assert.IsTrue(started.Elapsed < TimeSpan.FromSeconds(15), started.Elapsed.ToString());
         Assert.IsFalse(committed, "A record that timed out commits nothing.");
         await transaction.RollbackAsync();
@@ -2398,6 +2399,8 @@ public sealed class PlatformMessageStorePostgresTests
             var steps = LedgerTestExecutor(dataSource, observations);
             var messageId = $"dotnet-test-{Guid.NewGuid():N}";
             var sends = 0;
+            var delivery = new PlatformDelivery(null, null);
+            delivery.Begin();
 
             var result = await steps.ExecuteAsync(
                 CreateMessage(messageId, options), "deliver", "https://target.example/orders", "target",
@@ -2407,20 +2410,23 @@ public sealed class PlatformMessageStorePostgresTests
             Assert.AreEqual(1, sends, "The call that succeeded is not made again.");
             Assert.AreEqual("DELIVERED", await StepStatusAsync(dataSource, $"{messageId}:deliver"));
             Assert.AreEqual("DELIVERED", observations.Snapshot(messageId).Single().Status);
-            Assert.IsFalse(observations.StoreFailedInCurrentInvocation(messageId));
+            Assert.IsNull(delivery.StoreFailure);
         });
     }
 
     [TestMethod]
     public async Task DeliveredWriteThatKeepsFailingNeverRecordsFailed()
     {
-        // Every DELIVERED attempt fails; a further write would succeed and show.
-        await WithFailingLedgerAsync(failures: 3, async (dataSource, options) =>
+        // Every DELIVERED try fails (the first and three in place); a further
+        // write would succeed and show.
+        await WithFailingLedgerAsync(failures: 4, async (dataSource, options) =>
         {
             var observations = new PlatformStepObservationCollector();
             var steps = LedgerTestExecutor(dataSource, observations);
             var messageId = $"dotnet-test-{Guid.NewGuid():N}";
             var sends = 0;
+            var delivery = new PlatformDelivery(null, null);
+            delivery.Begin();
 
             await Assert.ThrowsExactlyAsync<PostgresException>(() => steps.ExecuteAsync(
                 CreateMessage(messageId, options), "deliver", "https://target.example/orders", "target",
@@ -2429,7 +2435,7 @@ public sealed class PlatformMessageStorePostgresTests
             Assert.AreEqual(1, sends);
             Assert.IsNull(await StepStatusAsync(dataSource, $"{messageId}:deliver"), "No FAILED row for a call that succeeded.");
             Assert.AreEqual("DELIVERED", observations.Snapshot(messageId).Single().Status);
-            Assert.IsTrue(observations.StoreFailedInCurrentInvocation(messageId));
+            Assert.IsInstanceOfType<PostgresException>(delivery.StoreFailure);
         });
     }
 
@@ -2468,10 +2474,12 @@ public sealed class PlatformMessageStorePostgresTests
             var messageId = $"dotnet-test-{Guid.NewGuid():N}";
             var committed = false;
 
-            var error = await Assert.ThrowsExactlyAsync<InvalidOperationException>(
+            var error = await Assert.ThrowsExactlyAsync<PlatformRecordHeldBackException>(
                 () => service.ProcessAsync(CreateMessage(messageId, options), () => committed = true, CancellationToken.None));
 
-            StringAssert.Contains(error.Message, "step ledger");
+            StringAssert.Contains(error.Reason, "a step outcome was not checked or recorded");
+            Assert.AreEqual(PlatformStoreErrorClass.Schema, error.ErrorClass, "A missing table is the schema's fault.");
+            Assert.AreEqual(PostgresErrorCodes.UndefinedTable, error.SqlState);
             Assert.IsFalse(committed);
             Assert.AreEqual(0, sends);
             Assert.IsNull(await LogStatusAsync(dataSource, messageId), "Nothing is recorded COMPLETED.");
@@ -2482,10 +2490,10 @@ public sealed class PlatformMessageStorePostgresTests
     [TestMethod]
     public async Task ALedgerFailureEndsTheAttemptWithoutRetriesOrParkingAndTheRedeliveryCompletes()
     {
-        // The first delivery's DELIVERED write fails on every attempt and the
+        // The first delivery's DELIVERED write fails on every try and the
         // handler reports a failure: no in-process retry sends again, nothing
         // is parked or committed. The redelivery records it.
-        await WithFailingLedgerAsync(failures: 3, async (dataSource, options) =>
+        await WithFailingLedgerAsync(failures: 4, async (dataSource, options) =>
         {
             options.MaxHandlerAttempts = 3;
             options.HandlerRetryDelayMs = 0;
@@ -2510,7 +2518,7 @@ public sealed class PlatformMessageStorePostgresTests
             var message = CreateMessage($"dotnet-test-{Guid.NewGuid():N}", options);
             var commits = 0;
 
-            await Assert.ThrowsExactlyAsync<InvalidOperationException>(
+            await Assert.ThrowsExactlyAsync<PlatformRecordHeldBackException>(
                 () => service.ProcessAsync(message, () => commits++, CancellationToken.None));
             Assert.AreEqual(1, handler.Calls.Count, "A store failure ends the attempt without in-process retries.");
             Assert.AreEqual(0, commits);
@@ -2520,7 +2528,7 @@ public sealed class PlatformMessageStorePostgresTests
             await service.ProcessAsync(message, () => commits++, CancellationToken.None);
 
             Assert.AreEqual(1, commits);
-            Assert.AreEqual(2, sends, "No DELIVERED row after the first delivery, so the redelivery sends again.");
+            Assert.AreEqual(2, sends, "No DELIVERED row after the first delivery and no record position for a mark, so the redelivery sends again.");
             Assert.AreEqual("COMPLETED", await LogStatusAsync(dataSource, message.MessageId));
             Assert.AreEqual("DELIVERED", await StepStatusAsync(dataSource, $"{message.MessageId}:deliver"));
         });
@@ -2535,7 +2543,7 @@ public sealed class PlatformMessageStorePostgresTests
     public async Task HandlerThatSwallowsALedgerWriteFailureIsNotRecordedCompleted(string path)
     {
         var locked = path.EndsWith("-lock", StringComparison.Ordinal);
-        await WithFailingLedgerAsync(failures: locked ? 0 : path == "delivered-write" ? 3 : 100, async (dataSource, options) =>
+        await WithFailingLedgerAsync(failures: locked ? 0 : path == "delivered-write" ? 4 : 100, async (dataSource, options) =>
         {
             // Another session holds the ledger table, so the ledger call hangs
             // until the handler's own timeout cancels it.
@@ -2589,7 +2597,7 @@ public sealed class PlatformMessageStorePostgresTests
             var messageId = $"dotnet-test-{Guid.NewGuid():N}";
             var committed = false;
 
-            await Assert.ThrowsExactlyAsync<InvalidOperationException>(
+            await Assert.ThrowsExactlyAsync<PlatformRecordHeldBackException>(
                 () => service.ProcessAsync(CreateMessage(messageId, options), () => committed = true, CancellationToken.None));
 
             Assert.AreEqual(path == "handler-timeout-read-lock" ? 0 : 1, sends);
@@ -2639,7 +2647,7 @@ public sealed class PlatformMessageStorePostgresTests
         NpgsqlDataSource dataSource, PlatformStepObservationCollector observations, TimeSpan? retryDelay = null) =>
         new(dataSource, observations, NullLogger<PlatformStepExecutor>.Instance)
         {
-            DeliveredWriteRetryDelay = retryDelay ?? TimeSpan.Zero,
+            DeliveredWriteRetryWaits = Enumerable.Repeat(retryDelay ?? TimeSpan.Zero, 3).ToArray(),
         };
 
     // Runs the test against a store in its own schema whose first `failures`
@@ -2712,7 +2720,7 @@ public sealed class PlatformMessageStorePostgresTests
             };
             var steps = new PlatformStepExecutor(dataSource, observations, NullLogger<PlatformStepExecutor>.Instance)
             {
-                DeliveredWriteRetryDelay = TimeSpan.Zero,
+                DeliveredWriteRetryWaits = [TimeSpan.Zero, TimeSpan.Zero, TimeSpan.Zero],
                 UsesPostgresServerTimeouts = options.UsesPostgresServerTimeouts,
             };
             var handler = new DelegateHandler((_, _) => Task.FromResult(PlatformMessageResult.Completed()));
@@ -2720,29 +2728,33 @@ public sealed class PlatformMessageStorePostgresTests
             var message = CreateMessage($"dotnet-test-{Guid.NewGuid():N}", options);
             var committed = false;
 
-            await Assert.ThrowsExactlyAsync<PlatformCommitUnconfirmedException>(
+            var heldBack = await Assert.ThrowsExactlyAsync<PlatformRecordHeldBackException>(
                 () => service.ProcessAsync(message, () => committed = true, CancellationToken.None));
+            Assert.IsInstanceOfType<PlatformCommitUnconfirmedException>(heldBack.InnerException);
+            // Whatever the warning's own SQLSTATE: never the record's own data.
+            Assert.AreEqual("08007", heldBack.SqlState);
+            Assert.AreEqual(PlatformStoreErrorClass.Unavailable, heldBack.ErrorClass);
             Assert.IsFalse(committed, "No offset is committed for an outcome that is on the primary only.");
             Assert.AreEqual(1, handler.Calls.Count, "The outcome write is retried in place; the handler is not run again.");
 
             var stepMessage = CreateMessage($"dotnet-test-{Guid.NewGuid():N}", options);
+            var delivery = new PlatformDelivery(null, null);
+            delivery.Begin();
             await Assert.ThrowsExactlyAsync<PlatformCommitUnconfirmedException>(() => steps.ExecuteAsync(
                 stepMessage, "deliver", "https://target.example/orders", "target", _ => Task.CompletedTask, CancellationToken.None));
-            Assert.IsTrue(observations.StoreFailedInCurrentInvocation(stepMessage.MessageId), "An unconfirmed DELIVERED write is a store failure.");
+            Assert.IsInstanceOfType<PlatformCommitUnconfirmedException>(delivery.StoreFailure, "An unconfirmed DELIVERED write is a store failure.");
         });
     }
 
     [TestMethod]
     [DataRow("delivered-write-data")]
     [DataRow("failed-write-data")]
-    [DataRow("handler-own-timeout")]
-    public async Task ALedgerFailureThatIsNotAnOutageIsRetriedAndParkedAsBefore(string cause)
+    public async Task ALedgerWriteRefusedForTheRecordsOwnDataParksTheMessageOnceWithoutRetries(string cause)
     {
-        // The store is healthy: the ledger refuses this call's data, or the
-        // handler's own timeout cancels it. Retrying the delivery would fail
-        // the same way, so the message is parked rather than looping.
         // 22021 (invalid byte sequence): the ledger refuses the row's data.
-        await WithFailingLedgerAsync(failures: cause == "handler-own-timeout" ? 0 : 100, async (dataSource, options) =>
+        // Neither a handler retry nor a read again could store it, so the
+        // message is parked once, with a reduced outcome, and committed.
+        await WithFailingLedgerAsync(failures: 100, async (dataSource, options) =>
         {
             options.MaxHandlerAttempts = 2;
             options.HandlerRetryDelayMs = 0;
@@ -2752,22 +2764,11 @@ public sealed class PlatformMessageStorePostgresTests
             var sends = 0;
             var handler = new DelegateHandler(async (message, ct) =>
             {
-                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                await steps.ExecuteAsync(message, "deliver", "https://target.example/orders", "target", async stepToken =>
+                await steps.ExecuteAsync(message, "deliver", "https://target.example/orders", "target", _ =>
                     {
                         sends++;
-                        if (cause == "failed-write-data")
-                        {
-                            throw new HttpRequestException("synthetic receiver failure");
-                        }
-
-                        if (cause == "handler-own-timeout")
-                        {
-                            timeout.Cancel();
-                        }
-
-                        await Task.CompletedTask;
-                    }, cause == "handler-own-timeout" ? timeout.Token : ct);
+                        return cause == "failed-write-data" ? throw new HttpRequestException("synthetic receiver failure") : Task.CompletedTask;
+                    }, ct);
                 return PlatformMessageResult.Completed();
             });
             var producer = new FakeProducer();
@@ -2777,11 +2778,56 @@ public sealed class PlatformMessageStorePostgresTests
 
             await service.ProcessAsync(message, () => commits++, CancellationToken.None);
 
-            Assert.AreEqual(2, handler.Calls.Count, "Retried in process as before.");
-            Assert.AreEqual(1, producer.Produced.Count, "Parked as before.");
+            Assert.AreEqual(1, handler.Calls.Count, "A store failure ends the attempt without in-process retries.");
+            Assert.AreEqual(1, sends);
+            Assert.AreEqual(1, producer.Produced.Count, "Parked once.");
+            StringAssert.Contains(
+                PlatformMessageConsumerService.ReadHeaders(producer.Produced[0].Message.Headers)["x-bip-error"],
+                cause == "delivered-write-data"
+                    ? "a step outcome of the record (SQLSTATE 22021); the send of step deliver had returned, its outcome not recorded"
+                    : "a step outcome of the record (SQLSTATE 22021); no send of the attempt had returned without a recorded outcome");
             Assert.AreEqual(1, commits);
             Assert.AreEqual("DLQ", await LogStatusAsync(dataSource, message.MessageId));
         }, sqlState: "22021");
+    }
+
+    [TestMethod]
+    public async Task ALedgerWriteCutShortByTheHandlersOwnTokenHoldsTheRecordBack()
+    {
+        // The handler's own timeout cancels the DELIVERED write. The store did
+        // not answer in time, as in an outage: nothing is parked or committed,
+        // and the record is read again.
+        await WithFailingLedgerAsync(failures: 0, async (dataSource, options) =>
+        {
+            options.MaxHandlerAttempts = 2;
+            options.HandlerRetryDelayMs = 0;
+            var observations = new PlatformStepObservationCollector();
+            var store = new PlatformMessageStore(dataSource, observations, Options.Create(options), NullLogger<PlatformMessageStore>.Instance);
+            var steps = LedgerTestExecutor(dataSource, observations);
+            var handler = new DelegateHandler(async (message, ct) =>
+            {
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                await steps.ExecuteAsync(message, "deliver", "https://target.example/orders", "target", _ =>
+                    {
+                        timeout.Cancel();
+                        return Task.CompletedTask;
+                    }, timeout.Token);
+                return PlatformMessageResult.Completed();
+            });
+            var producer = new FakeProducer();
+            using var service = CreateConsumerService(handler, store, observations, producer, options);
+            var message = CreateMessage($"dotnet-test-{Guid.NewGuid():N}", options);
+            var commits = 0;
+
+            var heldBack = await Assert.ThrowsExactlyAsync<PlatformRecordHeldBackException>(
+                () => service.ProcessAsync(message, () => commits++, CancellationToken.None));
+
+            Assert.AreEqual(PlatformStoreErrorClass.Unavailable, heldBack.ErrorClass);
+            Assert.AreEqual(1, handler.Calls.Count);
+            Assert.AreEqual(0, producer.Produced.Count);
+            Assert.AreEqual(0, commits);
+            Assert.IsNull(await LogStatusAsync(dataSource, message.MessageId));
+        });
     }
 
     [TestMethod]
@@ -2810,7 +2856,7 @@ public sealed class PlatformMessageStorePostgresTests
 
             var committed = false;
             var started = System.Diagnostics.Stopwatch.StartNew();
-            await Assert.ThrowsExactlyAsync<InvalidOperationException>(
+            await Assert.ThrowsExactlyAsync<PlatformRecordHeldBackException>(
                 () => service.ProcessAsync(CreateMessage($"dotnet-test-{Guid.NewGuid():N}", options), () => committed = true, CancellationToken.None));
 
             Assert.IsTrue(started.Elapsed < TimeSpan.FromSeconds(15), started.Elapsed.ToString());
@@ -2822,17 +2868,31 @@ public sealed class PlatformMessageStorePostgresTests
     }
 
     [TestMethod]
-    [DataRow("57P03", true)]
-    [DataRow("08006", true)]
-    [DataRow("53300", true)]
-    [DataRow("55P03", true)]
-    [DataRow("57014", true)]
-    [DataRow("22021", false)]
-    [DataRow("23505", false)]
-    [DataRow("42P01", false)]
-    public void StoreFailuresAreOutagesByTheirClass(string sqlState, bool outage)
+    [DataRow("22021", "record-data")]
+    [DataRow("22P05", "record-data")]
+    [DataRow("54000", "record-data")]
+    [DataRow("25006", "read-only")]
+    [DataRow("42501", "privilege")]
+    [DataRow("28P01", "privilege")]
+    [DataRow("42P01", "schema")]
+    [DataRow("42703", "schema")]
+    [DataRow("23505", "schema")]
+    [DataRow("3D000", "schema")]
+    [DataRow("3F000", "schema")]
+    [DataRow("57P03", "unavailable")]
+    [DataRow("08006", "unavailable")]
+    [DataRow("53300", "unavailable")]
+    [DataRow("55P03", "unavailable")]
+    [DataRow("57014", "unavailable")]
+    [DataRow("40P01", "unavailable")]
+    [DataRow("08007", "unavailable")]
+    public void StoreFailuresAreClassifiedByTheirSqlState(string sqlState, string expected)
     {
-        Assert.AreEqual(outage, PlatformStoreFailures.IsOutage(new PostgresException("synthetic", "ERROR", "ERROR", sqlState)));
+        var failure = new PostgresException("synthetic", "ERROR", "ERROR", sqlState);
+        Assert.AreEqual(expected, PlatformStoreFailures.Classify(failure).Label());
+        // The outermost exception in the chain that has a SQLSTATE decides.
+        Assert.AreEqual(expected, PlatformStoreFailures.Classify(new InvalidOperationException("wrapped", failure)).Label());
+        Assert.AreEqual(sqlState, PlatformStoreFailures.SqlState(new InvalidOperationException("wrapped", failure)));
     }
 
     // Makes the test server wait for a synchronous standby that does not
