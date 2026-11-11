@@ -13,8 +13,8 @@
   its own with the plain connection string. The server-side ones are set in
   each Message Store transaction for that transaction alone, as the Camel
   adapter does, together with `client_min_messages=warning` so that a role
-  setting can't hide the warning of an unconfirmed commit; every store
-  statement runs in such a transaction. Nothing is added to the startup
+  setting can't hide the warning of an unconfirmed commit (also with the
+  timeouts switched off); every store statement runs in such a transaction. Nothing is added to the startup
   `options`, so they also apply behind a pooler such as PgBouncer, which
   drops that parameter or refuses it with `08P01`, and a pooled connection
   keeps none of them. `BASIS_MESSAGE_STORE_POSTGRES_SERVER_TIMEOUTS=off`

@@ -2284,7 +2284,7 @@ public sealed class PlatformMessageStorePostgresTests
         CollectionAssert.AreEquivalent(
             new[] { "bip_message_attempt", "bip_message_log", "bip_message_replay_audit", "bip_step_outcome" },
             seen.Select(write => write.Table).Distinct().ToArray());
-        var expected = serverTimeouts == "on" ? ("15s", "5s", "warning") : session;
+        var expected = serverTimeouts == "on" ? ("15s", "5s", "warning") : (session.Item1, session.Item2, "warning");
         foreach (var write in seen)
         {
             Assert.AreEqual(expected, write.Settings, $"{write.Table} with server timeouts {serverTimeouts}");
@@ -2342,6 +2342,8 @@ public sealed class PlatformMessageStorePostgresTests
     // For the duration of the test, each insert or update of a message whose
     // id starts with the prefix records the statement_timeout, lock_timeout
     // and client_min_messages in effect in the transaction that writes it.
+    // The triggers sit on the shared tables, which is safe because the tests
+    // run one at a time.
     private static async Task<List<(string Table, (string, string, string) Settings)>> SettingsSeenByWritesAsync(string messageIdPrefix, Func<Task> test)
     {
         var seen = $"seen_settings_{Guid.NewGuid():N}";
@@ -2685,19 +2687,22 @@ public sealed class PlatformMessageStorePostgresTests
     }
 
     [TestMethod]
-    [DataRow(null)]
-    [DataRow("-c client_min_messages=error")]
-    public async Task ACommitWhoseSynchronousReplicationWaitWasCancelledIsAFailedWrite(string? sessionOptions)
+    [DataRow(null, "on")]
+    [DataRow("-c client_min_messages=error", "on")]
+    [DataRow("-c client_min_messages=error", "off")]
+    public async Task ACommitWhoseSynchronousReplicationWaitWasCancelledIsAFailedWrite(string? sessionOptions, string serverTimeouts)
     {
         // A synchronous standby that never answers: every commit waits for it,
         // the client's command timeout cancels the wait, and PostgreSQL then
         // reports the commit done with only a warning, although it is on the
         // primary alone. statement_timeout does not end that wait. A session
         // whose client_min_messages hides warnings still gets that one: the
-        // store's transactions set it to warning.
+        // store's transactions set it to warning, with the server timeouts
+        // switched off too.
         await WithUnansweredSynchronousStandbyAsync(async () =>
         {
             var options = CreateOptions(new NpgsqlConnectionStringBuilder(RequireConnectionString()) { Options = sessionOptions }.ConnectionString);
+            options.PostgresServerTimeouts = serverTimeouts;
             await using var dataSource = NpgsqlDataSource.Create(
                 new NpgsqlConnectionStringBuilder(PlatformStoreTimeouts.Apply(options.PostgresConnectionString)) { CommandTimeout = 1 }.ConnectionString);
             var observations = new PlatformStepObservationCollector();
@@ -2708,6 +2713,7 @@ public sealed class PlatformMessageStorePostgresTests
             var steps = new PlatformStepExecutor(dataSource, observations, NullLogger<PlatformStepExecutor>.Instance)
             {
                 DeliveredWriteRetryDelay = TimeSpan.Zero,
+                UsesPostgresServerTimeouts = options.UsesPostgresServerTimeouts,
             };
             var handler = new DelegateHandler((_, _) => Task.FromResult(PlatformMessageResult.Completed()));
             using var service = CreateConsumerService(handler, store, observations, new FakeProducer(), options);

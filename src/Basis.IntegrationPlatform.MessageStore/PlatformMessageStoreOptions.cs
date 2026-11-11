@@ -44,7 +44,8 @@ public sealed class PlatformMessageStoreOptions
     /// Whether each Message Store transaction sets the server-side statement
     /// and lock timeouts for itself: <c>on</c> (the default) or <c>off</c>, to
     /// leave them to the database, role or connection settings. The
-    /// client-side timeouts apply either way.
+    /// client-side timeouts, and the transaction's client_min_messages, apply
+    /// either way.
     /// </summary>
     public string PostgresServerTimeouts { get; set; } = Environment.GetEnvironmentVariable("BASIS_MESSAGE_STORE_POSTGRES_SERVER_TIMEOUTS") ?? "on";
 

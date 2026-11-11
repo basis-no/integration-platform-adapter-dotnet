@@ -406,7 +406,7 @@ TLS, set these through your deployment's secret and runtime configuration:
 | `BASIS_MESSAGE_STORE_POSTGRES_MAX_POOL_SIZE` | Optional bounded pool size for JDBC-derived settings; previous Npgsql default if unset |
 | `BASIS_MESSAGE_STORE_POSTGRES_SSL_MODE` | Optional Npgsql TLS mode, e.g. `VerifyFull` |
 | `BASIS_MESSAGE_STORE_POSTGRES_ROOT_CERTIFICATE` | Mounted PostgreSQL CA file |
-| `BASIS_MESSAGE_STORE_POSTGRES_SERVER_TIMEOUTS` | `on`: each Message Store transaction sets its own statement and lock timeouts; `off` sets none and leaves them to the database, role or connection settings |
+| `BASIS_MESSAGE_STORE_POSTGRES_SERVER_TIMEOUTS` | `on`: each Message Store transaction sets its own statement and lock timeouts; `off` sets neither and leaves them to the database, role or connection settings |
 
 The same Kafka client configuration covers consumption, DLQ and replay. TLS
 certificate and hostname verification stay enabled. Missing SASL credentials
@@ -461,15 +461,16 @@ adapter runs every store statement in such a transaction, a single read or
 write such as the contract check or a step ledger lookup too. So they reach
 the server through a connection pooler such as PgBouncer (in session or
 transaction mode), and a pooled connection goes back without them. The
-transaction also sets `client_min_messages=warning`, so that a role or
-database setting can't hide the warning of an unconfirmed commit.
+transaction also sets `client_min_messages=warning`, with the timeouts
+switched off too, so that a role or database setting can't hide the warning
+of an unconfirmed commit.
 
 The adapter adds nothing to the startup `options`, which a pooler may drop
 without a word or refuse with `08P01`, and leaves the connection string's own
 `Options` (or `PGOPTIONS`) as it is. With
 `BASIS_MESSAGE_STORE_POSTGRES_SERVER_TIMEOUTS=on`, the default, the adapter's
 values win in its transactions over a timeout set there or on the role. To
-use your own, set it to `off`: the transactions then set none of the three,
+use your own, set it to `off`: the transactions then set neither timeout,
 and the database, role or connection settings apply. The switch reaches the
 step executor through `AddBasisMessageStoreAdapter`; a `PlatformStepExecutor`
 constructed directly sets them. The client-side timeouts bound each call

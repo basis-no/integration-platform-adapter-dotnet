@@ -134,6 +134,7 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
     /// <summary>
     /// False with BASIS_MESSAGE_STORE_POSTGRES_SERVER_TIMEOUTS=off: the ledger's
     /// transactions set no server-side statement and lock timeouts.
+    /// client_min_messages is set either way.
     /// </summary>
     internal bool UsesPostgresServerTimeouts { get; init; } = true;
 

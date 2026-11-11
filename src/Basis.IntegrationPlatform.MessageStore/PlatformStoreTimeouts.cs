@@ -28,14 +28,17 @@ internal static class PlatformStoreTimeouts
     /// <summary>Server-side lock_timeout for each Message Store transaction, in milliseconds.</summary>
     internal const int LockTimeoutMs = 5_000;
 
-    // client_min_messages at warning: a role, database or connection setting
-    // of error would hide the warning of an unconfirmed synchronous commit,
-    // which would then count as confirmed (PlatformCommitConfirmation). The
-    // commit sends that warning before the transaction's settings end.
+    // client_min_messages at warning, with the timeouts switched off too: a
+    // role, database or connection setting of error would hide the warning of
+    // an unconfirmed synchronous commit, which would then count as confirmed
+    // (PlatformCommitConfirmation). The commit sends that warning before the
+    // transaction's settings end.
     private const string ServerSettingsSql =
         "select set_config('statement_timeout', @statement_timeout, true), " +
         "set_config('lock_timeout', @lock_timeout, true), " +
         "set_config('client_min_messages', 'warning', true)";
+
+    private const string WarningsOnlySql = "select set_config('client_min_messages', 'warning', true)";
 
     /// <summary>
     /// The connection string with each client-side timeout the deployment did
@@ -68,28 +71,27 @@ internal static class PlatformStoreTimeouts
     }
 
     /// <summary>
-    /// Begins a Message Store transaction. With <paramref name="serverTimeouts"/>
-    /// it first sets statement_timeout, lock_timeout and client_min_messages
-    /// for this transaction alone, as the Camel adapter does: a statement
-    /// reaches the server also through a pooler that drops or refuses startup
-    /// options, and the connection goes back to the pool without them. The
-    /// adapter runs every store statement in such a transaction, a single read
-    /// or write too, so each one gets them.
+    /// Begins a Message Store transaction. It first sets client_min_messages
+    /// and, with <paramref name="serverTimeouts"/>, statement_timeout and
+    /// lock_timeout for this transaction alone, as the Camel adapter does: a
+    /// statement reaches the server also through a pooler that drops or
+    /// refuses startup options, and the connection goes back to the pool
+    /// without them. The adapter runs every store statement in such a
+    /// transaction, a single read or write too, so each one gets them.
     /// </summary>
     internal static async Task<NpgsqlTransaction> BeginTransactionAsync(
         NpgsqlConnection connection, bool serverTimeouts, CancellationToken cancellationToken)
     {
         var transaction = await connection.BeginTransactionAsync(cancellationToken);
-        if (!serverTimeouts)
-        {
-            return transaction;
-        }
-
         try
         {
-            await using var command = new NpgsqlCommand(ServerSettingsSql, connection, transaction);
-            command.Parameters.AddWithValue("statement_timeout", $"{StatementTimeoutMs}ms");
-            command.Parameters.AddWithValue("lock_timeout", $"{LockTimeoutMs}ms");
+            await using var command = new NpgsqlCommand(serverTimeouts ? ServerSettingsSql : WarningsOnlySql, connection, transaction);
+            if (serverTimeouts)
+            {
+                command.Parameters.AddWithValue("statement_timeout", $"{StatementTimeoutMs}ms");
+                command.Parameters.AddWithValue("lock_timeout", $"{LockTimeoutMs}ms");
+            }
+
             await command.ExecuteNonQueryAsync(cancellationToken);
             return transaction;
         }
