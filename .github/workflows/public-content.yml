@@ -22,6 +22,9 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Test the check
+        run: python3 -I -m unittest discover -s .github/scripts
+
       - name: Select the new commits
         id: range
         env:
