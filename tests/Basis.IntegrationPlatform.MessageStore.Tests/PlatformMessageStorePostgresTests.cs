@@ -2161,22 +2161,140 @@ public sealed class PlatformMessageStorePostgresTests
     }
 
     [TestMethod]
-    public async Task StoreSessionsGetTheServerTimeouts()
+    [DataRow("on")]
+    [DataRow("off")]
+    public async Task EachStoreTransactionSetsTheServerTimeoutsForItselfAlone(string serverTimeouts)
     {
-        await using var dataSource = NpgsqlDataSource.Create(PlatformStoreTimeouts.Apply(RequireConnectionString()));
-        await using var connection = await dataSource.OpenConnectionAsync();
-        await using var command = new NpgsqlCommand("select current_setting('statement_timeout'), current_setting('lock_timeout')", connection);
-        await using var reader = await command.ExecuteReaderAsync();
-        Assert.IsTrue(await reader.ReadAsync());
-        Assert.AreEqual("15s", reader.GetString(0));
-        Assert.AreEqual("5s", reader.GetString(1));
+        await AssertEachStoreWriteRunsWithTheServerTimeoutsAsync(RequireConnectionString(), serverTimeouts);
     }
 
     [TestMethod]
     public async Task AHeldLockFailsTheRecordWithinTheLockTimeoutAndCommitsNothing()
     {
+        // A datasource without any server-side setting, as behind a pooler
+        // that drops the startup options: the store's own transaction sets the
+        // lock timeout.
         var options = CreateOptions(RequireConnectionString());
+        await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+        await AssertAHeldLockFailsTheRecordWithinTheLockTimeoutAsync(dataSource, options);
+    }
+
+    [TestMethod]
+    [DataRow("PGBOUNCER_IGNORING_OPTIONS_TEST_CONNECTION_STRING")]
+    [DataRow("PGBOUNCER_DEFAULT_TEST_CONNECTION_STRING")]
+    public async Task ThroughPgBouncerTheStoreConnectsAndItsTransactionsGetTheServerTimeouts(string variable)
+    {
+        // PgBouncer in session mode, with options in ignore_startup_parameters
+        // (it drops a startup options parameter without a word) or with its
+        // default settings (it refuses one with 08P01).
+        var poolerConnectionString = Environment.GetEnvironmentVariable(variable);
+        if (string.IsNullOrWhiteSpace(poolerConnectionString))
+        {
+            Assert.Inconclusive($"Set {variable} to run the PgBouncer tests.");
+        }
+
+        RequireConnectionString();
+        await AssertEachStoreWriteRunsWithTheServerTimeoutsAsync(poolerConnectionString!, "on");
+
+        var options = CreateOptions(poolerConnectionString!);
         await using var dataSource = NpgsqlDataSource.Create(PlatformStoreTimeouts.Apply(options.PostgresConnectionString));
+        await AssertAHeldLockFailsTheRecordWithinTheLockTimeoutAsync(dataSource, options);
+    }
+
+    [TestMethod]
+    [DataRow("contract gate")]
+    [DataRow("resend load")]
+    public async Task AStoreReadEndsItsLockWaitAtTheLockTimeout(string read)
+    {
+        await WithStoreSchemaAsync(
+            """
+            create table {0}.bip_contract (like public.bip_contract including all);
+            insert into {0}.bip_contract select * from public.bip_contract;
+            create table {0}.bip_message_log (like public.bip_message_log including all);
+            create table {0}.bip_message_attempt (like public.bip_message_attempt including all);
+            """,
+            async connectionString =>
+            {
+                var options = CreateOptions(connectionString);
+                options.ContractGateMaxAttempts = 1;
+                await using var dataSource = NpgsqlDataSource.Create(options.PostgresConnectionString);
+                var (store, _, _, _) = CreateStore(dataSource, options);
+                var messageId = $"dotnet-test-{Guid.NewGuid():N}";
+                await store.RecordAttemptAsync(CreateMessage(messageId, options), "dotnet-handler", "COMPLETED", null, CancellationToken.None);
+
+                // A migration that holds the table, say.
+                await using var holder = await dataSource.OpenConnectionAsync();
+                await using var holding = await holder.BeginTransactionAsync();
+                var table = read == "contract gate" ? "bip_contract" : "bip_message_log";
+                await using (var hold = new NpgsqlCommand($"lock table {table} in access exclusive mode", holder, holding))
+                {
+                    await hold.ExecuteNonQueryAsync();
+                }
+
+                var started = System.Diagnostics.Stopwatch.StartNew();
+                var error = read == "contract gate"
+                    ? (await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => store.VerifyContractAsync(CancellationToken.None))).InnerException
+                    : await Assert.ThrowsExactlyAsync<PostgresException>(() => store.ReplayAsync(
+                        messageId, new MessageReplayRequest("operator", "re-run"), new FakeProducer(), CancellationToken.None));
+
+                Assert.AreEqual(PostgresErrorCodes.LockNotAvailable, (error as PostgresException)?.SqlState, error?.ToString());
+                Assert.IsTrue(started.Elapsed < TimeSpan.FromSeconds(15), started.Elapsed.ToString());
+                await holding.RollbackAsync();
+            });
+    }
+
+    // Runs each kind of Message Store write through the registered adapter
+    // (the outcome record, the step ledger, a resend's audit rows) and checks
+    // the settings each one ran with, and that the pooled session keeps none.
+    private static async Task AssertEachStoreWriteRunsWithTheServerTimeoutsAsync(string connectionString, string serverTimeouts)
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddBasisMessageStoreAdapter<SyntheticHandler>(options =>
+        {
+            options.ApplicationName = "integration-e2e-dotnet";
+            options.EnvironmentName = "dev";
+            options.Tenant = "demo";
+            options.KafkaBootstrapServers = "unused:9092";
+            options.InputTopic = "bip.integration-e2e-dotnet.in";
+            options.ReplayInputTopicPattern = "bip.%s.in";
+            options.PostgresConnectionString = connectionString;
+            options.PostgresServerTimeouts = serverTimeouts;
+        });
+        await using var provider = services.BuildServiceProvider();
+        var store = provider.GetRequiredService<PlatformMessageStore>();
+        var steps = provider.GetRequiredService<IPlatformStepExecutor>();
+        var dataSource = provider.GetRequiredKeyedService<NpgsqlDataSource>(PlatformMessageStoreExtensions.MessageStoreDataSourceKey);
+        var options = provider.GetRequiredService<IOptions<PlatformMessageStoreOptions>>().Value;
+        await using var plain = NpgsqlDataSource.Create(connectionString);
+        var session = await SessionSettingsAsync(plain);
+        var prefix = $"dotnet-seen-{Guid.NewGuid():N}";
+        var message = CreateMessage($"{prefix}-1", options);
+
+        var seen = await SettingsSeenByWritesAsync(prefix, async () =>
+        {
+            await store.VerifyContractAsync(CancellationToken.None);
+            await store.RecordAttemptAsync(message, "dotnet-handler", "RECEIVED", null, CancellationToken.None);
+            await steps.ExecuteAsync(message, "deliver", "https://target.example/orders", "target", _ => Task.CompletedTask, CancellationToken.None);
+            await store.RecordAttemptAsync(message, "dotnet-handler", "COMPLETED", null, CancellationToken.None);
+            var replay = await store.ReplayAsync(message.MessageId, new MessageReplayRequest("operator", "re-run"), new FakeProducer(), CancellationToken.None);
+            Assert.AreEqual("PUBLISHED", replay.Status);
+        });
+
+        CollectionAssert.AreEquivalent(
+            new[] { "bip_message_attempt", "bip_message_log", "bip_message_replay_audit", "bip_step_outcome" },
+            seen.Select(write => write.Table).Distinct().ToArray());
+        var expected = serverTimeouts == "on" ? ("15s", "5s", "warning") : session;
+        foreach (var write in seen)
+        {
+            Assert.AreEqual(expected, write.Settings, $"{write.Table} with server timeouts {serverTimeouts}");
+        }
+
+        Assert.AreEqual(session, await SessionSettingsAsync(dataSource), "A pooled connection keeps no setting of the adapter's.");
+    }
+
+    private static async Task AssertAHeldLockFailsTheRecordWithinTheLockTimeoutAsync(NpgsqlDataSource dataSource, PlatformMessageStoreOptions options)
+    {
         var observations = new PlatformStepObservationCollector();
         // One write, so the test measures one lock wait.
         var store = new PlatformMessageStore(dataSource, observations, Options.Create(options), NullLogger<PlatformMessageStore>.Instance)
@@ -2209,6 +2327,64 @@ public sealed class PlatformMessageStorePostgresTests
         Assert.IsTrue(started.Elapsed < TimeSpan.FromSeconds(15), started.Elapsed.ToString());
         Assert.IsFalse(committed, "A record that timed out commits nothing.");
         await transaction.RollbackAsync();
+    }
+
+    private static async Task<(string, string, string)> SessionSettingsAsync(NpgsqlDataSource dataSource)
+    {
+        await using var connection = await dataSource.OpenConnectionAsync();
+        await using var command = new NpgsqlCommand(
+            "select current_setting('statement_timeout'), current_setting('lock_timeout'), current_setting('client_min_messages')", connection);
+        await using var reader = await command.ExecuteReaderAsync();
+        Assert.IsTrue(await reader.ReadAsync());
+        return (reader.GetString(0), reader.GetString(1), reader.GetString(2));
+    }
+
+    // For the duration of the test, each insert or update of a message whose
+    // id starts with the prefix records the statement_timeout, lock_timeout
+    // and client_min_messages in effect in the transaction that writes it.
+    private static async Task<List<(string Table, (string, string, string) Settings)>> SettingsSeenByWritesAsync(string messageIdPrefix, Func<Task> test)
+    {
+        var seen = $"seen_settings_{Guid.NewGuid():N}";
+        var tables = new[] { "bip_message_log", "bip_message_attempt", "bip_step_outcome", "bip_message_replay_audit" };
+        await using var admin = NpgsqlDataSource.Create(RequireConnectionString());
+        await using (var connection = await admin.OpenConnectionAsync())
+        {
+            await using var create = new NpgsqlCommand(
+                $"""
+                create table public.{seen} (written text, statement_timeout text, lock_timeout text, client_min_messages text);
+                create function public.{seen}() returns trigger language plpgsql as $$
+                begin
+                    insert into public.{seen} values (tg_table_name, current_setting('statement_timeout'),
+                        current_setting('lock_timeout'), current_setting('client_min_messages'));
+                    return new;
+                end $$;
+                """ + string.Concat(tables.Select(table =>
+                    $"create trigger {seen} before insert or update on public.{table} for each row " +
+                    $"when (new.message_id like '{messageIdPrefix}%') execute function public.{seen}();\n")),
+                connection);
+            await create.ExecuteNonQueryAsync();
+        }
+
+        try
+        {
+            await test();
+            await using var connection = await admin.OpenConnectionAsync();
+            await using var read = new NpgsqlCommand($"select written, statement_timeout, lock_timeout, client_min_messages from public.{seen}", connection);
+            await using var reader = await read.ExecuteReaderAsync();
+            var writes = new List<(string, (string, string, string))>();
+            while (await reader.ReadAsync())
+            {
+                writes.Add((reader.GetString(0), (reader.GetString(1), reader.GetString(2), reader.GetString(3))));
+            }
+
+            return writes;
+        }
+        finally
+        {
+            await using var connection = await admin.OpenConnectionAsync();
+            await using var drop = new NpgsqlCommand($"drop function public.{seen}() cascade; drop table public.{seen}", connection);
+            await drop.ExecuteNonQueryAsync();
+        }
     }
 
     [TestMethod]
@@ -2509,15 +2685,19 @@ public sealed class PlatformMessageStorePostgresTests
     }
 
     [TestMethod]
-    public async Task ACommitWhoseSynchronousReplicationWaitWasCancelledIsAFailedWrite()
+    [DataRow(null)]
+    [DataRow("-c client_min_messages=error")]
+    public async Task ACommitWhoseSynchronousReplicationWaitWasCancelledIsAFailedWrite(string? sessionOptions)
     {
         // A synchronous standby that never answers: every commit waits for it,
         // the client's command timeout cancels the wait, and PostgreSQL then
         // reports the commit done with only a warning, although it is on the
-        // primary alone. statement_timeout does not end that wait.
+        // primary alone. statement_timeout does not end that wait. A session
+        // whose client_min_messages hides warnings still gets that one: the
+        // store's transactions set it to warning.
         await WithUnansweredSynchronousStandbyAsync(async () =>
         {
-            var options = CreateOptions(RequireConnectionString());
+            var options = CreateOptions(new NpgsqlConnectionStringBuilder(RequireConnectionString()) { Options = sessionOptions }.ConnectionString);
             await using var dataSource = NpgsqlDataSource.Create(
                 new NpgsqlConnectionStringBuilder(PlatformStoreTimeouts.Apply(options.PostgresConnectionString)) { CommandTimeout = 1 }.ConnectionString);
             var observations = new PlatformStepObservationCollector();
@@ -2601,13 +2781,13 @@ public sealed class PlatformMessageStorePostgresTests
     [TestMethod]
     public async Task ALedgerReadThatTimesOutOnALockEndsTheAttemptWithoutParking()
     {
+        // The datasource sets no timeout; the ledger read's own transaction
+        // sets the lock timeout.
         await WithFailingLedgerAsync(failures: 0, async (dataSource, options) =>
         {
-            await using var timedSource = NpgsqlDataSource.Create(
-                new NpgsqlConnectionStringBuilder(options.PostgresConnectionString) { Options = "-c lock_timeout=300" }.ConnectionString);
             var observations = new PlatformStepObservationCollector();
             var store = new PlatformMessageStore(dataSource, observations, Options.Create(options), NullLogger<PlatformMessageStore>.Instance);
-            var steps = LedgerTestExecutor(timedSource, observations);
+            var steps = LedgerTestExecutor(dataSource, observations);
             var handler = new DelegateHandler(async (message, ct) =>
             {
                 await steps.ExecuteAsync(message, "deliver", "https://target.example/orders", "target", _ => Task.CompletedTask, ct);
@@ -2623,9 +2803,11 @@ public sealed class PlatformMessageStorePostgresTests
             }
 
             var committed = false;
+            var started = System.Diagnostics.Stopwatch.StartNew();
             await Assert.ThrowsExactlyAsync<InvalidOperationException>(
                 () => service.ProcessAsync(CreateMessage($"dotnet-test-{Guid.NewGuid():N}", options), () => committed = true, CancellationToken.None));
 
+            Assert.IsTrue(started.Elapsed < TimeSpan.FromSeconds(15), started.Elapsed.ToString());
             Assert.AreEqual(1, handler.Calls.Count, "A lock timeout is an outage: no in-process retry.");
             Assert.AreEqual(0, producer.Produced.Count);
             Assert.IsFalse(committed);

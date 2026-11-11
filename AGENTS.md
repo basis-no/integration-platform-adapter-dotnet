@@ -115,6 +115,10 @@ republishes the stored payload to the input topic with the next attempt number.
 - `PlatformMessageStorePostgresTests` reports inconclusive without
   `POSTGRES_TEST_CONNECTION_STRING`. When you touch SQL or persistence, run it against a
   disposable Postgres with `tests/fixtures/postgres/*.sql` applied in order, as `test.yml` does.
+  Its PgBouncer tests also need `PGBOUNCER_IGNORING_OPTIONS_TEST_CONNECTION_STRING` and
+  `PGBOUNCER_DEFAULT_TEST_CONNECTION_STRING`: PgBouncers in session mode in front of that
+  Postgres, one with `options` in `ignore_startup_parameters`, one with default settings. CI
+  sets neither.
 - The `Test` workflow runs the whole suite against real Postgres on every PR; do not run the whole
   suite locally unless asked. CI tests only this adapter: before releasing a contract-facing change,
   verify that both adapters still agree on the affected rows, headers and recovery behaviour.

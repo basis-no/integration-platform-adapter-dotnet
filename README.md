@@ -406,7 +406,7 @@ TLS, set these through your deployment's secret and runtime configuration:
 | `BASIS_MESSAGE_STORE_POSTGRES_MAX_POOL_SIZE` | Optional bounded pool size for JDBC-derived settings; previous Npgsql default if unset |
 | `BASIS_MESSAGE_STORE_POSTGRES_SSL_MODE` | Optional Npgsql TLS mode, e.g. `VerifyFull` |
 | `BASIS_MESSAGE_STORE_POSTGRES_ROOT_CERTIFICATE` | Mounted PostgreSQL CA file |
-| `BASIS_MESSAGE_STORE_POSTGRES_SERVER_TIMEOUTS` | `on`; `off` sends no server-side statement and lock timeouts, for a pooler that refuses startup parameters |
+| `BASIS_MESSAGE_STORE_POSTGRES_SERVER_TIMEOUTS` | `on`: each Message Store transaction sets its own statement and lock timeouts; `off` sets none and leaves them to the database, role or connection settings |
 
 The same Kafka client configuration covers consumption, DLQ and replay. TLS
 certificate and hostname verification stay enabled. Missing SASL credentials
@@ -439,9 +439,9 @@ can lose it. The adapter treats such a write as failed: it commits no offset
 for it, skips no step on it and publishes no replay after it, and retries
 the idempotent write.
 
-The adapter applies these defaults to its own datasource (the keyed
-`MessageStoreDataSourceKey` one), for every setting the connection string
-does not set itself. The default `NpgsqlDataSource` it registers for
+The adapter applies these client-side defaults to its own datasource (the
+keyed `MessageStoreDataSourceKey` one), for every setting the connection
+string does not set itself. The default `NpgsqlDataSource` it registers for
 compatibility keeps Npgsql's defaults, so an application's own queries are
 not affected. It is a pool of its own, so an application that resolves it
 can open up to twice the configured maximum pool size.
@@ -449,21 +449,33 @@ can open up to twice the configured maximum pool size.
 | Npgsql setting | Default | Bounds |
 | --- | --- | --- |
 | `Timeout` | 5 s (Npgsql: 15 s) | opening a connection, and waiting for a pooled one |
-| `Command Timeout` | 20 s (Npgsql: 30 s) | one command on the client; about 25 s when the server does not answer at all, with the cancel request |
+| `Command Timeout` | 20 s (Npgsql: 30 s) | one command on the client, a commit too; about 25 s when the server does not answer at all, with the cancel request |
 | `Keepalive` | 10 s (Npgsql: off) | how soon an idle dead connection is found |
-| `Options` | `-c statement_timeout=15000 -c lock_timeout=5000` | one statement, and a lock wait, on the server |
 
-To change one, set it in `POSTGRES_CONNECTION_STRING`. The server-side
-defaults go before any `PGOPTIONS` the environment sets, so a timeout set
-there wins. A connection
-pooler that refuses the `options` startup parameter (PgBouncer by default
-answers `08P01: unsupported startup parameter in options`) needs
-`BASIS_MESSAGE_STORE_POSTGRES_SERVER_TIMEOUTS=off`, which works with
-`POSTGRES_JDBC_URL` and `POSTGRES_CONNECTION_STRING` alike, or an explicit
-`Options` (also an empty `Options=`) in the connection string; the
-client-side timeouts still bound each call. With the shorter connect timeout,
-the startup contract check gives up on an unreachable store after about 80 s
-(10 attempts) instead of about 180 s.
+To change one, set it in `POSTGRES_CONNECTION_STRING`.
+
+On the server, `statement_timeout=15s` bounds one statement and
+`lock_timeout=5s` one lock wait. Each Message Store transaction sets them for
+itself alone with `set_config(..., true)`, as the Camel adapter does, and the
+adapter runs every store statement in such a transaction, a single read or
+write such as the contract check or a step ledger lookup too. So they reach
+the server through a connection pooler such as PgBouncer (in session or
+transaction mode), and a pooled connection goes back without them. The
+transaction also sets `client_min_messages=warning`, so that a role or
+database setting can't hide the warning of an unconfirmed commit.
+
+The adapter adds nothing to the startup `options`, which a pooler may drop
+without a word or refuse with `08P01`, and leaves the connection string's own
+`Options` (or `PGOPTIONS`) as it is. With
+`BASIS_MESSAGE_STORE_POSTGRES_SERVER_TIMEOUTS=on`, the default, the adapter's
+values win in its transactions over a timeout set there or on the role. To
+use your own, set it to `off`: the transactions then set none of the three,
+and the database, role or connection settings apply. The switch reaches the
+step executor through `AddBasisMessageStoreAdapter`; a `PlatformStepExecutor`
+constructed directly sets them. The client-side timeouts bound each call
+either way. With the shorter connect timeout, the
+startup contract check gives up on an unreachable store after about 80 s (10
+attempts) instead of about 180 s.
 
 Business persistence belongs in a separate application database. The adapter
 uses its keyed datasource `PlatformMessageStoreExtensions.MessageStoreDataSourceKey`
