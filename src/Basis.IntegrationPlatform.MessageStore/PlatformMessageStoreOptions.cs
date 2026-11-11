@@ -41,10 +41,11 @@ public sealed class PlatformMessageStoreOptions
     public string StepOutcomeStore { get; set; } = Environment.GetEnvironmentVariable("BASIS_MESSAGE_STORE_STEP_OUTCOME_STORE") ?? StepOutcomeStorePostgres;
 
     /// <summary>
-    /// Whether the adapter's Message Store sessions get the server-side
-    /// statement and lock timeouts: <c>on</c> (the default) or <c>off</c>, for
-    /// a connection pooler that refuses the <c>options</c> startup parameter.
-    /// The client-side timeouts apply either way.
+    /// Whether each Message Store transaction sets the server-side statement
+    /// and lock timeouts for itself: <c>on</c> (the default) or <c>off</c>, to
+    /// leave them to the database, role or connection settings. The
+    /// client-side timeouts, and the transaction's client_min_messages, apply
+    /// either way.
     /// </summary>
     public string PostgresServerTimeouts { get; set; } = Environment.GetEnvironmentVariable("BASIS_MESSAGE_STORE_POSTGRES_SERVER_TIMEOUTS") ?? "on";
 

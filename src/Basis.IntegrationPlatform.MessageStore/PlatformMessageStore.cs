@@ -19,6 +19,7 @@ public sealed class PlatformMessageStore
     private readonly NpgsqlDataSource dataSource;
     private readonly PlatformStepObservationCollector stepObservations;
     private readonly PlatformMessageStoreOptions options;
+    private readonly bool serverTimeouts;
     private readonly ILogger<PlatformMessageStore> logger;
 
     internal TimeProvider Clock { get; init; } = TimeProvider.System;
@@ -32,6 +33,7 @@ public sealed class PlatformMessageStore
         this.dataSource = dataSource;
         this.stepObservations = stepObservations;
         this.options = options.Value;
+        serverTimeouts = this.options.UsesPostgresServerTimeouts;
         this.logger = logger;
     }
 
@@ -55,8 +57,10 @@ public sealed class PlatformMessageStore
             try
             {
                 await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
-                await using var command = new NpgsqlCommand("select max(contract_major) from bip_contract", connection);
+                await using var transaction = await PlatformStoreTimeouts.BeginTransactionAsync(connection, serverTimeouts, cancellationToken);
+                await using var command = new NpgsqlCommand("select max(contract_major) from bip_contract", connection, transaction);
                 result = await command.ExecuteScalarAsync(cancellationToken);
+                await transaction.CommitAsync(cancellationToken);
                 break;
             }
             catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UndefinedTable)
@@ -132,6 +136,7 @@ public sealed class PlatformMessageStore
             {
                 present.Clear();
                 await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
+                await using var transaction = await PlatformStoreTimeouts.BeginTransactionAsync(connection, serverTimeouts, cancellationToken);
                 // pg_attribute lists every column of a table the search_path
                 // resolves, also one the role has no privilege on; to_regclass
                 // gives null for a table that does not resolve.
@@ -141,21 +146,25 @@ public sealed class PlatformMessageStore
                     from unnest(@tables) as t(name)
                     join pg_attribute a on a.attrelid = to_regclass(t.name) and a.attnum > 0 and not a.attisdropped
                     """,
-                    connection);
+                    connection,
+                    transaction);
                 command.Parameters.Add("tables", NpgsqlDbType.Array | NpgsqlDbType.Text).Value =
                     required.Select(table => table.Name).ToArray();
-                await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-                while (await reader.ReadAsync(cancellationToken))
+                await using (var reader = await command.ExecuteReaderAsync(cancellationToken))
                 {
-                    var table = reader.GetString(0);
-                    if (!present.TryGetValue(table, out var columns))
+                    while (await reader.ReadAsync(cancellationToken))
                     {
-                        present[table] = columns = new HashSet<string>(StringComparer.Ordinal);
-                    }
+                        var table = reader.GetString(0);
+                        if (!present.TryGetValue(table, out var columns))
+                        {
+                            present[table] = columns = new HashSet<string>(StringComparer.Ordinal);
+                        }
 
-                    columns.Add(reader.GetString(1));
+                        columns.Add(reader.GetString(1));
+                    }
                 }
 
+                await transaction.CommitAsync(cancellationToken);
                 break;
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
@@ -253,7 +262,7 @@ public sealed class PlatformMessageStore
             {
                 await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
                 using var confirmation = PlatformCommitConfirmation.Watch(connection);
-                await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+                await using var transaction = await PlatformStoreTimeouts.BeginTransactionAsync(connection, serverTimeouts, cancellationToken);
                 var capped = await CapPayloadExpiryAsync(connection, transaction, message.MessageId, payload, cancellationToken);
                 await UpsertAttemptAsync(connection, transaction, message, metadata, status, attempt, capped, error, stepsJson, cancellationToken);
                 await UpsertLogAsync(connection, transaction, message, status, attempt, capped, error, metadata, cancellationToken);
@@ -511,6 +520,18 @@ public sealed class PlatformMessageStore
     private async Task<ReplayableStoredMessage?> LoadStoredMessageAsync(string messageId, CancellationToken cancellationToken)
     {
         await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
+        await using var transaction = await PlatformStoreTimeouts.BeginTransactionAsync(connection, serverTimeouts, cancellationToken);
+        var stored = await ReadStoredMessageAsync(connection, transaction, messageId, cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+        return stored;
+    }
+
+    private async Task<ReplayableStoredMessage?> ReadStoredMessageAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        string messageId,
+        CancellationToken cancellationToken)
+    {
         await using var load = new NpgsqlCommand(
             """
             select message_id,
@@ -529,7 +550,8 @@ public sealed class PlatformMessageStore
             from bip_message_log
             where message_id = @message_id
             """,
-            connection);
+            connection,
+            transaction);
         load.Parameters.AddWithValue("message_id", messageId);
         await using var reader = await load.ExecuteReaderAsync(CommandBehavior.SingleRow, cancellationToken);
         if (!await reader.ReadAsync(cancellationToken))
@@ -692,6 +714,7 @@ public sealed class PlatformMessageStore
         await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
         // The REQUESTED row must be durable before the produce.
         using var confirmation = PlatformCommitConfirmation.Watch(connection);
+        await using var transaction = await PlatformStoreTimeouts.BeginTransactionAsync(connection, serverTimeouts, cancellationToken);
         await using var command = new NpgsqlCommand(
             """
             insert into bip_message_replay_audit (
@@ -703,7 +726,8 @@ public sealed class PlatformMessageStore
               @redo_steps, @target_topic, 'REQUESTED', now(), null
             )
             """,
-            connection);
+            connection,
+            transaction);
         command.Parameters.AddWithValue("replay_id", Guid.Parse(replayId));
         command.Parameters.AddWithValue("message_id", messageId);
         command.Parameters.AddWithValue("integration", integration);
@@ -713,23 +737,27 @@ public sealed class PlatformMessageStore
         command.Parameters.Add("redo_steps", NpgsqlDbType.Jsonb).Value = RedoStepsJson(request);
         command.Parameters.AddWithValue("target_topic", targetTopic);
         await command.ExecuteNonQueryAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
         confirmation.ThrowIfUnconfirmed();
     }
 
     private async Task UpdateReplayAuditAsync(string replayId, string status, string? error, CancellationToken cancellationToken)
     {
         await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
+        await using var transaction = await PlatformStoreTimeouts.BeginTransactionAsync(connection, serverTimeouts, cancellationToken);
         await using var command = new NpgsqlCommand(
             """
             update bip_message_replay_audit
             set status = @status, published_at = case when @status = 'PUBLISHED' then now() else published_at end, error = @error
             where replay_id = @replay_id
             """,
-            connection);
+            connection,
+            transaction);
         command.Parameters.AddWithValue("replay_id", Guid.Parse(replayId));
         command.Parameters.AddWithValue("status", status);
         AddNullableText(command, "error", error);
         await command.ExecuteNonQueryAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
     }
 
     private static string RedoStepsJson(MessageReplayRequest request)

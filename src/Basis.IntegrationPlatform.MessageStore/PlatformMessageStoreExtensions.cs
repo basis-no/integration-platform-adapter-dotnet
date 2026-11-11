@@ -33,7 +33,7 @@ public static class PlatformMessageStoreExtensions
         {
             var options = provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<PlatformMessageStoreOptions>>().Value;
             options.Validate();
-            return NpgsqlDataSource.Create(PlatformStoreTimeouts.Apply(options.PostgresConnectionString, options.UsesPostgresServerTimeouts));
+            return NpgsqlDataSource.Create(PlatformStoreTimeouts.Apply(options.PostgresConnectionString));
         });
         services.AddSingleton<PlatformStepObservationCollector>();
         services.AddSingleton<PlatformReplayEndpoints>();
@@ -53,12 +53,17 @@ public static class PlatformMessageStoreExtensions
             provider.GetRequiredService<PlatformStepObservationCollector>(),
             provider.GetRequiredService<IOptions<PlatformMessageStoreOptions>>(),
             provider.GetRequiredService<ILogger<PlatformMessageStore>>()));
-        services.AddSingleton<IPlatformStepExecutor>(provider => new PlatformStepExecutor(
-            provider.GetRequiredKeyedService<NpgsqlDataSource>(MessageStoreDataSourceKey),
-            provider.GetRequiredService<PlatformStepObservationCollector>(),
-            provider.GetRequiredService<ILogger<PlatformStepExecutor>>())
+        services.AddSingleton<IPlatformStepExecutor>(provider =>
         {
-            UsesStepLedger = provider.GetRequiredService<IOptions<PlatformMessageStoreOptions>>().Value.UsesStepLedger,
+            var options = provider.GetRequiredService<IOptions<PlatformMessageStoreOptions>>().Value;
+            return new PlatformStepExecutor(
+                provider.GetRequiredKeyedService<NpgsqlDataSource>(MessageStoreDataSourceKey),
+                provider.GetRequiredService<PlatformStepObservationCollector>(),
+                provider.GetRequiredService<ILogger<PlatformStepExecutor>>())
+            {
+                UsesStepLedger = options.UsesStepLedger,
+                UsesPostgresServerTimeouts = options.UsesPostgresServerTimeouts,
+            };
         });
         services.AddSingleton<IProducer<string, byte[]>>(provider =>
         {

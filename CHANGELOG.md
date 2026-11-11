@@ -7,13 +7,19 @@
   a 10 s keepalive, and `statement_timeout=15s` and `lock_timeout=5s` on the
   server. Before, Npgsql's defaults (15 s, 30 s, no keepalive) and no server
   limits let a hung store or a held lock stall the consumer for minutes, past
-  the poll interval. They apply to the adapter's keyed datasource only; the
+  the poll interval. The client-side ones apply to the adapter's keyed
+  datasource only, and a value set in the connection string wins; the
   default `NpgsqlDataSource` registered for compatibility is now a pool of
-  its own with the plain connection string. A value set in the connection
-  string wins, `PGOPTIONS` is kept, and
-  `BASIS_MESSAGE_STORE_POSTGRES_SERVER_TIMEOUTS=off` (or an explicit
-  `Options`) leaves out the server-side ones, for a pooler such as PgBouncer
-  that refuses them with `08P01`.
+  its own with the plain connection string. The server-side ones are set in
+  each Message Store transaction for that transaction alone, as the Camel
+  adapter does, together with `client_min_messages=warning` so that a role
+  setting can't hide the warning of an unconfirmed commit; every store
+  statement runs in such a transaction. Nothing is added to the startup
+  `options`, so they also apply behind a pooler such as PgBouncer, which
+  drops that parameter or refuses it with `08P01`, and a pooled connection
+  keeps none of them. `BASIS_MESSAGE_STORE_POSTGRES_SERVER_TIMEOUTS=off`
+  leaves the two timeouts to the database, role or connection settings;
+  `client_min_messages=warning` is set either way.
 
 - A step ledger failure that says the store is unavailable (a timeout, a lock
   timeout, a lost connection, SQLSTATE classes 08, 53, 57 and 58) now ends the

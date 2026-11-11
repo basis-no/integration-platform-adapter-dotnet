@@ -131,6 +131,13 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
     /// </summary>
     internal bool UsesStepLedger { get; init; } = true;
 
+    /// <summary>
+    /// False with BASIS_MESSAGE_STORE_POSTGRES_SERVER_TIMEOUTS=off: the ledger's
+    /// transactions set no server-side statement and lock timeouts.
+    /// client_min_messages is set either way.
+    /// </summary>
+    internal bool UsesPostgresServerTimeouts { get; init; } = true;
+
     public async Task<PlatformStepExecutionResult> ExecuteAsync(
         PlatformMessage message,
         string stepId,
@@ -558,6 +565,7 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
     private async Task<bool> WasDeliveredAsync(string idempotencyKey, CancellationToken cancellationToken)
     {
         await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
+        await using var transaction = await PlatformStoreTimeouts.BeginTransactionAsync(connection, UsesPostgresServerTimeouts, cancellationToken);
         await using var command = new NpgsqlCommand(
             """
             select 1
@@ -565,24 +573,30 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
             where idempotency_key = @idempotency_key
               and status = 'DELIVERED'
             """,
-            connection);
+            connection,
+            transaction);
         command.Parameters.AddWithValue("idempotency_key", idempotencyKey);
         var result = await command.ExecuteScalarAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
         return result is not null;
     }
 
     private async Task<string?> JournaledIntegrationAsync(string messageId, CancellationToken cancellationToken)
     {
         await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
+        await using var transaction = await PlatformStoreTimeouts.BeginTransactionAsync(connection, UsesPostgresServerTimeouts, cancellationToken);
         await using var command = new NpgsqlCommand(
             """
             select integration
             from bip_message_log
             where message_id = @message_id
             """,
-            connection);
+            connection,
+            transaction);
         command.Parameters.AddWithValue("message_id", messageId);
-        return await command.ExecuteScalarAsync(cancellationToken) as string;
+        var integration = await command.ExecuteScalarAsync(cancellationToken) as string;
+        await transaction.CommitAsync(cancellationToken);
+        return integration;
     }
 
     private async Task RecordAsync(
@@ -599,6 +613,7 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
         // A DELIVERED row the store can't confirm as durable would let a later
         // delivery skip a step whose record a failover can lose.
         using var confirmation = PlatformCommitConfirmation.Watch(connection);
+        await using var transaction = await PlatformStoreTimeouts.BeginTransactionAsync(connection, UsesPostgresServerTimeouts, cancellationToken);
         await using var command = new NpgsqlCommand(
             """
             insert into bip_step_outcome (
@@ -634,7 +649,8 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
             where bip_step_outcome.status <> 'DELIVERED'
                or excluded.status = 'DELIVERED'
             """,
-            connection);
+            connection,
+            transaction);
         command.Parameters.AddWithValue("idempotency_key", idempotencyKey);
         command.Parameters.AddWithValue("message_id", messageId);
         command.Parameters.AddWithValue("step_id", stepId);
@@ -643,6 +659,7 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
         PlatformMessageStore.AddNullableText(command, "target_ref", targetRef);
         PlatformMessageStore.AddNullableText(command, "error", error);
         await command.ExecuteNonQueryAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
         confirmation.ThrowIfUnconfirmed();
     }
 }

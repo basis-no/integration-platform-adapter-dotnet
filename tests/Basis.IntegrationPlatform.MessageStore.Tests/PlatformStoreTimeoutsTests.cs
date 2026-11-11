@@ -16,7 +16,7 @@ public sealed class PlatformStoreTimeoutsTests
         Assert.AreEqual(PlatformStoreTimeouts.ConnectSeconds, applied.Timeout);
         Assert.AreEqual(PlatformStoreTimeouts.CommandSeconds, applied.CommandTimeout);
         Assert.AreEqual(PlatformStoreTimeouts.KeepaliveSeconds, applied.KeepAlive);
-        Assert.AreEqual("-c statement_timeout=15000 -c lock_timeout=5000", applied.Options);
+        Assert.IsTrue(string.IsNullOrEmpty(applied.Options), "The server-side timeouts are set in each transaction, not at startup.");
         Assert.AreEqual("synthetic", applied.Password);
         Assert.IsTrue(PlatformStoreTimeouts.CommandSeconds * 1000 > PlatformStoreTimeouts.StatementTimeoutMs);
     }
@@ -26,6 +26,7 @@ public sealed class PlatformStoreTimeoutsTests
     [DataRow("Timeout=30;Command Timeout=60;Keepalive=0;Options=''", null)]
     [DataRow(" TIMEOUT =30; command timeout=60; KEEPALIVE=0; Options = ", null)]
     [DataRow("timeout=30;CommandTimeout=60;keepalive=0;options=-c search_path=app", "-c search_path=app")]
+    [DataRow("Timeout=30;Command Timeout=60;Keepalive=0;Options=-c statement_timeout=60000", "-c statement_timeout=60000")]
     [DataRow(";;Timeout=30; ;Command Timeout=60;Keepalive=0;;Options=", null)]
     public void KeepsEveryTimeoutTheConnectionStringSets(string explicitSettings, string? options)
     {
@@ -34,38 +35,34 @@ public sealed class PlatformStoreTimeoutsTests
         Assert.AreEqual(30, applied.Timeout);
         Assert.AreEqual(60, applied.CommandTimeout);
         Assert.AreEqual(0, applied.KeepAlive);
-        Assert.AreEqual(options, string.IsNullOrEmpty(applied.Options) ? null : applied.Options,
-            "An explicit Options, even an empty one, is left as it is, for a pooler that refuses startup parameters.");
+        Assert.AreEqual(options, string.IsNullOrEmpty(applied.Options) ? null : applied.Options, "The connection string's own Options is left as it is.");
     }
 
     [TestMethod]
-    [DataRow("Password='a;options=b'")]
-    [DataRow("Application Name=\"x; Options=\"")]
+    [DataRow("Password='a;timeout=1'")]
+    [DataRow("Application Name=\"x; Timeout=1\"")]
     public void AKeywordInsideAQuotedValueDoesNotCount(string quoted)
     {
         var applied = new NpgsqlConnectionStringBuilder(PlatformStoreTimeouts.Apply("Host=postgres;Username=app;" + quoted));
 
-        Assert.AreEqual("-c statement_timeout=15000 -c lock_timeout=5000", applied.Options);
+        Assert.AreEqual(PlatformStoreTimeouts.ConnectSeconds, applied.Timeout);
     }
 
     [TestMethod]
-    public void ServerTimeoutsFollowPgOptionsAndCanBeTurnedOff()
+    public void PgOptionsIsLeftToNpgsql()
     {
         var pgOptions = Environment.GetEnvironmentVariable("PGOPTIONS");
         try
         {
             Environment.SetEnvironmentVariable("PGOPTIONS", "-c search_path=app");
             var applied = new NpgsqlConnectionStringBuilder(PlatformStoreTimeouts.Apply("Host=postgres;Username=app"));
-            Assert.AreEqual("-c statement_timeout=15000 -c lock_timeout=5000 -c search_path=app", applied.Options);
+            Assert.IsTrue(string.IsNullOrEmpty(applied.Options), "Without Options in the connection string, Npgsql sends PGOPTIONS itself.");
+            Assert.AreEqual(PlatformStoreTimeouts.CommandSeconds, applied.CommandTimeout);
         }
         finally
         {
             Environment.SetEnvironmentVariable("PGOPTIONS", pgOptions);
         }
-
-        var off = new NpgsqlConnectionStringBuilder(PlatformStoreTimeouts.Apply("Host=postgres;Username=app", serverTimeouts: false));
-        Assert.IsTrue(string.IsNullOrEmpty(off.Options));
-        Assert.AreEqual(PlatformStoreTimeouts.CommandSeconds, off.CommandTimeout, "The client-side timeouts apply either way.");
     }
 
     [TestMethod]
@@ -110,7 +107,7 @@ public sealed class PlatformStoreTimeoutsTests
         Assert.AreEqual(PlatformStoreTimeouts.ConnectSeconds, adapter.Timeout);
         Assert.AreEqual(PlatformStoreTimeouts.CommandSeconds, adapter.CommandTimeout);
         Assert.AreEqual(PlatformStoreTimeouts.KeepaliveSeconds, adapter.KeepAlive);
-        StringAssert.Contains(adapter.Options, "lock_timeout=5000");
+        Assert.IsTrue(string.IsNullOrEmpty(adapter.Options), "Nothing is added to the startup parameters.");
         Assert.AreEqual(15, application.Timeout, "The application's default datasource keeps Npgsql's defaults.");
         Assert.AreEqual(30, application.CommandTimeout);
         Assert.IsTrue(string.IsNullOrEmpty(application.Options));

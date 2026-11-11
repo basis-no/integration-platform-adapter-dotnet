@@ -6,8 +6,10 @@ namespace Basis.IntegrationPlatform.MessageStore;
 /// Timeouts for every Message Store call, well under the consumer's poll
 /// interval (300 s by default), so a hung store, a held lock or a dead
 /// connection fails the call as a store failure instead of stalling the
-/// consumer until it leaves its group. Each is a default for the adapter's
-/// own datasource: a value the connection string sets wins.
+/// consumer until it leaves its group. The client-side ones are defaults for
+/// the adapter's own datasource: a value the connection string sets wins. The
+/// server-side ones are set in each Message Store transaction, for that
+/// transaction alone.
 /// </summary>
 internal static class PlatformStoreTimeouts
 {
@@ -20,21 +22,32 @@ internal static class PlatformStoreTimeouts
     /// <summary>Seconds of inactivity before Npgsql checks a connection with a keepalive (off by default).</summary>
     internal const int KeepaliveSeconds = 10;
 
-    /// <summary>Server-side statement_timeout for the adapter's sessions, in milliseconds.</summary>
+    /// <summary>Server-side statement_timeout for each Message Store transaction, in milliseconds.</summary>
     internal const int StatementTimeoutMs = 15_000;
 
-    /// <summary>Server-side lock_timeout for the adapter's sessions, in milliseconds.</summary>
+    /// <summary>Server-side lock_timeout for each Message Store transaction, in milliseconds.</summary>
     internal const int LockTimeoutMs = 5_000;
 
+    // client_min_messages at warning, with the timeouts switched off too: a
+    // role, database or connection setting of error would hide the warning of
+    // an unconfirmed synchronous commit, which would then count as confirmed
+    // (PlatformCommitConfirmation). The commit sends that warning before the
+    // transaction's settings end.
+    private const string ServerSettingsSql =
+        "select set_config('statement_timeout', @statement_timeout, true), " +
+        "set_config('lock_timeout', @lock_timeout, true), " +
+        "set_config('client_min_messages', 'warning', true)";
+
+    private const string WarningsOnlySql = "select set_config('client_min_messages', 'warning', true)";
+
     /// <summary>
-    /// The connection string with each timeout the deployment did not set.
-    /// The server-side timeouts go in the startup <c>Options</c>, after any
-    /// <c>PGOPTIONS</c> Npgsql would otherwise use. A connection string that
-    /// sets <c>Options</c> itself, also an empty one, is left as it is, and
-    /// <paramref name="serverTimeouts"/> false adds none, for a pooler that
-    /// refuses startup parameters.
+    /// The connection string with each client-side timeout the deployment did
+    /// not set. It adds no startup <c>Options</c>: a pooler such as PgBouncer
+    /// drops or refuses that parameter, and a session setting would stay on a
+    /// pooled server connection. The connection string's own <c>Options</c>,
+    /// or the <c>PGOPTIONS</c> Npgsql uses without it, is left as it is.
     /// </summary>
-    internal static string Apply(string connectionString, bool serverTimeouts = true)
+    internal static string Apply(string connectionString)
     {
         var given = Keywords(connectionString);
         bool Has(params string[] keys) => keys.Any(key => given.Contains(Normalize(key)));
@@ -54,17 +67,39 @@ internal static class PlatformStoreTimeouts
             builder.KeepAlive = KeepaliveSeconds;
         }
 
-        if (serverTimeouts && !Has("Options"))
-        {
-            // Npgsql uses PGOPTIONS only when the connection string has no
-            // Options; keep what it carries (a search_path, say). The last -c
-            // wins, so the defaults go first and its own timeouts win.
-            var environment = Environment.GetEnvironmentVariable("PGOPTIONS");
-            var timeouts = $"-c statement_timeout={StatementTimeoutMs} -c lock_timeout={LockTimeoutMs}";
-            builder.Options = string.IsNullOrWhiteSpace(environment) ? timeouts : $"{timeouts} {environment.Trim()}";
-        }
-
         return builder.ConnectionString;
+    }
+
+    /// <summary>
+    /// Begins a Message Store transaction. It first sets client_min_messages
+    /// and, with <paramref name="serverTimeouts"/>, statement_timeout and
+    /// lock_timeout for this transaction alone, as the Camel adapter does: a
+    /// statement reaches the server also through a pooler that drops or
+    /// refuses startup options, and the connection goes back to the pool
+    /// without them. The adapter runs every store statement in such a
+    /// transaction, a single read or write too, so each one gets them.
+    /// </summary>
+    internal static async Task<NpgsqlTransaction> BeginTransactionAsync(
+        NpgsqlConnection connection, bool serverTimeouts, CancellationToken cancellationToken)
+    {
+        var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        try
+        {
+            await using var command = new NpgsqlCommand(serverTimeouts ? ServerSettingsSql : WarningsOnlySql, connection, transaction);
+            if (serverTimeouts)
+            {
+                command.Parameters.AddWithValue("statement_timeout", $"{StatementTimeoutMs}ms");
+                command.Parameters.AddWithValue("lock_timeout", $"{LockTimeoutMs}ms");
+            }
+
+            await command.ExecuteNonQueryAsync(cancellationToken);
+            return transaction;
+        }
+        catch
+        {
+            await transaction.DisposeAsync();
+            throw;
+        }
     }
 
     /// <summary>
