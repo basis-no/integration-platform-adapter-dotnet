@@ -486,3 +486,117 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for branches and pull requests.
 This repository starts from a fresh history. Versions up to 0.3.1 were
 developed in an earlier private repository, so this repository has no tags or
 release pages for them. Their notes are in [CHANGELOG.md](CHANGELOG.md).
+
+## Known issues in 0.3.1
+
+Version 0.3.1 has two problems that every deployment on it should know about.
+There is no 0.3.2: the fixes ship in the first release after it, which is made
+from `main`.
+
+### A handler timeout stops the process
+
+0.3.1 treats every cancellation as a shutdown. Suppose an `HttpClient` call
+in the handler times out (after 100 s by default):
+
+- its `TaskCanceledException` leaves the consume loop. With .NET's default
+  for a failed background service,
+  `BackgroundServiceExceptionBehavior.StopHost`, the host stops and the
+  process exits with code 0;
+- the message is not retried, recorded or parked;
+- after the restart the consumer reads the same record, sends the call again
+  and stops again.
+
+The result is a restart loop with one more call to the receiver per restart.
+Exit code 0 makes each stop look like a clean shutdown. With
+`BackgroundServiceExceptionBehavior.Ignore` the process keeps running but no
+longer consumes.
+
+To avoid it, catch the timeout where the handler makes the call, and throw an
+exception that is not a cancellation. The step is then recorded `FAILED`, and
+the adapter retries the handler and then parks the message:
+
+```csharp
+await steps.ExecuteAsync(
+    message,
+    stepId: "target-system",
+    endpointUri: "https://target.example/api/orders",
+    targetRef: message.TargetSystem,
+    operation: async ct =>
+    {
+        try
+        {
+            using var response = await httpClients.CreateClient("target-system")
+                .PostAsync("api/orders", new ByteArrayContent(message.Payload), ct);
+            response.EnsureSuccessStatusCode();
+        }
+        catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
+        {
+            // 0.3.1 stops the host on any cancellation, so report the
+            // client's timeout as a failed call.
+            throw new TimeoutException("The call to target-system timed out.", ex);
+        }
+    },
+    cancellationToken);
+```
+
+Pass the handler's own `cancellationToken` to the step, as above. `ct` is then
+cancelled only when the host stops, so a shutdown still ends the call.
+
+All of a message's handler attempts, with every call they make, must fit in
+the consumer's poll interval (`max.poll.interval.ms`, 300 s by default). With
+the defaults they don't: three attempts with a 100 s timeout, plus 1 s between
+attempts, take longer. Kafka then delivers the message again, and the whole
+handler runs again, with three more calls and another DLQ copy, because a
+`FAILED` step is not skipped. Give the client a shorter `Timeout`, such as
+30 s, and count every call a handler makes.
+
+### A store that can be read but not written repeats calls
+
+A Message Store can answer reads while it refuses writes. This happens when it
+has been switched to read-only, as after a failover onto a standby or for
+maintenance, or when the runtime role has lost its write grants. Each step's
+call is then sent again on every read of the record:
+
+1. The step ledger finds no `DELIVERED` row, so the call is sent.
+2. The `DELIVERED` write fails, and the handler is retried, which sends the
+   call again.
+3. The message is parked in the DLQ.
+4. Recording the parked message fails too, and the record is read again five
+   seconds later.
+
+This repeats for as long as the store refuses writes. On every pass the
+receiver gets several calls and the DLQ gets one more copy, while the process
+keeps running. When only the step ledger (`bip_step_outcome`) refuses writes,
+the message is parked after one pass, with one call per handler attempt (three
+by default).
+
+To recognise it, look for failed writes in the log, such as
+`cannot execute INSERT in a read-only transaction` (SQLSTATE `25006`) or
+`permission denied` (`42501`), and for consumer lag that keeps growing. `main`
+has the same loop; #60 tracks the fix.
+
+The repeats of a message have the same step key, `<message-id>:<step-id>`, the
+key `bip_step_outcome` records, so a receiver that deduplicates by it applies
+the call once. In 0.3.1 the step's operation doesn't get the key: send it
+yourself as `Idempotency-Key`. This holds only for records that carry
+`x-bip-message-id`. A record without it gets a new message id on every read,
+so its repeats have different keys, and its DLQ copies have different ids.
+
+While the store can be read but not written:
+
+- Scale the integration down to zero replicas until the store accepts writes
+  again, then scale it back up. Its uncommitted records are read again from
+  the committed offsets: each affected message sends its call once more and
+  then completes, although DLQ copies of it exist.
+- Receivers that deduplicate by `Idempotency-Key` are protected from the
+  repeats. Check the other receivers for duplicate calls.
+- Before you resend anything afterwards, look in the DLQ for several copies of
+  the same message: the same `x-bip-message-id`, or, for records that arrived
+  without one, the same key or payload. Check the message's latest status in
+  the Message Store, and resend each message once, only if it did not
+  complete. A resend republishes the payload stored in the Message Store, not
+  the DLQ copy.
+- A message parked after its receiver got the call, as when only the step
+  ledger refused writes, has no `DELIVERED` step, so a resend sends the call
+  again. Unless the receiver deduplicates by `Idempotency-Key`, check with the
+  receiver first.

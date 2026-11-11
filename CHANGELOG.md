@@ -155,6 +155,20 @@
   the earliest attempt recorded by this integration. Re-consuming that earliest
   attempt rewrites its receipt time and can move the cap; replay cannot.
 
+## 0.3.1
+
+Released from the earlier private repository; its release notes were not
+carried over. Known issues, found after the release ("Known issues in 0.3.1"
+in the README gives the workarounds):
+
+- A handler timeout stops the process, by default with exit code 0, which
+  leads to a restart loop that sends the receiver one more call per restart.
+  Fixed after 0.3.1: see "A handler timeout no longer stops the consumer"
+  above.
+- While the Message Store can be read but not written, a step's call is sent
+  again on every read of the record, and each pass parks one more copy of the
+  message in the DLQ (#60).
+
 ## 0.3.0
 
 First public release, on NuGet.org, under the package id
