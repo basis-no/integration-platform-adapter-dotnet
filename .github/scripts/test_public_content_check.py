@@ -18,7 +18,7 @@ def isolated_environment(home):
     env.update(HOME=home, XDG_CONFIG_HOME=os.path.join(home, ".config"))
     env.update(GIT_AUTHOR_NAME="Synthetic", GIT_AUTHOR_EMAIL="synthetic@users.noreply.github.com",
                GIT_COMMITTER_NAME="Synthetic", GIT_COMMITTER_EMAIL="synthetic@users.noreply.github.com",
-               GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+               GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1", GIT_ATTR_NOSYSTEM="1")
     return env
 
 
