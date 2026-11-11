@@ -245,6 +245,15 @@ internal sealed class PlatformMessageConsumerService : BackgroundService
             throw new PlatformRecordHeldBackException("a step outcome was not checked or recorded, so it is consumed again", storeFailure);
         }
 
+        if (delivery.CallerCancelled && handled.Result.Succeeded)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            // A step did not run, and the handler returned success anyway: the
+            // message must not be recorded COMPLETED.
+            throw new PlatformRecordHeldBackException(
+                "a step did not run because the handler's own cancellation token was already cancelled, so it is consumed again", null);
+        }
+
         if (handled.Result.Succeeded)
         {
             if (await RecordOutcomeAsync(record, metadata, "COMPLETED", null, parked: false, commitOffset, cancellationToken))

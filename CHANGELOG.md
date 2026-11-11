@@ -29,7 +29,9 @@
   read-only store (`25006`), a lost grant (`42501`, class `28`), a schema
   mismatch (another class `42`, class `23`) or a ledger call cut short by the
   handler's own token got the handler retried and the message parked, while
-  recording the parked message failed the same way. The ERROR lines for a
+  recording the parked message failed the same way. A step started with a
+  token the handler already cancelled reaches no store and is still the
+  handler's failure. The ERROR lines for a
   record that is not committed end with `storeError=<class>`
   (`record-data`, `read-only`, `privilege`, `schema` or `unavailable`) and its
   SQLSTATE, as in the Camel adapter.

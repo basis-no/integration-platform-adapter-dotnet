@@ -201,6 +201,103 @@ public sealed partial class PlatformMessageStorePostgresTests
     }
 
     [TestMethod]
+    [DataRow("failed-write")]
+    [DataRow("ledger-check")]
+    [DataRow("ledger-check-swallowed")]
+    public async Task AStepWhoseLedgerCallTheHandlersCancelledTokenStopsIsAHandlerFailure(string path)
+    {
+        // The store is healthy; the handler's own timeout has already fired
+        // when the ledger call starts. That is the handler's failure: retried
+        // and parked, not a store failure that holds the record back.
+        await WithFailingLedgerAsync(failures: 0, async (dataSource, options) =>
+        {
+            options.MaxHandlerAttempts = 2;
+            options.HandlerRetryDelayMs = 0;
+            var observations = new PlatformStepObservationCollector();
+            var store = new PlatformMessageStore(dataSource, observations, Options.Create(options), NullLogger<PlatformMessageStore>.Instance);
+            var steps = LedgerTestExecutor(dataSource, observations);
+            var sends = 0;
+            var handler = new DelegateHandler(async (message, ct) =>
+            {
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                if (path != "failed-write")
+                {
+                    timeout.Cancel();
+                }
+
+                try
+                {
+                    await steps.ExecuteAsync(message, "deliver", DeliverUri, "target", _ =>
+                    {
+                        sends++;
+                        // The operation turns its timeout into a failure of its own.
+                        timeout.Cancel();
+                        throw new TimeoutException("The call to the receiver timed out.");
+                    }, timeout.Token);
+                }
+                catch (OperationCanceledException) when (path == "ledger-check-swallowed")
+                {
+                    return PlatformMessageResult.Completed();
+                }
+
+                return PlatformMessageResult.Completed();
+            });
+            var producer = new FakeProducer();
+            using var service = CreateConsumerService(handler, store, observations, producer, options);
+            var message = CreateMessage($"dotnet-test-{Guid.NewGuid():N}", options);
+            var commits = 0;
+
+            if (path == "ledger-check-swallowed")
+            {
+                // The step did not run and the handler returned success: not
+                // recorded COMPLETED.
+                await Assert.ThrowsExactlyAsync<PlatformRecordHeldBackException>(
+                    () => service.ProcessAsync(message, () => commits++, CancellationToken.None));
+                Assert.AreEqual(0, commits);
+                Assert.IsNull(await LogStatusAsync(dataSource, message.MessageId));
+                return;
+            }
+
+            await service.ProcessAsync(message, () => commits++, CancellationToken.None);
+
+            Assert.AreEqual(2, handler.Calls.Count, "Retried in process.");
+            Assert.AreEqual(path == "failed-write" ? 2 : 0, sends);
+            Assert.AreEqual(1, producer.Produced.Count, "Parked.");
+            Assert.AreEqual(1, commits);
+            Assert.AreEqual("DLQ", await LogStatusAsync(dataSource, message.MessageId));
+            Assert.IsNull(await StepStatusAsync(dataSource, $"{message.MessageId}:deliver"), "The FAILED write did not reach the store; the step runs again anyway.");
+        });
+    }
+
+    [TestMethod]
+    public async Task ARecordParkedForItsDataIsParkedAgainAfterAnotherOffsetOfItsPartitionBegan()
+    {
+        await WithIsolatedStoreAsync(async store =>
+        {
+            var options = store.Options();
+            var (service, steps, _, producer) = store.Consumer(options, new LogRecorder());
+            using var consumerService = service(SendingHandler(steps, () => { }));
+            // The reduced outcome cannot be written, so the parked record is
+            // held back.
+            await store.FailWritesAsync("bip_message_attempt", "57P03", "$1->>'correlation_id' is null");
+            var refused = RecordAt(0, options, $"dotnet-test-{Guid.NewGuid():N}", ("x-bip-source-system", "nul\0"));
+
+            await Assert.ThrowsExactlyAsync<PlatformRecordHeldBackException>(
+                () => consumerService.ProcessAsync(consumerService.ReadRecord(refused), () => { }, CancellationToken.None));
+            await Assert.ThrowsExactlyAsync<PlatformRecordHeldBackException>(
+                () => consumerService.ProcessAsync(consumerService.ReadRecord(refused), () => { }, CancellationToken.None));
+            Assert.AreEqual(1, producer.Produced.Count, "Read again at its own offset, it is not parked again.");
+
+            // Offsets moved: another record of the partition begins, and the
+            // one at offset 0 is a record of its own again.
+            consumerService.ReadRecord(RecordAt(1, options, $"dotnet-test-{Guid.NewGuid():N}"));
+            await Assert.ThrowsExactlyAsync<PlatformRecordHeldBackException>(
+                () => consumerService.ProcessAsync(consumerService.ReadRecord(refused), () => { }, CancellationToken.None));
+            Assert.AreEqual(2, producer.Produced.Count);
+        });
+    }
+
+    [TestMethod]
     public async Task ParallelStepsWhoseWritesFailAreEachSentOnce()
     {
         await WithIsolatedStoreAsync(async store =>

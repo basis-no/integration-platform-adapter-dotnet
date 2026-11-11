@@ -27,6 +27,7 @@ internal sealed class PlatformDelivery
     private readonly List<string> unrecordedSends = [];
     private Exception? storeFailure;
     private bool onlyRecordData = true;
+    private volatile bool callerCancelled;
     private volatile bool ended;
 
     internal PlatformDelivery(PlatformRecordPosition? position, PlatformUnrecordedDeliveries? marks)
@@ -101,6 +102,15 @@ internal sealed class PlatformDelivery
             onlyRecordData &= PlatformStoreFailures.IsRecordData(failure);
         }
     }
+
+    /// <summary>
+    /// Whether a step's ledger check was not made because the handler's own
+    /// cancellation token was already cancelled: no store failure, but that
+    /// step did not run.
+    /// </summary>
+    internal bool CallerCancelled => callerCancelled;
+
+    internal void NoteCallerCancellation() => callerCancelled = true;
 
     internal void NoteUnrecordedSend(string stepId)
     {

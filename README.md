@@ -144,8 +144,12 @@ record: every later step of it, in a handler retry too, throws before its
 operation runs, the handler is not retried, and whatever the handler returns,
 the adapter neither records the message nor commits its offset, but processes
 the delivery again after the failure backoff, without parking it. This
-includes a ledger call cut short by the handler's own cancellation token, such
-as a timeout. Only a failure for the record's own data, which no later read can
+includes a ledger call that the handler's own cancellation token, such as a
+timeout, cuts short while it waits for the store. A step started with a token
+that is already cancelled does not reach the store at all: it throws the
+cancellation and records nothing, the handler's failure is retried and parked
+as any other, and a handler that returns success anyway gets the delivery
+processed again. Only a failure for the record's own data, which no later read can
 store, parks the message instead. A ledger that refuses every write therefore
 holds its partition back until it accepts them; the error log names the
 message and the store error.
@@ -284,7 +288,8 @@ handler's async flow, in parallel tasks too, or, on a worker of the handler's
 own that does not carry that flow, when it runs with the consumed message's
 id. A step executor call outside the consumer's processing, such as one from
 an application's own endpoint, does not belong to a record and is not
-affected.
+affected, unless it runs with the id of a message the consumer is processing
+at that moment.
 
 ### A step whose `DELIVERED` outcome could not be written
 

@@ -188,6 +188,15 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
             return await WriteFromMarkAsync(delivery, mark, message, stepId, idempotencyKey, cancellationToken);
         }
 
+        if (UsesStepLedger && cancellationToken.IsCancellationRequested)
+        {
+            // The handler's own token was cancelled before the step: the
+            // ledger check never reaches the store, so it is no store failure.
+            // The handler's failure is retried and parked as any other.
+            delivery?.NoteCallerCancellation();
+            cancellationToken.ThrowIfCancellationRequested();
+        }
+
         bool delivered;
         try
         {
@@ -218,7 +227,10 @@ public sealed class PlatformStepExecutor : IPlatformStepExecutor
             // timeout, is a failed step like any other.
             var error = PlatformStoreFailures.Storable(ex.Message);
             Observe(message.MessageId, stepId, Failed, idempotencyKey, recordedUri, targetRef, error);
-            if (UsesStepLedger)
+            // With the handler's own token already cancelled, the FAILED write
+            // would not reach the store; a step without a DELIVERED row runs
+            // again anyway, so the operation's failure stands alone.
+            if (UsesStepLedger && !cancellationToken.IsCancellationRequested)
             {
                 try
                 {
