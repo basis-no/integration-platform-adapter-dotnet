@@ -1,14 +1,29 @@
 version: 2
 updates:
+  # Each ecosystem opens one grouped PR a week for minor and patch updates.
+  # Majors match no group, so each opens its own PR for a person to decide.
+  # The cooldown waits three days after a release before proposing it.
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 3
     groups:
       actions:
         patterns: ["*"]
+        update-types: [minor, patch]
+  # Majors here include packages that follow the .NET major, such as Npgsql
+  # 9 to 10 or a Microsoft.* package. The .NET SDK is not managed by Dependabot:
+  # there is no global.json, and the workflows install 8.0.x.
   - package-ecosystem: nuget
     directory: /
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    cooldown:
+      default-days: 3
+    groups:
+      nuget:
+        patterns: ["*"]
+        update-types: [minor, patch]
